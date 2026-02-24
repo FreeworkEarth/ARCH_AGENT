@@ -1,0 +1,25 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Analysis outputs (generated locally, not committed)
+REPOS_ANALYZED/
+
+# Secrets
+PAT_GITHUB_TOKEN.txt
+*.token
+*.secret
+
+# DV8 database files
+*.db
+
+# Generated outputs
+*.png
+*.json.bak
+calibration_datapoints.json
+
+# OS
+.DS_Store
+Thumbs.db
