@@ -60,7 +60,7 @@ Output ONLY JSON:
   "count": <number> (for temporal_analysis, default: 5),
   "branch": "<branch>" (for temporal_analysis, default: "trunk" for PDFBox, otherwise "main"),
   "min_months_apart": <number> (for temporal_analysis: 0=all-time mode, 1-12=recent mode with N months spacing),
-  "model": "<ollama_model>" (for interpret_metrics/interpret_temporal, default: "deepseek-r1:14b", recommended: "deepseek-r1:70b" for best quality)
+  "model": "<ollama_model>" (for interpret_metrics/interpret_temporal, default: "deepseek-r1:32b", recommended: "deepseek-r1:70b" for best quality)
 }
 
 MODEL EXTRACTION RULES:
@@ -68,7 +68,7 @@ MODEL EXTRACTION RULES:
 - If user mentions "deepseek-r1:32b", "32b", "32B" → "model": "deepseek-r1:32b"
 - If user mentions "deepseek-r1:70b", "70b", "70B" → "model": "deepseek-r1:70b"
 - If user says "all models" or "all deepseek" → "model": "all"
-- Default when no model mentioned: "deepseek-r1:14b"
+- Default when no model mentioned: "deepseek-r1:32b"
 
 TWO SIMPLE MODES:
 1. ALL-TIME MODE (min_months_apart=0):
@@ -100,9 +100,9 @@ Examples:
 - "analyze jsoup all-time with 10 timesteps 3 months apart and then interpret with deepseek-r1:32b" → {"tool": "temporal_analysis", "repo": "jsoup", "count": 10, "branch": "main", "min_months_apart": 3, "model": "deepseek-r1:32b"}
 - "analyze commons-io all-time in 5 timesteps and then interpret with deepseek-r1:70b" → {"tool": "temporal_analysis", "repo": "commons-io", "count": 5, "branch": "main", "min_months_apart": 0, "model": "deepseek-r1:70b"}
 - "interpret the temporal analysis for jsoup with deepseek-r1:32b" → {"tool": "interpret_temporal", "repo": "jsoup", "model": "deepseek-r1:32b"}
-- "interpret this temporal analysis folder '/.../temporal_analysis_alltime_...'" → {"tool": "interpret_temporal", "repo": "/.../temporal_analysis_alltime_.../INPUT_INTERPRETATION", "model": "deepseek-r1:14b"}
-- "analyze ARCH_ANALYSIS_TRAINTICKET_TOY_EXAMPLES_MULTILANG all-time in 2 timesteps on branch temporal and then interpret with deepseek-r1:14b" → {"tool": "temporal_analysis", "repo": "ARCH_ANALYSIS_TRAINTICKET_TOY_EXAMPLES_MULTILANG", "count": 2, "branch": "temporal", "min_months_apart": 0, "model": "deepseek-r1:14b"}
-- "analyze and interpret https://github.com/apache/commons-io.git all time 5 timesteps with deepseek-r1:14b and answer: why did the m-score change between 2020 and 2024?" → {"tool": "temporal_analysis", "repo": "https://github.com/apache/commons-io.git", "count": 5, "branch": "main", "min_months_apart": 0, "model": "deepseek-r1:14b"}
+- "interpret this temporal analysis folder '/.../temporal_analysis_alltime_...'" → {"tool": "interpret_temporal", "repo": "/.../temporal_analysis_alltime_.../INPUT_INTERPRETATION", "model": "deepseek-r1:32b"}
+- "analyze ARCH_ANALYSIS_TRAINTICKET_TOY_EXAMPLES_MULTILANG all-time in 2 timesteps on branch temporal and then interpret with deepseek-r1:32b" → {"tool": "temporal_analysis", "repo": "ARCH_ANALYSIS_TRAINTICKET_TOY_EXAMPLES_MULTILANG", "count": 2, "branch": "temporal", "min_months_apart": 0, "model": "deepseek-r1:32b"}
+- "analyze and interpret https://github.com/apache/commons-io.git all time 5 timesteps with deepseek-r1:32b and answer: why did the m-score change between 2020 and 2024?" → {"tool": "temporal_analysis", "repo": "https://github.com/apache/commons-io.git", "count": 5, "branch": "main", "min_months_apart": 0, "model": "deepseek-r1:32b"}
 - "analyze https://github.com/apache/pdfbox.git all-time 5 timesteps and then interpret with deepseek-r1:32b" → {"tool": "temporal_analysis", "repo": "https://github.com/apache/pdfbox.git", "count": 5, "branch": "trunk", "min_months_apart": 0, "model": "deepseek-r1:32b"}
 
 KNOWN REPOSITORIES (use EXACTLY these short names when no URL is given):
@@ -352,7 +352,7 @@ def tool_interpret_temporal(plan: dict) -> int:
             size = (m_model.group(1) or m_model.group(2)).lower()
             if size in ("14b", "32b", "70b"):
                 raw_model = f"deepseek-r1:{size}"
-    model = (raw_model or "deepseek-r1:14b").strip()
+    model = (raw_model or "deepseek-r1:32b").strip()
 
     folder = plan.get("repo") or plan.get("folder")
     # If folder is just a short repo name (not an absolute path, URL, or temporal path),
@@ -818,6 +818,9 @@ def tool_temporal_analysis(plan: dict) -> int:
                 min_months_apart = 0
             except ValueError:
                 pass
+        # Smart commit selection: pick commits with most file changes
+        if any(k in ur for k in ["smart commit", "intelligent commit", "most changes", "biggest changes", "most files changed"]):
+            plan["spacing_mode"] = "smart"
         # Date range: "between 2012 to 2014" or "from 2012-01 to 2014-12"
         m_range = re.search(r"(?:between|from)\s+(\d{4}(?:-\d{1,2}(?:-\d{1,2})?)?)\s+(?:to|and)\s+(\d{4}(?:-\d{1,2}(?:-\d{1,2})?)?)", ur)
         if m_range:
@@ -905,8 +908,13 @@ def tool_temporal_analysis(plan: dict) -> int:
     if force_dual and not had_source_path:
         source_path = None
 
+    # Smart commit mode
+    smart_commits = plan.get("spacing_mode") == "smart"
+
     # Determine mode based on min_months_apart
-    if min_commits_apart > 0:
+    if smart_commits:
+        mode_name = "SMART (commits with most file changes)"
+    elif min_commits_apart > 0:
         mode_name = f"RECENT-COMMITS ({min_commits_apart} commits spacing)"
     elif min_months_apart > 0:
         mode_name = f"RECENT-MAJOR ({min_months_apart} months minimum spacing)"
@@ -944,6 +952,8 @@ def tool_temporal_analysis(plan: dict) -> int:
             cmd += ["--java-depends"]
         if force_depends:
             cmd += ["--force-depends"]
+        if smart_commits:
+            cmd += ["--spacing-mode", "smart"]
         if min_commits_apart > 0:
             cmd += ["--min-commits-apart", str(min_commits_apart)]
         if since_date:
@@ -1119,7 +1129,7 @@ def tool_temporal_analysis(plan: dict) -> int:
                 # Pass the specific temporal folder (json_file.parent) to avoid glob picking up all folders
                 temporal_folder = str(json_file.parent) if json_file else None
                 # Model can come from "model" or "interpret_model" in plan
-                interpret_model = plan.get("model") or plan.get("interpret_model") or "deepseek-r1:14b"
+                interpret_model = plan.get("model") or plan.get("interpret_model") or "deepseek-r1:32b"
                 return tool_interpret_temporal({
                     "repo": temporal_folder or repo,
                     "model": interpret_model,
@@ -1221,7 +1231,7 @@ def tool_interpret_metrics(plan: dict) -> int:
         ur = (plan.get('user_request') or '').lower() if isinstance(plan, dict) else ''
         # Heuristic: prefer deepseek if mentioned, else qwen, else llama
         if 'deepseek' in (ur or ''):
-            model = 'deepseek-r1:14b'
+            model = 'deepseek-r1:32b'
         elif 'qwen' in (ur or ''):
             model = 'qwen2:8b'
         else:
@@ -1571,7 +1581,7 @@ def main():
         print('')
         print('Options:')
         print('  --temporal-root <path>  Explicit temporal analysis folder (skips glob discovery)')
-        print('  --model <model>         LLM model for interpretation (default: deepseek-r1:14b)')
+        print('  --model <model>         LLM model for interpretation (default: deepseek-r1:32b)')
         print('')
         print('Examples:')
         print('  "Analyze pdfbox and explain the results"')
@@ -1593,10 +1603,10 @@ def main():
     if temporal_root_override:
         print(f"\nDirect interpretation mode")
         print(f"  Temporal root: {temporal_root_override}")
-        print(f"  Model: {model_override or 'deepseek-r1:14b'}\n")
+        print(f"  Model: {model_override or 'deepseek-r1:32b'}\n")
         rc = tool_interpret_temporal({
             "repo": temporal_root_override,
-            "model": model_override or "deepseek-r1:14b",
+            "model": model_override or "deepseek-r1:32b",
             "user_request": user_req
         })
         sys.exit(rc)

@@ -2,12 +2,18 @@
 
 A two-stage pipeline for automated software architecture analysis using DV8, NeoDepends, and local LLMs.
 
+## Pipeline Overview
+
+![Pipeline Diagram](pipeline_diagram.png)
+
 ## What it does
 
 1. **Stage 1 — Analyze**: Clone a GitHub repo, run DV8/NeoDepends dependency analysis across multiple commits (temporal), compute M-score, propagation cost, decoupling level, independence level, and generate time-series plots.
 2. **Stage 2 — Interpret**: Feed the analysis results to a local reasoning LLM (DeepSeek-R1) to generate per-transition DRH diff reports, a combined temporal interpretation report, and answer specific architectural questions.
 
 All outputs go into `REPOS_ANALYZED/<repo-name>/` (auto-created on first run).
+
+
 
 ## Prerequisites
 
@@ -82,7 +88,7 @@ chmod +x setup.sh
 powershell -ExecutionPolicy Bypass -File setup.ps1
 ```
 
-The setup script installs Python dependencies, installs Ollama, and pulls `deepseek-r1:14b` (~9 GB).
+The setup script installs Python dependencies, installs Ollama, and pulls `deepseek-r1:32b` (~19 GB).
 
 ## Quick Start
 
@@ -96,14 +102,14 @@ cd 01_stage_analyze
 
 ```bash
 python3 LLM_frontend_upgraded.py \
-  "analyze and interpret https://github.com/apache/commons-io.git all-time 5 timesteps with deepseek-r1:14b and answer: how did the architecture evolve?"
+  "analyze and interpret https://github.com/apache/commons-io.git all-time 5 timesteps with deepseek-r1:32b and answer: how did the architecture evolve?"
 ```
 
 ### Interpret an existing analysis folder (fast — skips re-analysis)
 
 ```bash
 python3 LLM_frontend_upgraded.py \
-  "interpret this temporal analysis folder '/path/to/REPOS_ANALYZED/commons-io/temporal_analysis_alltime_...' with deepseek-r1:14b and answer: what caused the m-score drop?"
+  "interpret this temporal analysis folder '/path/to/REPOS_ANALYZED/commons-io/temporal_analysis_alltime_...' with deepseek-r1:32b and answer: what caused the m-score drop?"
 ```
 
 If a prior interpretation run exists, you will be prompted to reuse it (fast, ~30s) or re-run the LLM (slow, ~10min).
@@ -114,7 +120,7 @@ The toy example repo is at: [ARCH_ANALYSIS_TRAINTICKET_TOY_EXAMPLES_MULTILANG](h
 
 ```bash
 python3 LLM_frontend_upgraded.py \
-  "analyze and interpret ARCH_ANALYSIS_TRAINTICKET_TOY_EXAMPLES_MULTILANG all-time in 2 timesteps on branch temporal with deepseek-r1:14b and answer: how did the architecture change from the god-class version to the refactored version?"
+  "analyze and interpret ARCH_ANALYSIS_TRAINTICKET_TOY_EXAMPLES_MULTILANG all-time in 2 timesteps on branch temporal with deepseek-r1:32b and answer: how did the architecture change from the god-class version to the refactored version?"
 ```
 
 ## Pipeline stages
@@ -147,17 +153,17 @@ GitHub URL / local repo
 
 | Model | RAM required | Speed | Quality |
 |-------|-------------|-------|---------|
-| `deepseek-r1:14b` | ~12 GB | ~3-5 min/transition | Good (default) |
-| `deepseek-r1:32b` | ~24 GB | ~8-10 min/transition | Better |
+| `deepseek-r1:14b` | ~12 GB | ~3-5 min/transition | Good |
+| `deepseek-r1:32b` | ~24 GB | ~8-10 min/transition | Better (default) |
 | `deepseek-r1:70b` | ~140 GB | Slow | Best (cluster recommended) |
 
-`deepseek-r1:14b` is pulled automatically by `setup.sh`. To install a larger model manually:
+`deepseek-r1:32b` is pulled automatically by `setup.sh`. To install a larger model manually:
 
 ```bash
-ollama pull deepseek-r1:32b
+ollama pull deepseek-r1:70b
 ```
 
-Then use it by adding `with deepseek-r1:32b` to your prompt:
+Then use it by adding `with deepseek-r1:70b` to your prompt:
 
 ```bash
 python3 LLM_frontend_upgraded.py \

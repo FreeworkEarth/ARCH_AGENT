@@ -1743,7 +1743,9 @@ def get_commit_history(
     repo_path = repo_path.resolve()
 
     # Determine mode and fetch count
-    if min_months_apart > 0:
+    if spacing_mode == "smart":
+        fetch_count = 100000  # Need all commits to rank by change size
+    elif min_months_apart > 0:
         spacing_mode = "recent"
         # For recent mode with spacing, need to look back far enough
         fetch_count = count * min_months_apart * 100  # Look back enough commits
@@ -1876,6 +1878,36 @@ def get_commit_history(
         # If we didn't gather enough due to shallow history, try to append oldest
         if len(selected) < count and commits[-1] not in selected:
             selected.append(commits[-1])
+        return selected
+
+    elif spacing_mode == "smart":
+        # MODE 4: SMART - Select commits with the most file changes (largest diffs).
+        # Runs git log --numstat to count added+removed lines per commit, then picks top N.
+        import subprocess as _sp
+        result2 = _sp.run(
+            ["git", "log", branch, "--pretty=format:%H", "--numstat"],
+            cwd=repo_path, capture_output=True, text=True
+        )
+        change_counts: dict = {}
+        current_hash = None
+        for line in result2.stdout.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            if len(line) == 40 and all(c in '0123456789abcdef' for c in line):
+                current_hash = line
+                change_counts[current_hash] = 0
+            elif current_hash and '\t' in line:
+                parts = line.split('\t')
+                try:
+                    added = int(parts[0]) if parts[0] != '-' else 0
+                    removed = int(parts[1]) if parts[1] != '-' else 0
+                    change_counts[current_hash] += added + removed
+                except (ValueError, IndexError):
+                    pass
+        ranked = sorted(commits, key=lambda c: change_counts.get(c['hash'], 0), reverse=True)
+        selected = ranked[:count]
+        selected.sort(key=lambda c: c['date'], reverse=True)  # newest-first like other modes
         return selected
 
     # Default fallback
@@ -2550,8 +2582,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--since-date", help="Limit analysis to commits on/after this date (YYYY or YYYY-MM or YYYY-MM-DD).")
     parser.add_argument("--until-date", help="Limit analysis to commits on/before this date (YYYY or YYYY-MM or YYYY-MM-DD).")
     parser.add_argument("--fine-grain", action="store_true", help="In temporal mode, also run full arch-report (anti-patterns, clustering, hotspots) for each revision.")
-    parser.add_argument("--spacing-mode", choices=["intelligent", "interpolate", "all-time-major"], default="intelligent",
-                       help="Revision selection mode: intelligent (smart filtering), interpolate (first/last/evenly-spaced), all-time-major (most significant ever).")
+    parser.add_argument("--spacing-mode", choices=["intelligent", "interpolate", "all-time-major", "smart", "uniform"], default="intelligent",
+                       help="Revision selection mode: smart (most file changes), uniform/alltime (evenly spaced), intelligent (default filtering).")
     parser.add_argument("--no-temporal-worktree", action="store_true",
                        help="Disable git worktrees in temporal mode (use git archive snapshots instead).")
     # Single-commit focus analysis options
@@ -2735,6 +2767,25 @@ def main() -> None:
         if last_output:
             print(f"   Time-series data: {last_output}")
         print(f"   Revision folders: {workspace / repo_root.name}/")
+
+        # Clean up cloned repo source files — keep only .git and temporal_analysis_* folders.
+        # The .git dir is kept so subsequent runs can skip re-cloning.
+        repo_folder = workspace / repo_root.name
+        if repo_folder.exists():
+            removed = []
+            for item in list(repo_folder.iterdir()):
+                if item.name == ".git" or item.name.startswith("temporal_analysis"):
+                    continue
+                try:
+                    if item.is_dir():
+                        shutil.rmtree(item)
+                    else:
+                        item.unlink()
+                    removed.append(item.name)
+                except Exception as e:
+                    print(f"  Warning: could not remove {item.name}: {e}")
+            if removed:
+                print(f"  Cleaned up source files: {', '.join(removed)}")
         return
 
     # try to detect a sensible source root automatically (Maven/Gradle/common)

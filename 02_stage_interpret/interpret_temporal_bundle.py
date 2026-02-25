@@ -9,12 +9,13 @@ End-to-end interpretation for a temporal analysis folder:
 Example:
   python3 interpret_temporal_bundle.py \
     --temporal-root ../REPOS/zeppelin/temporal_analysis_alltime_2013-06_to_2025-11 \
-    --model deepseek-r1:14b
+    --model deepseek-r1:32b
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import re
 import subprocess
@@ -213,7 +214,117 @@ def build_deterministic_overall(
     return "\n".join(lines).rstrip() + "\n"
 
 
-def build_overall_prompt(repo: str, temporal_root: Path, summaries: List[Tuple[int, int, str]], timeseries: Dict[str, Any]) -> str:
+def _load_fanin_fanout(rev_folder: Path) -> Dict[str, Dict[str, int]]:
+    """Load per-file FanIn/FanOut from interpretation_payload.json in the revision folder."""
+    payload_path = rev_folder / "OutputData" / "interpretation_payload.json"
+    if not payload_path.exists():
+        return {}
+    try:
+        data = json.loads(payload_path.read_text(encoding="utf-8"))
+        rows = (data.get("dangerous_files") or {}).get("rows") or []
+        result: Dict[str, Dict[str, int]] = {}
+        for r in rows:
+            fname = (r.get("Filename") or "").split("/")[-1]
+            if fname:
+                try:
+                    result[fname] = {
+                        "FanIn": int(r.get("FanIn", 0)),
+                        "FanOut": int(r.get("FanOut", 0)),
+                    }
+                except (ValueError, TypeError):
+                    pass
+        return result
+    except Exception:
+        return {}
+
+
+def _load_clique_count(rev_folder: Path) -> int:
+    """Return total distinct files participating in cliques for this revision."""
+    csv_path = rev_folder / "OutputData" / "arch-issue" / "anti-pattern-summary.csv"
+    if not csv_path.exists():
+        return 0
+    try:
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            for row in csv.reader(f):
+                if row and row[0].strip() == "Clique":
+                    return int(float(row[2]))
+    except Exception:
+        pass
+    return 0
+
+
+def load_mscore_worst_modules(temporal_root: Path, top_n: int = 5) -> str:
+    """
+    For each revision folder under temporal_root, load mscore_exact_components.json
+    and return the top_n worst modules ranked by contribution (= cross_penalty × size_factor).
+    Also loads FanIn/FanOut per file and clique count to give a multi-signal refactoring picture.
+    Returns a formatted string ready to embed in an LLM prompt.
+    """
+    lines = []
+    # Revision folders live INSIDE temporal_root named NN_reponame_DDMMYYYY_HHMM
+    search_root = temporal_root
+    component_files = sorted(search_root.glob("*/OutputData/metrics/mscore_exact_components.json"))
+    rev_map: Dict[int, Path] = {}
+    for p in component_files:
+        folder_name = p.parts[-4]  # e.g. "01_commons-io_23022026_1058"
+        try:
+            rev_num = int(folder_name.split("_")[0])
+            rev_map[rev_num] = p
+        except (ValueError, IndexError):
+            continue
+
+    for rev_n in sorted(rev_map.keys()):
+        path = rev_map[rev_n]
+        # path: temporal_root/NN_repo/OutputData/metrics/mscore_exact_components.json
+        rev_folder = path.parents[2]  # NN_repo/ folder
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        modules = data.get("module_details", [])
+        # Sort by contribution (= cross_penalty × size_factor) — captures both violation
+        # severity AND module size. A large module with moderate cross_penalty outranks a
+        # single file with high cross_penalty because it requires coordinated refactoring.
+        worst = sorted(modules, key=lambda m: m.get("contribution", 0), reverse=True)[:top_n]
+        if not worst:
+            continue
+
+        # Load supplementary signals
+        fanin_fanout = _load_fanin_fanout(rev_folder)
+        clique_count = _load_clique_count(rev_folder)
+        clique_note = f", clique_files={clique_count}" if clique_count > 0 else ""
+
+        lines.append(
+            f"\nRevision {rev_n} "
+            f"(mscore={data.get('mscore_percentage', 0):.1f}%, "
+            f"layers={data.get('num_layers', 0)}, "
+            f"modules={data.get('num_modules', 0)}{clique_note}):"
+        )
+        for m in worst:
+            files = m.get("files", [])
+            file_str_parts = []
+            for fpath in files[:3]:
+                fname = fpath.split("/")[-1]
+                fi_fo = fanin_fanout.get(fname)
+                if fi_fo:
+                    file_str_parts.append(
+                        f"{fname}(FanIn={fi_fo['FanIn']},FanOut={fi_fo['FanOut']})"
+                    )
+                else:
+                    file_str_parts.append(fname)
+            if len(files) > 3:
+                file_str_parts.append("...")
+            file_str = ", ".join(file_str_parts)
+            lines.append(
+                f"  - Layer {m.get('layer')} / Module {m.get('module')}: "
+                f"contribution={m.get('contribution', 0):.4f} "
+                f"(cross_penalty={m.get('cross_penalty', 0):.3f}, size={m.get('module_size', 0)} files) | "
+                f"files: {file_str}"
+            )
+    return "\n".join(lines) if lines else "(mscore components not available)"
+
+
+def build_overall_prompt(repo: str, temporal_root: Path, summaries: List[Tuple[int, int, str]], timeseries: Dict[str, Any], mscore_breakdown: str = "") -> str:
     return f"""You are an expert software architect.
 
 Hard rules:
@@ -226,6 +337,7 @@ Hard rules:
 - Then: "## Notes"
 - When discussing file counts, treat added_files_count/removed_files_count as DRH-diff counters (not git add/delete). Prefer DRH file count (old→new) from the summaries.
 - Copy/paste numbers from FACTS; do not invent or recompute values.
+- When referencing M-score worst modules: modules are ranked by contribution (= cross_penalty × size_factor). Name specific files from the highest-contribution module as the primary refactoring target. FanIn/FanOut values per file are shown — high FanIn means many dependents break if refactored, high FanOut means the file is fragile and hard to isolate. The revision header shows clique_files= count indicating how many files are in circular dependency clusters (those require coordinated refactoring of the whole cluster). Note if the same module appears across multiple revisions (persistent hotspot). Do NOT rank by cross_penalty alone.
 
 Context:
 - repo: {repo}
@@ -235,27 +347,89 @@ Context:
 FACTS (timeseries.json excerpt):
 {json.dumps(timeseries, indent=2)[:12000]}
 
+M-SCORE WORST MODULES PER REVISION (top 5 by contribution = cross_penalty × size_factor; FanIn/FanOut per file; clique_files count in header):
+{mscore_breakdown}
+
 PER-TRANSITION COMPREHENSIVE SUMMARIES (chronological newest→older):
 {chr(10).join([f'### new={n} old={o}{chr(10)}{ms}' for n,o,ms in summaries])}
 """
 
 
-def answer_user_question(model: str, question: str, report_text: str, timeout_s: int = 900) -> str:
-    """Call the LLM to answer a specific user question using the combined report as context."""
-    context = report_text[:12000]
-    prompt = f"""You are an expert software architect answering a specific question about a repository's architectural evolution.
+def answer_user_question(model: str, question: str, report_text: str,
+                         mscore_breakdown: str = "", timeout_s: int = 900) -> str:
+    """Call the LLM to answer a specific user question using the combined report as context.
 
-Hard rules:
-- Answer ONLY the question asked. Be direct and concise (max 300 words).
-- Use ONLY facts from the report below. Do NOT invent numbers or files.
-- Format your answer as plain Markdown: short header, bullet points for evidence, 1-sentence conclusion.
-- Do NOT output reasoning or "thinking" blocks.
-- IMPORTANT: If the question mentions specific years or dates (e.g. "from 2020 to 2024"), you MUST find the transition(s) whose commit dates fall within that range and cite them explicitly — include the commit date, metric values, and numeric delta from the report. Do NOT give a generic answer about overall trends; be specific about which transition(s) caused the change and when.
-- IMPORTANT: When citing metric changes, ALWAYS include BOTH the absolute delta in points (e.g. "+7.38 points") AND the relative percentage (e.g. "+15.02%"). Never cite only one of them. Example: "m-score increased from 49.14 to 56.52 (+7.38 points, +15.02%)".
+    Builds a priority context: M-score worst modules first (most useful for file-level questions),
+    then Comprehensive Summary blocks (each labelled with commit dates for date-range questions),
+    then narrative up to a total of ~12000 chars.
+    """
+    # 1. M-score worst modules — put first so it's never truncated away
+    priority_context = ""
+    if mscore_breakdown and "(mscore components not available)" not in mscore_breakdown:
+        priority_context = (
+            "## M-SCORE WORST MODULES PER REVISION (top 5 by contribution = cross_penalty × size_factor; FanIn/FanOut per file; clique_files count in header):\n"
+            + mscore_breakdown + "\n\n"
+        )
+
+    # 2. Extract Comprehensive Summary blocks — they carry date labels for date-range questions
+    summary_blocks = re.findall(
+        r'(## Comprehensive Summary.*?)(?=\n## |\Z)', report_text, re.DOTALL
+    )
+    summary_text = "\n\n".join(summary_blocks[:6])[:6000]
+
+    # 3. Fill remaining budget with the narrative from the full report
+    budget = 12000 - len(priority_context) - len(summary_text)
+    narrative = report_text[:max(0, budget)]
+
+    context = priority_context + summary_text + ("\n\n" if summary_text else "") + narrative
+
+    # Detect file/refactor questions — use ultra-direct numbered-list prompt to prevent narrative drift
+    q_lower = question.lower()
+    is_files_question = any(k in q_lower for k in [
+        "refactor", "specific file", "which file", "bad file", "worst file",
+        "file to fix", "file to improve", "give me file", "5 file", "top file",
+        "files to", "file i should", "files i should",
+    ])
+
+    if is_files_question and priority_context:
+        prompt = f"""You are a software architect. Output ONLY a numbered list — no paragraphs, no headers, no conclusions, no thinking.
+
+STRICT FORMAT (follow exactly, nothing else):
+1. FileName.java — Layer N, contribution=X.XXXX (cross_penalty=Y.YYY, size=Z files), FanIn=A, FanOut=B; [one sentence: why this is the worst]
+2. FileName.java — Layer N, contribution=X.XXXX (cross_penalty=Y.YYY, size=Z files), FanIn=A, FanOut=B; [one sentence reason]
+3. FileName.java — ...
+4. FileName.java — ...
+5. FileName.java — ...
+
+Rules:
+- Use ONLY files from the M-SCORE WORST MODULES data below.
+- Rank by contribution score (highest first). contribution = cross_penalty × size_factor.
+- If FanIn/FanOut are shown in the data, include them. If not shown, omit those fields.
+- Pick representative file names from the module's files list (prefer the first file listed per module, or pick distinct files across modules).
+- Do NOT output anything before item 1 or after item 5.
+- Do NOT output reasoning, thinking, headers, summaries, or explanations outside the numbered items.
 
 QUESTION: {question}
 
-REPORT (temporal interpretation report excerpt):
+M-SCORE WORST MODULES (most recent revision first, ranked by contribution):
+{priority_context}
+"""
+    else:
+        prompt = f"""You are an expert software architect answering a specific question about a repository's architectural evolution.
+
+Hard rules:
+- Answer ONLY the question asked. Be direct and concise (max 300 words).
+- Use ONLY facts from the report below. Do NOT invent numbers or files not mentioned in the report.
+- Do NOT use background knowledge about library versions, release history, or project wikis — cite only what is in the report.
+- Format: short header, bullet points for evidence, 1-sentence conclusion.
+- Do NOT output reasoning or "thinking" blocks.
+- For date-range questions (e.g. "from 2023 to 2024"): the Comprehensive Summary blocks above are labelled with transition dates in the format "old=revN (YYYY-MM-DD) → new=revM (YYYY-MM-DD)". Find the transition(s) whose dates fall within the range asked and cite their specific metric deltas. Do NOT give a generic answer about overall trends.
+- For "which files to refactor" questions: use the M-SCORE WORST MODULES section above. Modules are ranked by contribution (cross_penalty × size_factor) — this is the correct refactoring priority because it weights both violation severity AND module size (larger coupled modules are harder to fix). List files from the highest-contribution modules first, citing their FanIn/FanOut values. Also note the clique_files count in the revision header — if high, mention that circular dependency clusters require coordinated refactoring. Do NOT use layer-movement data (files that moved between layers). Do NOT rank by cross_penalty alone.
+- When citing metric changes, ALWAYS include both absolute delta and percentage (e.g. "+7.38 points, +15.02%").
+
+QUESTION: {question}
+
+REPORT (M-score data first, then transition summaries with dates, then narrative):
 {context}
 """
     return query_ollama(model, prompt, timeout_s=timeout_s)
@@ -265,7 +439,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Generate per-transition DRH interpretation + one combined summary report.")
     ap.add_argument("--temporal-root", required=True, help="Path to temporal_analysis_* folder")
     ap.add_argument("--repo", default=None, help="Path to git repo (default: temporal_root/..)")
-    ap.add_argument("--model", default="deepseek-r1:14b", help="Ollama model (default: deepseek-r1:14b)")
+    ap.add_argument("--model", default="deepseek-r1:32b", help="Ollama model (default: deepseek-r1:32b)")
     ap.add_argument("--ollama-timeout-s", type=int, default=900, help="Ollama timeout in seconds (default: 900)")
     ap.add_argument("--no-llm", action="store_true", help="Generate per-transition prompt files only (no model calls)")
     ap.add_argument("--no-overall", action="store_true", help="Skip overall summary generation")
@@ -370,6 +544,7 @@ def main() -> int:
     # Combined report — also in the run subfolder
     combined_path = run_folder / f"temporal_interpretation_report_{normalize_model_name(args.model)}_{ts}.md"
     lines: List[str] = []
+    mscore_breakdown: str = ""  # populated below; kept in scope for Q&A
     lines.append(f"# Temporal Interpretation Report")
     lines.append(f"- repo: {timeseries.get('repo') or repo_path.name}")
     lines.append(f"- temporal_root: {temporal_root}")
@@ -390,10 +565,15 @@ def main() -> int:
 
     if not args.no_overall:
         transitions = list(zip(reversed(nums[1:]), reversed(nums[:-1])))
-        lines.append(build_deterministic_overall(timeseries.get("repo") or repo_path.name, temporal_root, timeseries, reports, transitions).strip())
+        mscore_breakdown = load_mscore_worst_modules(temporal_root)
+        det_overall = build_deterministic_overall(timeseries.get("repo") or repo_path.name, temporal_root, timeseries, reports, transitions).strip()
+        if mscore_breakdown and "(mscore components not available)" not in mscore_breakdown:
+            det_overall += "\n\n## M-Score Worst Modules Per Revision\n" + mscore_breakdown
+        lines.append(det_overall)
         lines.append("")
         if args.llm_overall and not args.no_llm:
-            prompt = build_overall_prompt(timeseries.get("repo") or repo_path.name, temporal_root, summaries, timeseries)
+            mscore_breakdown = load_mscore_worst_modules(temporal_root)
+            prompt = build_overall_prompt(timeseries.get("repo") or repo_path.name, temporal_root, summaries, timeseries, mscore_breakdown)
             overall = query_ollama(args.model, prompt, timeout_s=args.ollama_timeout_s)
             overall = strip_thinking_and_fences(overall)
             if overall:
@@ -431,6 +611,10 @@ def main() -> int:
     combined_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
     print(f"Wrote combined report: {combined_path}")
 
+    # Ensure mscore_breakdown is always available for Q&A (may not be set if --no-overall)
+    if not mscore_breakdown:
+        mscore_breakdown = load_mscore_worst_modules(temporal_root)
+
     # --- Interactive Q&A loop ---
     # Start with the user's initial question (if any), then offer follow-up prompts.
     if not args.no_llm:
@@ -464,6 +648,7 @@ def main() -> int:
             prior = "\n\n".join(conversation) if conversation else ""
             context_for_answer = (prior + "\n\n" + report_text) if prior else report_text
             raw = answer_user_question(args.model, current_question, context_for_answer,
+                                       mscore_breakdown=mscore_breakdown,
                                        timeout_s=args.ollama_timeout_s)
             answer = strip_thinking_and_fences(raw)
 

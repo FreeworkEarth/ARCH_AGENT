@@ -28,12 +28,12 @@ if (-not (Get-Command ollama -ErrorAction SilentlyContinue)) {
 # Models
 Write-Host ""
 Write-Host "[3/3] Pulling required models (this may take several minutes)..." -ForegroundColor Yellow
-Write-Host "  Pulling deepseek-r1:14b (~9 GB)..."
-ollama pull deepseek-r1:14b
+Write-Host "  Pulling deepseek-r1:32b (~19 GB)..."
+ollama pull deepseek-r1:32b
 
 Write-Host ""
 Write-Host "=== Setup complete! ===" -ForegroundColor Green
 Write-Host ""
 Write-Host "Quick start:"
 Write-Host "  cd 01_stage_analyze"
-Write-Host '  python LLM_frontend_upgraded.py "analyze https://github.com/apache/commons-io.git all-time 5 timesteps with deepseek-r1:14b and answer: how did the architecture evolve?"'
+Write-Host '  python LLM_frontend_upgraded.py "analyze https://github.com/apache/commons-io.git all-time 5 timesteps with deepseek-r1:32b and answer: how did the architecture evolve?"'

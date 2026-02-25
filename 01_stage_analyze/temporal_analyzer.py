@@ -100,7 +100,7 @@ def get_commit_history(
             })
 
     # Spacing strategies
-    if spacing_mode == "alltime":
+    if spacing_mode in ("alltime", "uniform"):
         if len(commits) <= count:
             return commits
         selected = [commits[0]]  # newest
@@ -112,6 +112,36 @@ def get_commit_history(
                 selected.append(commits[idx])
         if count > 1:
             selected.append(commits[-1])  # oldest
+        return selected
+
+    elif spacing_mode == "smart":
+        # Select commits with the most files changed — captures real architectural movement.
+        # Uses git log --numstat to count added+removed lines per commit across all files.
+        result2 = subprocess.run(
+            ["git", "log", branch, "--pretty=format:%H", "--numstat"],
+            cwd=repo_path, capture_output=True, text=True
+        )
+        change_counts: Dict[str, int] = {}
+        current_hash = None
+        for line in result2.stdout.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            if len(line) == 40 and all(c in '0123456789abcdef' for c in line):
+                current_hash = line
+                change_counts[current_hash] = 0
+            elif current_hash and '\t' in line:
+                parts = line.split('\t')
+                try:
+                    added = int(parts[0]) if parts[0] != '-' else 0
+                    removed = int(parts[1]) if parts[1] != '-' else 0
+                    change_counts[current_hash] += added + removed
+                except (ValueError, IndexError):
+                    pass
+        # Rank by total lines changed, take top N, keep newest-first order
+        ranked = sorted(commits, key=lambda c: change_counts.get(c['hash'], 0), reverse=True)
+        selected = ranked[:count]
+        selected.sort(key=lambda c: c['date'], reverse=True)  # newest-first like other modes
         return selected
 
     elif spacing_mode == "recent":

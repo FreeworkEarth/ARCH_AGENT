@@ -22,7 +22,7 @@ from commit_analyzer import CommitAnalyzer
 class MetricInterpreter:
     """Interpret metric changes using git context and LLM reasoning"""
 
-    def __init__(self, repo_path: str, model: str = "deepseek-r1:14b"):
+    def __init__(self, repo_path: str, model: str = "deepseek-r1:32b"):
         self.repo_path = Path(repo_path)
         self.model = model
         self.commit_analyzer = CommitAnalyzer(repo_path)
@@ -277,7 +277,7 @@ def main():
     parser = argparse.ArgumentParser(description="Interpret metric changes with git context")
     parser.add_argument('--repo', required=True, help='Path to git repository')
     parser.add_argument('--timeseries', required=True, help='Path to timeseries.json')
-    parser.add_argument('--model', default='deepseek-r1:14b', help='Ollama model to use')
+    parser.add_argument('--model', default='deepseek-r1:32b', help='Ollama model to use')
     parser.add_argument('--output', help='Output path for report')
 
     args = parser.parse_args()

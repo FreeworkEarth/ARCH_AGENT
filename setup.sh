@@ -21,12 +21,12 @@ fi
 # Models
 echo ""
 echo "[3/3] Pulling required models (this may take several minutes)..."
-echo "  Pulling deepseek-r1:14b (~9 GB)..."
-ollama pull deepseek-r1:14b
+echo "  Pulling deepseek-r1:32b (~19 GB)..."
+ollama pull deepseek-r1:32b
 
 echo ""
 echo "=== Setup complete! ==="
 echo ""
 echo "Quick start:"
 echo "  cd 01_stage_analyze"
-echo "  python3 LLM_frontend_upgraded.py \"analyze https://github.com/apache/commons-io.git all-time 5 timesteps with deepseek-r1:14b and answer: how did the architecture evolve?\""
+echo "  python3 LLM_frontend_upgraded.py \"analyze https://github.com/apache/commons-io.git all-time 5 timesteps with deepseek-r1:32b and answer: how did the architecture evolve?\""

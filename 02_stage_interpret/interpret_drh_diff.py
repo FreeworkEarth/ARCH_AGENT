@@ -18,7 +18,7 @@ Example (Zeppelin, compare newest vs previous):
     --temporal-root ../REPOS/zeppelin/temporal_analysis_alltime_2013-06_to_2025-11 \
     --new 1 --old 2 \
     --repo ../REPOS/zeppelin \
-    --model deepseek-r1:14b
+    --model deepseek-r1:32b
 
 If you want to only generate the prompt (no LLM call):
   python3 interpret_drh_diff.py ... --no-llm
@@ -572,7 +572,12 @@ def build_managers_special(context: Dict[str, Any]) -> Tuple[str, List[str]]:
         for f in files:
             if isinstance(f, str):
                 allowed_files.append(f)
-        cross_lines.append(_fmt_kv(m, ["module_key", "layer", "module_size", "cross_penalty", "clddf"]))
+        entry = _fmt_kv(m, ["module_key", "layer", "module_size", "cross_penalty", "clddf"])
+        if files:
+            short_files = ", ".join(f.split("/")[-1] for f in files[:3] if isinstance(f, str))
+            if short_files:
+                entry += f", files=[{short_files}]"
+        cross_lines.append(entry)
 
     # Expand allowed file list deterministically from facts we provide (so verifier doesn't false-fail).
     for r in (diff.get("moved_layers_sample") or [])[:25]:
@@ -621,6 +626,36 @@ def build_managers_special(context: Dict[str, Any]) -> Tuple[str, List[str]]:
         )
     if cross_lines:
         lines.append("- Highest cross-layer penalty modules (newer): " + " | ".join(cross_lines))
+
+    # Deterministic refactoring hotspot — top module by contribution proxy (cross_penalty × module_size)
+    all_cross = ms_pen.get("top_cross_penalty_modules") or []
+    contrib_sorted = sorted(
+        [m for m in all_cross if isinstance(m, dict)],
+        key=lambda m: m.get("cross_penalty", 0) * m.get("module_size", 1),
+        reverse=True,
+    )
+    if contrib_sorted:
+        hm = contrib_sorted[0]
+        hm_files = hm.get("files_sample") or []
+        hm_file_parts = []
+        for fpath in hm_files[:3]:
+            fname = fpath.split("/")[-1] if isinstance(fpath, str) else str(fpath)
+            fi = next(
+                (r for r in dangerous_top if isinstance(r, dict) and (r.get("Filename") or "").endswith(fname)),
+                None,
+            )
+            if fi:
+                hm_file_parts.append(f"{fname}(FanIn={fi.get('FanIn','?')},FanOut={fi.get('FanOut','?')})")
+            else:
+                hm_file_parts.append(fname)
+        if len(hm_files) > 3:
+            hm_file_parts.append("...")
+        lines.append(
+            f"- Refactoring hotspot (top module by cross_penalty×size): "
+            f"Layer {hm.get('layer')} / {hm.get('module_size', 0)} files, "
+            f"cross_penalty={hm.get('cross_penalty', 0):.3f} | "
+            f"files: {', '.join(hm_file_parts)}"
+        )
 
     # de-dup while keeping order
     seen = set()
@@ -965,7 +1000,7 @@ def main() -> int:
     ap.add_argument("--repo", required=True, help="Path to the git repo (for commit context)")
     ap.add_argument("--new", type=int, required=True, help="Newer revision_number (from timeseries.json, usually 1 is newest)")
     ap.add_argument("--old", type=int, required=True, help="Older revision_number (from timeseries.json)")
-    ap.add_argument("--model", default="deepseek-r1:14b", help="Ollama model name (default: deepseek-r1:14b)")
+    ap.add_argument("--model", default="deepseek-r1:32b", help="Ollama model name (default: deepseek-r1:32b)")
     ap.add_argument("--ollama-timeout-s", type=int, default=900, help="Ollama timeout in seconds (default: 900)")
     ap.add_argument("--output", default=None, help="Output markdown path (default: INPUT_INTERPRETATION/drh_diff_report_*.md)")
     ap.add_argument("--no-llm", action="store_true", help="Only write the prompt file; do not call Ollama")

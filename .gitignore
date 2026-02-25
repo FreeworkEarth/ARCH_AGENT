@@ -15,8 +15,9 @@ PAT_GITHUB_TOKEN.txt
 # DV8 database files
 *.db
 
-# Generated outputs
+# Generated outputs (allow pipeline diagram)
 *.png
+!pipeline_diagram.png
 *.json.bak
 calibration_datapoints.json
 
