@@ -14,22 +14,75 @@ All outputs go into `REPOS_ANALYZED/<repo-name>/` (auto-created on first run).
 | Tool | Version | Notes |
 |------|---------|-------|
 | Python | 3.10+ | |
-| Java | 11+ | Required by DV8 and Depends |
-| DV8 CLI | latest | Download from [dv8.io](https://www.archdia.com/dv8/) — add `dv8-console` to PATH |
-| NeoDepends | v0.2.7 | Download binary for your platform from the [NeoDepends releases page](https://github.com/gdrosos/neodepends/releases) |
-| Ollama | latest | Installed by `setup.sh` |
+| Java | 11+ | Required by DV8 and NeoDepends |
+| DV8 CLI | latest | Manual install — see below |
+| NeoDepends | latest | Coming soon — not required yet. [Releases](https://github.com/FreeworkEarth/neodepends/releases) |
+| Ollama | latest | Installed automatically by `setup.sh` |
 | Git | 2.x+ | |
+
+### DV8 Setup (manual — one time)
+
+DV8 requires a license and cannot be automated.
+
+1. Download **DV8 Standard (Trial)** from [archdia.com](https://archdia.com/#shopify-section-1555640000024) — choose the version for your OS. The Standard edition includes `dv8-console` (the CLI used by this pipeline).
+
+2. Unzip and place the folder at the standard location for your OS:
+
+   | OS | Recommended path |
+   |----|-----------------|
+   | macOS | `~/tools/dv8/` |
+   | Linux | `~/tools/dv8/` |
+   | Windows | `C:\tools\dv8\` |
+
+3. Add `dv8-console` to your PATH — run the command for your OS **once**, then restart your terminal:
+
+   **macOS/Linux:**
+
+   ```bash
+   echo 'export PATH="$HOME/tools/dv8:$PATH"' >> ~/.zshrc && source ~/.zshrc
+   ```
+
+   **Windows (PowerShell):**
+
+   ```powershell
+   [Environment]::SetEnvironmentVariable("Path", $env:Path + ";C:\tools\dv8", "User")
+   ```
+
+   Then close and reopen PowerShell.
+
+4. Launch the DV8 GUI once to activate the trial license. After that, `dv8-console` runs fully headlessly — no GUI needed again.
+
+5. Verify:
+
+   ```bash
+   dv8-console --version
+   ```
+
+### NeoDepends Setup (coming soon)
+
+> **Note:** NeoDepends integration is work in progress and not required to run the pipeline. Instructions will be added in a future release. Latest binaries: [github.com/FreeworkEarth/neodepends/releases](https://github.com/FreeworkEarth/neodepends/releases)
 
 ## Install
 
 ```bash
-git clone <this-repo-url>
+git clone https://github.com/FreeworkEarth/ARCH_AGENT.git
 cd ARCH_AGENT
+```
+
+**macOS / Linux:**
+
+```bash
 chmod +x setup.sh
 ./setup.sh
 ```
 
-This installs Python dependencies and pulls `deepseek-r1:14b` (~9 GB).
+**Windows (PowerShell):**
+
+```powershell
+powershell -ExecutionPolicy Bypass -File setup.ps1
+```
+
+The setup script installs Python dependencies, installs Ollama, and pulls `deepseek-r1:14b` (~9 GB).
 
 ## Quick Start
 
@@ -92,10 +145,21 @@ GitHub URL / local repo
 
 ## Models
 
-| Model | Use | Speed |
-|-------|-----|-------|
-| `deepseek-r1:14b` | Interpretation + Q&A (default) | ~3-5 min/transition |
-| `deepseek-r1:32b` | Higher quality interpretation | ~8-10 min/transition |
-| `deepseek-r1:70b` | Best quality (requires ~140 GB RAM) | Cluster recommended |
+| Model | RAM required | Speed | Quality |
+|-------|-------------|-------|---------|
+| `deepseek-r1:14b` | ~12 GB | ~3-5 min/transition | Good (default) |
+| `deepseek-r1:32b` | ~24 GB | ~8-10 min/transition | Better |
+| `deepseek-r1:70b` | ~140 GB | Slow | Best (cluster recommended) |
 
-Switch model by adding `with deepseek-r1:32b` to your prompt.
+`deepseek-r1:14b` is pulled automatically by `setup.sh`. To install a larger model manually:
+
+```bash
+ollama pull deepseek-r1:32b
+```
+
+Then use it by adding `with deepseek-r1:32b` to your prompt:
+
+```bash
+python3 LLM_frontend_upgraded.py \
+  "analyze and interpret https://github.com/apache/commons-io.git all-time 5 timesteps with deepseek-r1:32b and answer: how did the architecture evolve?"
+```

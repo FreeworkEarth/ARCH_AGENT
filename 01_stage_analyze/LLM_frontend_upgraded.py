@@ -1011,12 +1011,12 @@ def tool_temporal_analysis(plan: dict) -> int:
             search_root = pathlib.Path(workspace).expanduser().resolve()
             all_candidates = list(search_root.glob("*/temporal_analysis*/timeseries.json"))
         else:
-            search_root = test_auto_dir / "REPOS"
+            search_root = test_auto_dir / "REPOS_ANALYZED"
             all_candidates = list(search_root.glob("*/temporal_analysis*/timeseries.json"))
 
         if all_candidates:
             json_file = max(all_candidates, key=lambda p: p.stat().st_mtime)
-            repos_dir = json_file.parent.parent   # REPOS/<repo_name>/
+            repos_dir = json_file.parent.parent   # REPOS_ANALYZED/<repo_name>/
             repo_name = repos_dir.name
         else:
             # Fallback: derive from repo variable as before
