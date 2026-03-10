@@ -1,4 +1,4 @@
-# ARCH_AGENT — Software Architecture Analysis Pipeline
+# ARCH_AGENT — AI supported Software Architecture Analysis Pipeline
 
 A two-stage pipeline for automated software architecture analysis using DV8, NeoDepends, and local LLMs.
 
@@ -168,4 +168,73 @@ Then use it by adding `with deepseek-r1:70b` to your prompt:
 ```bash
 python3 LLM_frontend_upgraded.py \
   "analyze and interpret https://github.com/apache/commons-io.git all-time 5 timesteps with deepseek-r1:32b and answer: how did the architecture evolve?"
+```
+
+## Stage 3 — Fast Q&A (RAG + LLM)
+
+Stage 3 answers questions in **<30 seconds** using a pre-built index — no re-running DV8 or Stage 2.
+
+### How it works
+
+```
+Question → TF-IDF retrieval (4-layer index) → compact prompt → LLM answer
+```
+
+**4-layer index:**
+- **L1** — DV8/M-score/architecture concept docs (knowledge base)
+- **L2** — Generated analysis reports (per analyzed repo)
+- **L3** — Raw metric data (M-score components, FanIn/FanOut, contribution)
+- **L4** — Git revision history (commit dates, hashes, metric deltas)
+
+### Usage
+
+From `01_stage_analyze/`:
+
+```bash
+# Ask about files to refactor (uses L3 metrics, numbered list output)
+python3 LLM_frontend_upgraded.py "query commons-io: which files should I refactor first?"
+
+# Ask about a metric concept (uses L1 KB docs, concise explanation)
+python3 LLM_frontend_upgraded.py "query: what is a clique anti-pattern?"
+
+# Ask about a time period (uses L4 commit history + L3 metrics)
+python3 LLM_frontend_upgraded.py "query commons-io: why did the m-score drop in 2023?"
+
+# Direct (bypasses LLM plan parser — instant)
+python3 LLM_frontend_upgraded.py "ask commons-io: give me 5 worst files"
+```
+
+Or run directly from `03_stage_query/`:
+
+```bash
+cd 03_stage_query
+python3 query_engine.py --repo commons-io --question "which files should I refactor first?"
+```
+
+### Backend switching (cloud / cluster)
+
+Switch from Ollama to any OpenAI-compatible endpoint without changing code:
+
+```bash
+# vLLM on GPU cluster
+ARCH_AGENT_LLM_BACKEND=vllm \
+ARCH_AGENT_LLM_BASE_URL=http://gpu-node:8000 \
+  python3 LLM_frontend_upgraded.py "query commons-io: worst files?"
+
+# Any API (GLM-5, OpenAI, etc.)
+ARCH_AGENT_LLM_BACKEND=api \
+ARCH_AGENT_LLM_BASE_URL=https://open.bigmodel.cn/api/paas/v4 \
+ARCH_AGENT_LLM_API_KEY=your-key \
+  python3 LLM_frontend_upgraded.py "query commons-io: explain m-score"
+```
+
+### Rebuild the index
+
+The index is built automatically on first query. To force a rebuild after adding new reports:
+
+```bash
+cd 03_stage_query
+python3 rag_index.py --force
+# or with explicit paths:
+python3 rag_index.py --repos-dir ../REPOS_ANALYZED --kb-dir /path/to/RAG_KnowledgeBase --force
 ```

@@ -22,6 +22,11 @@ PLOTTER = os.path.join(THIS_DIR, "metric_plotter.py")
 BACKFILL_TEMPORAL = os.path.join(THIS_DIR, "backfill_temporal_payloads.py")
 INTERPRET_TEMPORAL = os.path.join(os.path.dirname(THIS_DIR), "02_stage_interpret", "interpret_temporal_bundle.py")
 BUNDLE_VERIFY = os.path.join(os.path.dirname(THIS_DIR), "02_stage_interpret", "verify_interpretation_bundle.py")
+QUERY_ENGINE = os.path.join(os.path.dirname(THIS_DIR), "03_stage_query", "query_engine.py")
+FETCH_ISSUES = os.path.join(THIS_DIR, "fetch_github_issues.py")
+EXPORT_DV8 = os.path.join(THIS_DIR, "export_dv8_binary_files.py")
+COMPUTE_RISK = os.path.join(THIS_DIR, "compute_file_risk_scores.py")
+PLOT_RISK = os.path.join(THIS_DIR, "plot_risk_score_stats.py")
 
 # Config
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
@@ -46,12 +51,15 @@ Tools available:
 4. temporal_analysis - Analyze multiple Git revisions and plot metrics over time
 5. interpret_metrics - Interpret WHY metrics changed by analyzing git commits (requires timeseries.json)
 6. interpret_temporal - Interpret a temporal analysis folder (pairwise DRH diffs + overall summary)
-6. peak_full_arch - Find the two revisions with biggest M-score delta and run full arch reports on both
+7. peak_full_arch - Find the two revisions with biggest M-score delta and run full arch reports on both
+8. query - Fast Q&A on existing results (uses risk scores + commit log + M-score data; answers in <2min; no re-run needed)
+
+IMPORTANT: Use tool="query" whenever the user asks a question about already-analyzed data WITHOUT requesting a new analysis run. Examples: "what are the 5 most dangerous files?", "why did m-score get worse?", "what causes technical debt?", "which parts are decreasing in quality?". These questions use pre-computed risk scores, commit logs, and DV8 data — they do NOT re-run DV8.
 
 Output ONLY JSON:
 {
-  "tool": "analyze_repo|explain_metrics|explain_concept|temporal_analysis|interpret_metrics|interpret_temporal",
-  "repo": "<local path or Git URL>",
+  "tool": "analyze_repo|explain_metrics|explain_concept|temporal_analysis|interpret_metrics|interpret_temporal|query",
+  "repo": "<local path or Git URL or short repo name>",
   "ask": "all|m-score|propagation-cost|..." (optional for analyze_repo),
   "skip_arch_report": true|false (default: true),
   "force_depends": true|false (default: false),
@@ -60,7 +68,9 @@ Output ONLY JSON:
   "count": <number> (for temporal_analysis, default: 5),
   "branch": "<branch>" (for temporal_analysis, default: "trunk" for PDFBox, otherwise "main"),
   "min_months_apart": <number> (for temporal_analysis: 0=all-time mode, 1-12=recent mode with N months spacing),
-  "model": "<ollama_model>" (for interpret_metrics/interpret_temporal, default: "deepseek-r1:32b", recommended: "deepseek-r1:70b" for best quality)
+  "model": "<ollama_model>" (for interpret_metrics/interpret_temporal/query, default: "deepseek-r1:32b", recommended: "deepseek-r1:70b" for best quality),
+  "question": "<question text>" (for query tool: the full question to answer),
+  "user_question": "<question text>" (for temporal_analysis/interpret_temporal: question answered after analysis)
 }
 
 MODEL EXTRACTION RULES:
@@ -102,8 +112,19 @@ Examples:
 - "interpret the temporal analysis for jsoup with deepseek-r1:32b" → {"tool": "interpret_temporal", "repo": "jsoup", "model": "deepseek-r1:32b"}
 - "interpret this temporal analysis folder '/.../temporal_analysis_alltime_...'" → {"tool": "interpret_temporal", "repo": "/.../temporal_analysis_alltime_.../INPUT_INTERPRETATION", "model": "deepseek-r1:32b"}
 - "analyze ARCH_ANALYSIS_TRAINTICKET_TOY_EXAMPLES_MULTILANG all-time in 2 timesteps on branch temporal and then interpret with deepseek-r1:32b" → {"tool": "temporal_analysis", "repo": "ARCH_ANALYSIS_TRAINTICKET_TOY_EXAMPLES_MULTILANG", "count": 2, "branch": "temporal", "min_months_apart": 0, "model": "deepseek-r1:32b"}
-- "analyze and interpret https://github.com/apache/commons-io.git all time 5 timesteps with deepseek-r1:32b and answer: why did the m-score change between 2020 and 2024?" → {"tool": "temporal_analysis", "repo": "https://github.com/apache/commons-io.git", "count": 5, "branch": "main", "min_months_apart": 0, "model": "deepseek-r1:32b"}
+- "analyze and interpret https://github.com/apache/commons-io.git all time 5 timesteps with deepseek-r1:32b and answer: why did the m-score change between 2020 and 2024?" → {"tool": "temporal_analysis", "repo": "https://github.com/apache/commons-io.git", "count": 5, "branch": "main", "min_months_apart": 0, "model": "deepseek-r1:32b", "user_question": "why did the m-score change between 2020 and 2024?"}
 - "analyze https://github.com/apache/pdfbox.git all-time 5 timesteps and then interpret with deepseek-r1:32b" → {"tool": "temporal_analysis", "repo": "https://github.com/apache/pdfbox.git", "count": 5, "branch": "trunk", "min_months_apart": 0, "model": "deepseek-r1:32b"}
+- "analyze and interpret https://github.com/apache/commons-io.git last 3 years 1 commit per month with deepseek-r1:32b and tell me the 5 most dangerous files" → {"tool": "temporal_analysis", "repo": "https://github.com/apache/commons-io.git", "count": 36, "branch": "main", "min_months_apart": 1, "model": "deepseek-r1:32b", "user_question": "What are the 5 most dangerous files in the repository right now, and why? Base the answer on anti-pattern involvement, structural coupling (fan-in), SCC membership, bug-linked churn, and co-change signals."}
+- "analyze commons-io last 3 years 12 commits per year and interpret and answer: what are the 5 most dangerous files?" → {"tool": "temporal_analysis", "repo": "commons-io", "count": 36, "branch": "main", "min_months_apart": 1, "model": "deepseek-r1:32b", "user_question": "What are the 5 most dangerous files in commons-io right now, and why?"}
+- "query commons-io: which files should I refactor first?" → {"tool": "query", "repo": "commons-io", "question": "which files should I refactor first?"}
+- "ask commons-io: why did the m-score drop in 2023?" → {"tool": "query", "repo": "commons-io", "question": "why did the m-score drop in 2023?"}
+- "what is a clique anti-pattern?" → {"tool": "query", "repo": null, "question": "what is a clique anti-pattern?"}
+- "query: explain propagation cost" → {"tool": "query", "repo": null, "question": "explain propagation cost"}
+- "fast query commons-io give me 5 worst files" → {"tool": "query", "repo": "commons-io", "question": "give me 5 worst files to refactor"}
+- "query commons-io: what are the 5 most dangerous files?" → {"tool": "query", "repo": "commons-io", "question": "What are the 5 most dangerous files in commons-io right now, and why? Use the multi-signal risk scores (bug churn, anti-patterns, SCC membership) AND the DV8 structural data to justify each file's ranking."}
+- "ask commons-io why did the m-score get worse over time and link it to commits" → {"tool": "query", "repo": "commons-io", "question": "Why did the M-score get worse over time? Link each significant drop in M-score to specific commits, bugs, or new features that introduced new coupling. Which specific files or groups entered anti-patterns during those transitions?"}
+- "query commons-io what parts are decreasing in quality" → {"tool": "query", "repo": "commons-io", "question": "What parts of the system are most rapidly decreasing in quality over the last 12 months? Identify file groups where bug churn, anti-pattern membership, or propagation cost has been increasing, and name the specific commits or changes that drove the deterioration."}
+- "ask commons-io what causes the most technical debt" → {"tool": "query", "repo": "commons-io", "question": "What parts of the system are causing the most technical debt? Identify groups of files that combine the most bugs and churn with structural design flaws (anti-patterns, high fan-in, SCC cycles), and explain what design flaws link them together."}
 
 KNOWN REPOSITORIES (use EXACTLY these short names when no URL is given):
 - "jsoup" → Java HTML parser
@@ -298,14 +319,14 @@ def _resolve_repo_and_source(repo: str, source_path: str | None) -> tuple[str, s
     return str(p), source_path
 
 def _temporal_root_from_interpretation_path(p: str) -> str | None:
-    """Given a path to INPUT_INTERPRETATION or its parent temporal folder, return the temporal root."""
+    """Given a path to INPUT_INTERPRETATION, OUTPUT_INTERPRETATION, or their parent temporal folder, return the temporal root."""
     try:
         pp = pathlib.Path(p).expanduser().resolve()
     except Exception:
         return None
     if pp.is_file():
         pp = pp.parent
-    if pp.name == "INPUT_INTERPRETATION":
+    if pp.name in ("INPUT_INTERPRETATION", "OUTPUT_INTERPRETATION"):
         tr = pp.parent
         if (tr / "timeseries.json").exists():
             return str(tr)
@@ -332,6 +353,305 @@ def _temporal_root_from_interpretation_path(p: str) -> str | None:
             break
         cur = cur.parent
     return None
+
+def _run_risk_pipeline(temporal_root: pathlib.Path, repo_name: str, git_root: pathlib.Path | None = None) -> None:
+    """
+    Run the full per-file risk scoring pipeline after backfill completes:
+      1. fetch_github_issues   — build issue_map.json (JIRA/GitHub auto-detected)
+      2. export_dv8_binary_files --all  — convert .dv8-clsx/.dv8-dsm → JSON/CSV
+      3. compute_file_risk_scores       — multi-signal composite risk scores
+      4. plot_risk_score_stats          — statistical plots + risk_score_stats.json
+
+    All steps are best-effort: failure of one does not stop the rest.
+    """
+    interp_root = temporal_root / "INPUT_INTERPRETATION"
+
+    # --- Step 1: Issue map (JIRA/GitHub auto-detected from commit history) ---
+    issue_map_path = temporal_root / "issue_map.json"
+    if not issue_map_path.exists() and os.path.isfile(FETCH_ISSUES):
+        print("\n[risk-pipeline] Fetching issue map (JIRA/GitHub auto-detection)...")
+        fi_cmd = [sys.executable, FETCH_ISSUES, "--out", str(issue_map_path)]
+        if git_root and git_root.exists():
+            fi_cmd += ["--git-root", str(git_root)]
+        token = os.getenv("GH_TOKEN") or os.getenv("GITHUB_TOKEN")
+        if token:
+            fi_cmd += ["--token", token]
+        fi_rc = subprocess.call(fi_cmd)
+        if fi_rc != 0:
+            print("  [risk-pipeline] Issue fetch failed or skipped — continuing without typed churn.")
+            issue_map_path = None
+    elif issue_map_path.exists():
+        print(f"\n[risk-pipeline] Reusing existing issue_map.json")
+
+    # --- Step 2: Export .dv8-clsx / .dv8-dsm binary files → JSON + CSV ---
+    if os.path.isfile(EXPORT_DV8) and interp_root.exists():
+        already_exported = any(interp_root.rglob("*_files.json"))
+        if already_exported:
+            print("\n[risk-pipeline] DV8 binary exports already present — skipping re-export.")
+        else:
+            print("\n[risk-pipeline] Exporting DV8 binary anti-pattern files → JSON/CSV...")
+            subprocess.call([sys.executable, EXPORT_DV8, "--all", str(interp_root)])
+
+    # --- Step 3: Compute multi-signal file risk scores ---
+    risk_json = interp_root / "file_risk_scores.json"
+    if risk_json.exists():
+        print(f"\n[risk-pipeline] Reusing existing file_risk_scores.json")
+    elif os.path.isfile(COMPUTE_RISK) and interp_root.exists():
+        print("\n[risk-pipeline] Computing file risk scores...")
+        cr_cmd = [sys.executable, COMPUTE_RISK, str(interp_root), "--verbose"]
+        if git_root and git_root.exists():
+            cr_cmd += ["--git-root", str(git_root)]
+        if issue_map_path and pathlib.Path(str(issue_map_path)).exists():
+            # Pass issue map to backfill if it was generated — already baked into payloads,
+            # but log for traceability
+            pass
+        subprocess.call(cr_cmd)
+    else:
+        print(f"\n[risk-pipeline] Skipping risk scores (script not found or INPUT_INTERPRETATION missing)")
+
+    # --- Step 4: Statistical plots ---
+    if os.path.isfile(PLOT_RISK) and risk_json.exists():
+        print("\n[risk-pipeline] Generating risk score statistical plots...")
+        subprocess.call([sys.executable, PLOT_RISK, str(risk_json), "--top-n", "30"])
+
+    print("\n[risk-pipeline] Done.")
+    if risk_json.exists():
+        # Print quick top-5 summary
+        try:
+            import json as _json
+            data = _json.loads(risk_json.read_text(encoding="utf-8"))
+            files = data.get("files", [])
+            if files:
+                print(f"\n{'='*60}")
+                print(f"  TOP-5 MOST DANGEROUS FILES — {repo_name}")
+                print(f"{'='*60}")
+                for f in files[:5]:
+                    aps = ", ".join(f.get("anti_patterns_seen", [])) or "—"
+                    sigs = f.get("signals", {})
+                    print(
+                        f"  #{f['rank']:>2}  score={f['risk_score']:.4f}  {f['file']}\n"
+                        f"       anti-patterns: {aps}\n"
+                        f"       fan-in={sigs.get('hotspot_fanin_score',0):.0f}  "
+                        f"scc={sigs.get('scc_membership_count',0)}  "
+                        f"anti_pattern_count={sigs.get('anti_pattern_count',0)}  "
+                        f"bug_churn={sigs.get('bug_churn_total',0)}"
+                    )
+                print(f"{'='*60}")
+                print(f"  Full results: {risk_json}")
+                plots_dir = risk_json.parent / "plots" / "risk_stats"
+                if plots_dir.exists():
+                    print(f"  Plots: {plots_dir}")
+        except Exception:
+            pass
+
+
+def _load_rich_qa_context(temporal_root: pathlib.Path) -> tuple:
+    """
+    Load risk scores + bug-linked commit log for Q&A context injection.
+    Returns (risk_score_context: str, commit_context: str, mscore_breakdown: str, report_text: str).
+    All strings are empty if data not found.
+    """
+    risk_score_context = ""
+    commit_context = ""
+    report_text = ""
+
+    # Risk scores
+    risk_json = temporal_root / "INPUT_INTERPRETATION" / "file_risk_scores.json"
+    if risk_json.exists():
+        try:
+            risk_data = json.loads(risk_json.read_text(encoding="utf-8"))
+            top_files = risk_data.get("files", [])[:25]
+            lines_rs = ["rank | file | risk_score | bug_churn | anti_patterns | scc_revisions | co_change | anti_pattern_types"]
+            lines_rs.append("---" * 12)
+            for f in top_files:
+                s = f.get("signals", {})
+                aps = ", ".join(f.get("anti_patterns_seen", [])[:3])
+                lines_rs.append(
+                    f"#{f['rank']:2d} | {f['file'].split('/')[-1]:40s} | {f['risk_score']:.3f} | "
+                    f"bug={s.get('bug_churn_total',0):5d} | ap={s.get('anti_pattern_count',0):3d} revisions | "
+                    f"scc={s.get('scc_membership_count',0):2d} revisions | co={s.get('co_change_without_dep',0):2d} | [{aps}]"
+                )
+            risk_score_context = "\n".join(lines_rs)
+            print(f"  [query] Risk scores: top {len(top_files)} files loaded")
+        except Exception as exc:
+            print(f"  [query] WARNING: Could not load risk scores: {exc}")
+
+    # Bug-linked commits from issue_map
+    issue_map_path = temporal_root / "issue_map.json"
+    if issue_map_path.exists():
+        try:
+            issue_data = json.loads(issue_map_path.read_text(encoding="utf-8"))
+            summaries_map = issue_data.get("summaries", {})
+            issues_map = issue_data.get("issues", {})
+            commit_log = issue_data.get("commit_log", [])
+            _jira_re = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
+            _bug_kw = re.compile(r"\b(fix|bug|hotfix|patch|defect|regress)\b", re.IGNORECASE)
+            bug_commits = []
+            for c in commit_log:
+                subj = c.get("subject", "")
+                jira_refs = _jira_re.findall(subj)
+                is_bug_jira = any(issues_map.get(k) == "bug" for k in jira_refs)
+                is_bug_kw = bool(_bug_kw.search(subj))
+                if is_bug_jira or is_bug_kw:
+                    issue_title = ""
+                    for k in jira_refs:
+                        if k in summaries_map:
+                            issue_title = f" ({summaries_map[k]})"
+                            break
+                    bug_commits.append(f"- [{c.get('date','')[:10]}] {c.get('hash','')[:8]} {subj}{issue_title}")
+            commit_context = "\n".join(bug_commits[:80])
+            print(f"  [query] Commit log: {len(bug_commits)} bug-linked commits loaded")
+        except Exception as exc:
+            print(f"  [query] WARNING: Could not load commit log: {exc}")
+
+    # Most recent combined interpretation report
+    interp_out = temporal_root / "OUTPUT_INTERPRETATION"
+    if interp_out.exists():
+        existing = sorted(
+            interp_out.rglob("temporal_interpretation_report_*.md"),
+            key=lambda p: p.stat().st_mtime
+        )
+        if existing:
+            report_text = existing[-1].read_text(encoding="utf-8")
+            print(f"  [query] Interpretation report: {existing[-1].name}")
+
+    return risk_score_context, commit_context, report_text
+
+
+def tool_query(plan: dict) -> int:
+    """
+    Fast Q&A on existing analysis results.
+    Uses risk scores + commit log + M-score data + interpretation report.
+    No re-running DV8 or LLM interpretation — answers in 1-3 minutes.
+    Falls back to Stage 3 RAG engine if no temporal analysis exists for this repo.
+    """
+    question = plan.get("question") or plan.get("user_request") or ""
+    repo = plan.get("repo") or None
+    model = plan.get("model") or "deepseek-r1:32b"
+
+    # --- Try to find an existing temporal analysis for this repo ---
+    temporal_root = None
+    if repo:
+        test_auto_dir = pathlib.Path(THIS_DIR).parent
+        repos_dir = test_auto_dir / "REPOS_ANALYZED" / repo
+        if repos_dir.exists():
+            candidates = [p for p in repos_dir.glob("temporal_analysis*/") if p.is_dir()
+                          and (p / "timeseries.json").exists()]
+            if candidates:
+                temporal_root = max(candidates, key=lambda p: p.stat().st_mtime)
+                print(f"[query] Using temporal analysis: {temporal_root.name}")
+
+    if temporal_root:
+        # Rich Q&A: risk scores + commit log + interpretation report
+        risk_score_context, commit_context, report_text = _load_rich_qa_context(temporal_root)
+        mscore_breakdown = ""
+        try:
+            import importlib.util as _ilu
+            _spec = _ilu.spec_from_file_location("itb", pathlib.Path(INTERPRET_TEMPORAL))
+            _mod = _ilu.module_from_spec(_spec)
+            _spec.loader.exec_module(_mod)
+            mscore_breakdown = _mod.load_mscore_worst_modules(temporal_root)
+        except Exception as exc:
+            print(f"  [query] WARNING: Could not load mscore breakdown: {exc}")
+
+        if not question:
+            sep = "=" * 70
+            print(f"\n{sep}\n  INTERACTIVE Q&A — commons-io\n"
+                  f"  Data: risk scores + {temporal_root.name}\n"
+                  f"  Type 'q' to quit.\n{sep}")
+            try:
+                question = input("  Your question: ").strip()
+            except EOFError:
+                question = ""
+            if not question or question.lower() in ("q", "quit", "exit"):
+                return 0
+
+        conversation = []
+        current_question = question
+        sep = "=" * 70
+        while current_question:
+            print(f"\nAnswering: {current_question!r}")
+            prior = "\n\n".join(conversation)
+            ctx = (prior + "\n\n" + report_text) if prior else report_text
+            try:
+                import importlib.util as _ilu
+                _spec = _ilu.spec_from_file_location("itb", pathlib.Path(INTERPRET_TEMPORAL))
+                _mod = _ilu.module_from_spec(_spec)
+                _spec.loader.exec_module(_mod)
+                raw = _mod.answer_user_question(
+                    model, current_question, ctx,
+                    mscore_breakdown=mscore_breakdown,
+                    timeout_s=900,
+                    risk_score_context=risk_score_context,
+                    commit_context=commit_context,
+                )
+                answer = _mod.strip_thinking_and_fences(raw)
+            except Exception as exc:
+                answer = f"[query error] {exc}"
+
+            print(f"\n{sep}\n  ANSWER\n  Q: {current_question}\n{sep}")
+            print(answer)
+            print(sep)
+            conversation.append(f"Q: {current_question}\nA: {answer}")
+
+            # Save answer
+            run_folder = temporal_root / "OUTPUT_INTERPRETATION"
+            if run_folder.exists():
+                # Find most recent run subfolder to save into
+                subfolders = sorted(run_folder.iterdir(), key=lambda p: p.stat().st_mtime)
+                save_folder = subfolders[-1] if subfolders else run_folder
+            else:
+                save_folder = temporal_root
+            from datetime import datetime as _dt
+            now = _dt.now()
+            answer_path = save_folder / f"USER_ANSWER_{now.strftime('%Y%m%d')}.md"
+            entry = f"\n---\n\n**Q ({now.strftime('%H:%M:%S')})**: {current_question}\n\n{answer}\n"
+            if answer_path.exists():
+                with open(answer_path, "a", encoding="utf-8") as f:
+                    f.write(entry)
+            else:
+                answer_path.write_text(
+                    f"# Q&A Session — {now.strftime('%Y%m%d')}\n\n**Model**: {model}\n\n---\n\n"
+                    f"**Q ({now.strftime('%H:%M:%S')})**: {current_question}\n\n{answer}\n",
+                    encoding="utf-8"
+                )
+            print(f"  Saved: {answer_path}")
+
+            print(f"\n{sep}\n  FOLLOW-UP (Enter / 'q' to finish)\n{sep}")
+            try:
+                next_q = input("  Your question: ").strip()
+            except EOFError:
+                break
+            if not next_q or next_q.lower() in ("q", "quit", "exit"):
+                break
+            if not any(c.isalpha() or c.isdigit() for c in next_q):
+                break
+            current_question = next_q
+        return 0
+
+    # --- Fallback: Stage 3 RAG engine (no temporal analysis found) ---
+    print(f"[query] No temporal analysis found for '{repo}' — falling back to RAG engine")
+    stage3_dir = pathlib.Path(QUERY_ENGINE).parent
+    if not stage3_dir.exists():
+        print(f"[query] Stage 3 not found at {stage3_dir}")
+        return 1
+    index_file = stage3_dir / ".rag_index.json"
+    if not index_file.exists():
+        print("[query] RAG index not found — building now (first-time setup)...")
+        rag_index_py = stage3_dir / "rag_index.py"
+        subprocess.run([sys.executable, str(rag_index_py)], check=False)
+    num_ctx = int(plan.get("num_ctx") or 4096)
+    cmd = [sys.executable, str(QUERY_ENGINE), "--model", model, "--num-ctx", str(num_ctx)]
+    if repo:
+        cmd += ["--repo", repo]
+    if question:
+        cmd += ["--question", question]
+        print(f"[query] Question: {question}")
+        print(f"[query] Repo: {repo or 'all'}, Model: {model}\n")
+    else:
+        print(f"[query] Starting interactive session — Repo: {repo or 'all'}, Model: {model}")
+    return subprocess.run(cmd).returncode
+
 
 def tool_interpret_temporal(plan: dict) -> int:
     """
@@ -367,7 +687,7 @@ def tool_interpret_temporal(plan: dict) -> int:
                 print(f"Auto-selected most recent temporal folder: {folder}")
     if not folder:
         # Try to extract quoted path from user_request
-        m = re.search(r"['\"]([^'\"]+INPUT_INTERPRETATION[^'\"]*)['\"]", ur)
+        m = re.search(r"['\"]([^'\"]+(INPUT_INTERPRETATION|OUTPUT_INTERPRETATION)[^'\"]*)['\"]", ur)
         folder = m.group(1) if m else None
     if not folder:
         # Try unquoted temporal_analysis_* folder name in prompt
@@ -385,7 +705,7 @@ def tool_interpret_temporal(plan: dict) -> int:
                     folder = str(max(candidates, key=lambda p: p.stat().st_mtime))
                     print(f"Auto-selected most recent temporal folder: {folder}")
     if not folder:
-        print("No temporal folder provided. Pass a temporal_analysis_* path or its INPUT_INTERPRETATION subfolder.")
+        print("No temporal folder provided. Pass a temporal_analysis_* path or its INPUT_INTERPRETATION/OUTPUT_INTERPRETATION subfolder.")
         return 1
     folder = str(folder).strip()
     if "..." in folder:
@@ -396,7 +716,7 @@ def tool_interpret_temporal(plan: dict) -> int:
         print(f"Could not resolve temporal root from: {folder}")
         try:
             pp = pathlib.Path(folder).expanduser().resolve()
-            base = pp.parent if pp.name == "INPUT_INTERPRETATION" else pp
+            base = pp.parent if pp.name in ("INPUT_INTERPRETATION", "OUTPUT_INTERPRETATION") else pp
             if base.exists():
                 candidates = list(base.glob("temporal_analysis*/timeseries.json"))
                 if candidates:
@@ -465,9 +785,12 @@ def tool_interpret_temporal(plan: dict) -> int:
             print(f"Missing backfill script: {BACKFILL_TEMPORAL}")
             return 1
 
+    # --- Risk pipeline: issue fetch → DV8 export → risk scores → plots ---
+    _run_risk_pipeline(tr, repo_name, git_root=repo if (repo / ".git").exists() else None)
+
     # --- Check for existing interpretation runs ---
     model_safe = model.replace("/", "_").replace(":", "_")
-    interp_dir = tr / "INPUT_INTERPRETATION"
+    interp_dir = tr / "OUTPUT_INTERPRETATION"
     existing_reports = sorted(
         interp_dir.glob(f"*/temporal_interpretation_report_{model_safe}*.md"),
         key=lambda p: p.stat().st_mtime, reverse=True
@@ -505,6 +828,8 @@ def tool_interpret_temporal(plan: dict) -> int:
                 _spec = importlib.util.spec_from_file_location("itb", pathlib.Path(INTERPRET_TEMPORAL))
                 _mod = importlib.util.module_from_spec(_spec)
                 _spec.loader.exec_module(_mod)
+                _risk_ctx, _commit_ctx, _ = _load_rich_qa_context(tr)
+                _mscore_bd = _mod.load_mscore_worst_modules(tr)
                 conversation = []
                 current_question = user_question
                 sep = "=" * 70
@@ -512,7 +837,11 @@ def tool_interpret_temporal(plan: dict) -> int:
                     print(f"\nAnswering: {current_question!r}")
                     prior = "\n\n".join(conversation)
                     ctx = (prior + "\n\n" + report_text) if prior else report_text
-                    raw = _mod.answer_user_question(model, current_question, ctx, timeout_s=900)
+                    raw = _mod.answer_user_question(model, current_question, ctx,
+                                                    mscore_breakdown=_mscore_bd,
+                                                    timeout_s=900,
+                                                    risk_score_context=_risk_ctx,
+                                                    commit_context=_commit_ctx)
                     answer = _mod.strip_thinking_and_fences(raw)
                     print(f"\n{sep}\n  ANSWER\n  Q: {current_question}\n{sep}\n{answer}\n{sep}")
                     conversation.append(f"Q: {current_question}\nA: {answer}")
@@ -1051,6 +1380,13 @@ def tool_temporal_analysis(plan: dict) -> int:
             bf_rc = subprocess.call(bf_cmd)
             if bf_rc == 0:
                 print("Interpretation bundle ready.")
+                # Risk pipeline: issue fetch → DV8 binary export → risk scores → plots
+                _git_root = None
+                if repo and "://" not in str(repo):
+                    _candidate = pathlib.Path(repo).expanduser().resolve()
+                    if (_candidate / ".git").exists():
+                        _git_root = _candidate
+                _run_risk_pipeline(temporal_folder, repo_name, git_root=_git_root)
             else:
                 print("Warning: Backfill failed; interpretation may not work.")
 
@@ -1087,10 +1423,19 @@ def tool_temporal_analysis(plan: dict) -> int:
                 refine_msg = f"Refine around steepest M-score change: {since_date} → {until_date} (Δ≈{best[0]:.2f}%)"
                 print(f"\n{refine_msg}")
 
+            # If plan carries a user_question (from JSON dispatch), inject it into user_request
+            # so _extract_user_question() and tool_interpret_temporal can find it.
+            plan_question = plan.get("user_question") or plan.get("question") or ""
+            if plan_question and "answer:" not in (ur or "").lower():
+                ur = (ur + f"\n\nanswer: {plan_question}").strip() if ur else f"answer: {plan_question}"
+
             # Check if user explicitly asked for interpretation in original request
             # Suppress auto-interpret if user said "only analyze" / "just analyze" / "analyze only"
             analyze_only = ur and any(k in ur.lower() for k in ['only analyze', 'just analyze', 'analyze only', 'no interpret', 'without interpret'])
-            auto_interpret = (not analyze_only) and ur and any(k in ur.lower() for k in [' interpret', 'then interpret', 'and interpret', ' explain why'])
+            auto_interpret = (not analyze_only) and (
+                plan_question  # always interpret when a question was explicitly provided
+                or (ur and any(k in ur.lower() for k in [' interpret', 'then interpret', 'and interpret', ' explain why']))
+            )
 
             if auto_interpret:
                 # Skip the menu, go straight to interpretation
@@ -1133,7 +1478,8 @@ def tool_temporal_analysis(plan: dict) -> int:
                 return tool_interpret_temporal({
                     "repo": temporal_folder or repo,
                     "model": interpret_model,
-                    "user_request": plan.get("user_request") or ur
+                    # Pass the (possibly question-injected) user_request so the Q&A step fires
+                    "user_request": ur or plan.get("user_request") or "",
                 })
             else:
                 print("No further action.")
@@ -1472,6 +1818,10 @@ def run_tool(plan: dict, user_request: str) -> int:
         "interpret_folder": "interpret_temporal",
         "peak": "peak_full_arch",
         "peak_full_arch": "peak_full_arch",
+        "query": "query",
+        "ask": "query",
+        "fast query": "query",
+        "fast_query": "query",
     }
 
     tool = tool_map.get(tool, tool)
@@ -1483,6 +1833,25 @@ def run_tool(plan: dict, user_request: str) -> int:
         tool = "peak_full_arch"
     if any(kw in ur for kw in ["what is", "what's", "whats", "explain ", "define "]) and not any(kw in ur for kw in ["interpret", "why ", "over time", "revisions", "commits"]):
         tool = "explain_concept"
+    # Fast-path: "query <repo>[<model>]: <question>" — bypass LLM dispatch
+    # Interactive: "query commons-io[32b]" (no colon, no question) → REPL session
+    import re as _re
+    _q_match = _re.match(
+        r'^(?:query|ask|fast\s+query)\s+([\w\-]+)(?:\[([\w:\-\.]+)\])?\s*(?::\s*(.+))?$',
+        (user_request or '').strip(), _re.I,
+    )
+    if _q_match:
+        tool = "query"
+        plan["repo"] = _q_match.group(1).strip()
+        if _q_match.group(2):
+            plan["interp_model"] = _q_match.group(2).strip()
+        if _q_match.group(3):
+            plan["question"] = _q_match.group(3).strip()
+        # group(3) absent → interactive session (no question set)
+    elif ur.startswith("query:") or ur.startswith("ask:"):
+        tool = "query"
+        plan["question"] = (user_request or '').split(":", 1)[-1].strip()
+        plan.setdefault("repo", None)
 
     if tool == "analyze_repo":
         print("Tool: Analyze Repository\n")
@@ -1551,6 +1920,14 @@ def run_tool(plan: dict, user_request: str) -> int:
         p['user_request'] = user_request
         return tool_peak_full_arch(p)
 
+    elif tool == "query":
+        print("Tool: Fast RAG Query (Stage 3)\n")
+        p = dict(plan)
+        if not p.get("question"):
+            # Extract question from user_request if not already parsed
+            p["question"] = user_request
+        return tool_query(p)
+
     else:
         print(f"Unknown tool: {tool}")
         print("Defaulting to analyze_repo...")
@@ -1612,6 +1989,29 @@ def main():
         sys.exit(rc)
 
     print(f"\nYou asked: {user_req}\n")
+
+    # ── Fast-path: bypass Ollama planner for "query <repo>[model]: question" ──
+    # Interactive: "query commons-io[32b]" with no colon/question → REPL session
+    import re as _re_main
+    _qm = _re_main.match(
+        r'^(?:query|ask|fast\s+query)\s+([\w\-]+)(?:\[([\w:\-\.]+)\])?\s*(?::\s*(.+))?$',
+        user_req.strip(), _re_main.I,
+    )
+    if _qm:
+        _fast_plan = {
+            "tool": "query",
+            "repo": _qm.group(1).strip(),
+        }
+        if _qm.group(3):
+            _fast_plan["question"] = _qm.group(3).strip()
+        if _qm.group(2):
+            _fast_plan["interp_model"] = _qm.group(2).strip()
+        if model_override and not _fast_plan.get("model"):
+            _fast_plan["model"] = model_override
+        print(f"Plan (fast-path): {json.dumps(_fast_plan, indent=2)}\n")
+        rc = run_tool(_fast_plan, user_req)
+        sys.exit(rc)
+
     print("Planning...\n")
 
     try:
@@ -1647,7 +2047,7 @@ def main():
         if any(k in ur for k in _interpret_keywords) or _interpret_simple:
             p = {"tool": "interpret_temporal", "user_request": user_req}
             # Prefer quoted path if present
-            m = re.search(r"['\"]([^'\"]*(?:INPUT_INTERPRETATION|temporal_analysis)[^'\"]*)['\"]", user_req)
+            m = re.search(r"['\"]([^'\"]*(?:INPUT_INTERPRETATION|OUTPUT_INTERPRETATION|temporal_analysis)[^'\"]*)['\"]", user_req)
             if m:
                 p["repo"] = m.group(1)
             # Pass repo name so tool_interpret_temporal can find latest folder

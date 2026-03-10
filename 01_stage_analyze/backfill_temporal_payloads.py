@@ -280,6 +280,16 @@ def main():
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copytree(src, dest)
 
+        # Export DV8 binary anti-pattern files (.dv8-clsx / .dv8-dsm) → JSON + CSV
+        # Written into the mirrored OutputData so they live alongside the originals.
+        dest_out = dest_rev / "OutputData"
+        if dest_out.is_dir():
+            try:
+                from export_dv8_binary_files import export_output_dir as _export_dv8
+                _export_dv8(dest_out, verbose=False)
+            except Exception as _exc:
+                print(f"  ! DV8 binary export failed for {rev_dir.name}: {_exc}")
+
     # Copy aggregate artifacts useful for the interpreter (plots + timeseries)
     plots_src = root / "plots"
     if plots_src.exists():

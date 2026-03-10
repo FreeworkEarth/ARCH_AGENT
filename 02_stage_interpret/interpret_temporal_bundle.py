@@ -19,9 +19,18 @@ import csv
 import json
 import re
 import subprocess
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+
+# Stage 3 LLM backend (optional import — falls back to direct subprocess if not available)
+try:
+    sys.path.insert(0, str(Path(__file__).parent.parent / "03_stage_query"))
+    from llm_backend import LLMBackend as _LLMBackend
+    _HAS_LLM_BACKEND = True
+except ImportError:
+    _HAS_LLM_BACKEND = False
 
 
 def read_json(path: Path) -> Dict[str, Any]:
@@ -48,7 +57,12 @@ def extract_managers_special(report_text: str) -> str:
     return report_text[start:end].strip()
 
 
-def query_ollama(model: str, prompt: str, timeout_s: int = 900) -> str:
+def query_ollama(model: str, prompt: str, timeout_s: int = 900, num_ctx: int = 32768) -> str:
+    """Call LLM via LLMBackend (supports Ollama/vLLM/API via env vars)."""
+    if _HAS_LLM_BACKEND:
+        llm = _LLMBackend(model=model, num_ctx=num_ctx)
+        return llm.generate(prompt, timeout_s=timeout_s)
+    # Fallback: direct subprocess (original behaviour)
     res = subprocess.run(["ollama", "run", model, prompt], capture_output=True, text=True, timeout=timeout_s)
     out = (res.stdout or "").strip()
     if out:
@@ -59,7 +73,9 @@ def query_ollama(model: str, prompt: str, timeout_s: int = 900) -> str:
 def strip_thinking_and_fences(text: str) -> str:
     if not text:
         return text
-    # Strip leading Thinking... block
+    # Strip <think>...</think> blocks (Deepseek-R1 style)
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    # Strip leading Thinking... block (older Ollama style)
     lines = text.splitlines()
     if lines and lines[0].strip().lower().startswith("thinking"):
         end_idx = None
@@ -209,7 +225,7 @@ def build_deterministic_overall(
     lines.append("")
     lines.append("## Notes")
     lines.append("- metrics source: `timeseries.json`")
-    lines.append("- per-transition reports: `INPUT_INTERPRETATION/drh_diff_report_<model>_newX_oldY.md`")
+    lines.append("- per-transition reports: `OUTPUT_INTERPRETATION/<run>/drh_diff_report_<model>_newX_oldY.md`")
     lines.append("- evidence graph diffs: `INPUT_INTERPRETATION/EVIDENCE_GRAPH_DIFF/`")
     return "\n".join(lines).rstrip() + "\n"
 
@@ -253,12 +269,15 @@ def _load_clique_count(rev_folder: Path) -> int:
     return 0
 
 
-def load_mscore_worst_modules(temporal_root: Path, top_n: int = 5) -> str:
+def load_mscore_worst_modules(temporal_root: Path, top_n: int = 5, max_revisions: int = 5) -> str:
     """
     For each revision folder under temporal_root, load mscore_exact_components.json
     and return the top_n worst modules ranked by contribution (= cross_penalty × size_factor).
     Also loads FanIn/FanOut per file and clique count to give a multi-signal refactoring picture.
     Returns a formatted string ready to embed in an LLM prompt.
+
+    max_revisions: only include the most recent N revisions (revision_number=1 is newest).
+    Default 5 keeps the context budget manageable (~5000 chars vs 32k for all 36 revisions).
     """
     lines = []
     # Revision folders live INSIDE temporal_root named NN_reponame_DDMMYYYY_HHMM
@@ -273,7 +292,11 @@ def load_mscore_worst_modules(temporal_root: Path, top_n: int = 5) -> str:
         except (ValueError, IndexError):
             continue
 
-    for rev_n in sorted(rev_map.keys()):
+    # revision_number=1 is newest — take the lowest revision numbers (most recent)
+    all_rev_nums = sorted(rev_map.keys())
+    recent_rev_nums = all_rev_nums[:max_revisions]
+
+    for rev_n in recent_rev_nums:
         path = rev_map[rev_n]
         # path: temporal_root/NN_repo/OutputData/metrics/mscore_exact_components.json
         rev_folder = path.parents[2]  # NN_repo/ folder
@@ -356,42 +379,118 @@ PER-TRANSITION COMPREHENSIVE SUMMARIES (chronological newest→older):
 
 
 def answer_user_question(model: str, question: str, report_text: str,
-                         mscore_breakdown: str = "", timeout_s: int = 900) -> str:
+                         mscore_breakdown: str = "", timeout_s: int = 900,
+                         risk_score_context: str = "", commit_context: str = "") -> str:
     """Call the LLM to answer a specific user question using the combined report as context.
 
     Builds a priority context: M-score worst modules first (most useful for file-level questions),
+    then risk score table (multi-signal: bug churn + anti-patterns + fan-in + SCC + co-change),
     then Comprehensive Summary blocks (each labelled with commit dates for date-range questions),
-    then narrative up to a total of ~12000 chars.
+    then narrative up to a total of ~16000 chars.
     """
-    # 1. M-score worst modules — put first so it's never truncated away
+    # Context budget: 28000 chars (fits comfortably in 32k num_ctx with room for prompt boilerplate).
+    # Hard cap every section so the total is ALWAYS within budget regardless of input size.
+    CONTEXT_BUDGET = 28000
+
+    # 1. M-score worst modules (capped to recent 5 revisions by caller; hard cap 6000 chars here too)
     priority_context = ""
     if mscore_breakdown and "(mscore components not available)" not in mscore_breakdown:
         priority_context = (
-            "## M-SCORE WORST MODULES PER REVISION (top 5 by contribution = cross_penalty × size_factor; FanIn/FanOut per file; clique_files count in header):\n"
-            + mscore_breakdown + "\n\n"
+            "## M-SCORE WORST MODULES (most recent 5 revisions, top 5 by contribution = cross_penalty × size_factor; FanIn/FanOut per file):\n"
+            + mscore_breakdown[:6000] + "\n\n"
         )
 
-    # 2. Extract Comprehensive Summary blocks — they carry date labels for date-range questions
+    # 2. Risk score table — multi-signal evidence (bug churn, anti-patterns, SCC, co-change)
+    risk_section = ""
+    if risk_score_context:
+        risk_section = (
+            "## MULTI-SIGNAL FILE RISK SCORES (bug_churn 30% + anti_pattern 25% + fan_in 20% + scc 15% + co_change 10%):\n"
+            + risk_score_context[:4000] + "\n\n"
+        )
+
+    # 3. Commit context for M-score causality questions
+    commit_section = ""
+    if commit_context:
+        commit_section = (
+            "## BUG-LINKED COMMITS (JIRA-typed or keyword-matched; most recent first):\n"
+            + commit_context[:6000] + "\n\n"
+        )
+
+    # 4. Extract Comprehensive Summary blocks — they carry date labels for date-range questions
     summary_blocks = re.findall(
         r'(## Comprehensive Summary.*?)(?=\n## |\Z)', report_text, re.DOTALL
     )
-    summary_text = "\n\n".join(summary_blocks[:6])[:6000]
+    summary_text = "\n\n".join(summary_blocks[:8])[:6000]
 
-    # 3. Fill remaining budget with the narrative from the full report
-    budget = 12000 - len(priority_context) - len(summary_text)
-    narrative = report_text[:max(0, budget)]
+    # 5. Fill remaining budget with narrative (usually 0 — summaries already cover it)
+    used = len(priority_context) + len(risk_section) + len(commit_section) + len(summary_text)
+    remaining = max(0, CONTEXT_BUDGET - used)
+    narrative = report_text[:remaining] if remaining > 500 else ""
 
-    context = priority_context + summary_text + ("\n\n" if summary_text else "") + narrative
+    context = priority_context + risk_section + commit_section + summary_text + ("\n\n" if summary_text else "") + narrative
 
-    # Detect file/refactor questions — use ultra-direct numbered-list prompt to prevent narrative drift
     q_lower = question.lower()
-    is_files_question = any(k in q_lower for k in [
-        "refactor", "specific file", "which file", "bad file", "worst file",
-        "file to fix", "file to improve", "give me file", "5 file", "top file",
-        "files to", "file i should", "files i should",
+
+    # Detect "most dangerous / worst files" questions — use risk score data
+    is_danger_question = any(k in q_lower for k in [
+        "dangerous", "most dangerous", "riskiest", "worst file", "bad file",
+        "technical debt", "most debt", "debt", "problematic", "priority",
+        "5 most", "top 5", "top file",
     ])
 
-    if is_files_question and priority_context:
+    # Detect M-score causality questions
+    is_mscore_causality = any(k in q_lower for k in [
+        "why did m-score", "why m-score", "why did the m-score", "m-score got worse",
+        "m-score deteriorat", "m-score declin", "what caused", "what change caused",
+        "linked to", "link to commit", "which commit", "which feature", "which bug",
+        "quality decrease", "quality declin", "decreasing in quality", "decrease in quality",
+    ])
+
+    # Detect refactor/structural questions — use M-score module data
+    is_files_question = any(k in q_lower for k in [
+        "refactor", "specific file", "which file", "file to fix", "file to improve",
+        "give me file", "files to", "file i should", "files i should",
+    ])
+
+    if is_danger_question and risk_section:
+        prompt = f"""You are a software architect. Answer the question below using the MULTI-SIGNAL FILE RISK SCORES as your primary evidence.
+
+The risk score combines 5 signals measured across 36 monthly snapshots of the repository:
+- bug_churn_total: lines changed in bug-fix commits (JIRA-linked or keyword-matched) — weight 30%
+- anti_pattern_count: number of revisions where the file is in a DV8 anti-pattern (clique/cycle/unhealthy inheritance) — weight 25%
+- hotspot_fanin_score: cumulative fan-in (blast radius if changed) — weight 20%
+- scc_membership_count: revisions where file is in a cyclic SCC (circular dependency) — weight 15%
+- co_change_without_dep: behaviorally coupled partners with no declared structural dependency — weight 10%
+
+Hard rules:
+- Do NOT output reasoning or <think> blocks.
+- For each file: state its rank, risk_score, and cite at least 2 specific signal values (bug_churn, anti_pattern_count, etc.) from the data.
+- Explain what each signal means architecturally (e.g. "high bug_churn means this file is actively being patched for defects").
+- Also cross-reference with M-SCORE WORST MODULES data if relevant (file appears in both → doubly confirmed).
+- Format: numbered list, one file per item. Max 400 words total.
+- Do NOT invent numbers. Use only values from the data below.
+
+QUESTION: {question}
+
+{context}
+"""
+    elif is_mscore_causality and commit_section:
+        prompt = f"""You are a software architect. Answer the question about WHY the M-score changed over time, linking metric changes to specific commits, bugs, and code changes.
+
+Hard rules:
+- Do NOT output reasoning or <think> blocks.
+- For each M-score drop (negative Δ): find the time window from the COMPREHENSIVE SUMMARY blocks, then look in the COMMIT CONTEXT for commits in that window. Identify bug-fix commits or feature commits that touch files already in DV8 anti-patterns or SCCs.
+- Causality chain: "M-score dropped Δ=-X at transition old=revN → new=revM (DATE). In that window, commit HASH (DATE) added/changed FILE which joined SCC Y / entered anti-pattern Z, increasing propagation cost by +P."
+- If a JIRA issue is mentioned in a commit message, cite it and its type (bug/feature).
+- Group: distinguish deterioration caused by (a) new features adding coupling vs (b) bug fixes patching heavily-coupled files vs (c) refactoring that accidentally increased coupling.
+- Format: 1 paragraph per significant drop event, with commit evidence. Max 500 words.
+- Do NOT invent numbers or files not in the data.
+
+QUESTION: {question}
+
+{context}
+"""
+    elif is_files_question and priority_context:
         prompt = f"""You are a software architect. Output ONLY a numbered list — no paragraphs, no headers, no conclusions, no thinking.
 
 STRICT FORMAT (follow exactly, nothing else):
@@ -418,21 +517,22 @@ M-SCORE WORST MODULES (most recent revision first, ranked by contribution):
         prompt = f"""You are an expert software architect answering a specific question about a repository's architectural evolution.
 
 Hard rules:
-- Answer ONLY the question asked. Be direct and concise (max 300 words).
+- Answer ONLY the question asked. Be direct and concise (max 400 words).
 - Use ONLY facts from the report below. Do NOT invent numbers or files not mentioned in the report.
 - Do NOT use background knowledge about library versions, release history, or project wikis — cite only what is in the report.
+- Do NOT output reasoning or <think> blocks.
 - Format: short header, bullet points for evidence, 1-sentence conclusion.
-- Do NOT output reasoning or "thinking" blocks.
-- For date-range questions (e.g. "from 2023 to 2024"): the Comprehensive Summary blocks above are labelled with transition dates in the format "old=revN (YYYY-MM-DD) → new=revM (YYYY-MM-DD)". Find the transition(s) whose dates fall within the range asked and cite their specific metric deltas. Do NOT give a generic answer about overall trends.
-- For "which files to refactor" questions: use the M-SCORE WORST MODULES section above. Modules are ranked by contribution (cross_penalty × size_factor) — this is the correct refactoring priority because it weights both violation severity AND module size (larger coupled modules are harder to fix). List files from the highest-contribution modules first, citing their FanIn/FanOut values. Also note the clique_files count in the revision header — if high, mention that circular dependency clusters require coordinated refactoring. Do NOT use layer-movement data (files that moved between layers). Do NOT rank by cross_penalty alone.
-- When citing metric changes, ALWAYS include both absolute delta and percentage (e.g. "+7.38 points, +15.02%").
+- For date-range questions: find transitions whose dates fall within the range asked and cite their specific metric deltas.
+- For "technical debt" questions: combine the MULTI-SIGNAL RISK SCORES (which files have most bugs+churn+anti-patterns) with the M-SCORE WORST MODULES (structural coupling) to identify groups of files that are both structurally bad AND actively causing problems.
+- For "most rapidly decreasing in quality" questions: find transitions with the largest negative M-score deltas (look at the transition summaries), identify which files changed in those windows (from COMMIT CONTEXT), and name the specific anti-patterns/SCCs that worsened.
+- When citing metric changes, ALWAYS include both absolute delta and percentage.
 
 QUESTION: {question}
 
-REPORT (M-score data first, then transition summaries with dates, then narrative):
+REPORT (M-score data first, then risk scores, then transition summaries with dates, then narrative):
 {context}
 """
-    return query_ollama(model, prompt, timeout_s=timeout_s)
+    return query_ollama(model, prompt, timeout_s=timeout_s, num_ctx=32768)
 
 
 def main() -> int:
@@ -448,6 +548,8 @@ def main() -> int:
     ap.add_argument("--no-verify", action="store_true", help="Disable verifier pass (default: verify on)")
     ap.add_argument("--user-question", default=None,
                     help="Optional question to answer from the combined report (printed to terminal + saved as USER_ANSWER_*.md)")
+    ap.add_argument("--qa-only", action="store_true",
+                    help="Skip all per-transition processing and run Q&A only on the most recent existing combined report.")
     args = ap.parse_args()
 
     temporal_root = Path(args.temporal_root).expanduser().resolve()
@@ -475,8 +577,115 @@ def main() -> int:
     if len(nums) < 2:
         raise RuntimeError("Need at least 2 revisions.")
 
-    interp_root = temporal_root / "INPUT_INTERPRETATION"
+    interp_root = temporal_root / "OUTPUT_INTERPRETATION"
     interp_root.mkdir(parents=True, exist_ok=True)
+
+    # --- QA-only mode: skip all per-transition work, use existing report ---
+    if args.qa_only:
+        # Find the most recent combined report across all run subfolders
+        existing_reports = sorted(
+            interp_root.rglob("temporal_interpretation_report_*.md"),
+            key=lambda p: p.stat().st_mtime,
+        )
+        if not existing_reports:
+            print("ERROR: --qa-only specified but no existing temporal_interpretation_report_*.md found.", file=sys.stderr)
+            return 1
+        combined_path = existing_reports[-1]
+        run_folder = combined_path.parent
+        print(f"[qa-only] Using existing report: {combined_path}")
+        mscore_breakdown = load_mscore_worst_modules(temporal_root, max_revisions=5)
+        # Jump directly to Q&A section
+        risk_score_context = ""
+        risk_json_path = temporal_root / "INPUT_INTERPRETATION" / "file_risk_scores.json"
+        if risk_json_path.exists():
+            try:
+                risk_data = json.loads(risk_json_path.read_text(encoding="utf-8"))
+                top_files = risk_data.get("files", [])[:25]
+                lines_rs = ["rank | file | risk_score | bug_churn | anti_patterns | scc_revisions | co_change | anti_pattern_types"]
+                lines_rs.append("---" * 12)
+                for f in top_files:
+                    s = f.get("signals", {})
+                    aps = ", ".join(f.get("anti_patterns_seen", [])[:3])
+                    lines_rs.append(
+                        f"#{f['rank']:2d} | {f['file'].split('/')[-1]:40s} | {f['risk_score']:.3f} | "
+                        f"bug={s.get('bug_churn_total',0):5d} | ap={s.get('anti_pattern_count',0):3d} revisions | "
+                        f"scc={s.get('scc_membership_count',0):2d} revisions | co={s.get('co_change_without_dep',0):2d} | [{aps}]"
+                    )
+                risk_score_context = "\n".join(lines_rs)
+                print(f"  [Q&A] Loaded risk scores for top {len(top_files)} files")
+            except Exception as exc:
+                print(f"  [Q&A] WARNING: Could not load risk scores: {exc}")
+        commit_context = ""
+        issue_map_path = temporal_root / "issue_map.json"
+        if issue_map_path.exists():
+            try:
+                issue_data = json.loads(issue_map_path.read_text(encoding="utf-8"))
+                summaries_map = issue_data.get("summaries", {})
+                issues_map = issue_data.get("issues", {})
+                commit_log = issue_data.get("commit_log", [])
+                import re as _re
+                _jira_re = _re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
+                _bug_kw = _re.compile(r"\b(fix|bug|hotfix|patch|defect|regress)\b", _re.IGNORECASE)
+                bug_commits = []
+                for c in commit_log:
+                    subj = c.get("subject", "")
+                    jira_refs = _jira_re.findall(subj)
+                    is_bug_jira = any(issues_map.get(k) == "bug" for k in jira_refs)
+                    is_bug_kw = bool(_bug_kw.search(subj))
+                    if is_bug_jira or is_bug_kw:
+                        issue_title = ""
+                        for k in jira_refs:
+                            if k in summaries_map:
+                                issue_title = f" ({summaries_map[k]})"
+                                break
+                        bug_commits.append(f"- [{c.get('date','')[:10]}] {c.get('hash','')[:8]} {subj}{issue_title}")
+                commit_context = "\n".join(bug_commits[:80])
+                print(f"  [Q&A] Loaded {len(bug_commits)} bug-linked commits")
+            except Exception as exc:
+                print(f"  [Q&A] WARNING: Could not load commit context: {exc}")
+        report_text = combined_path.read_text(encoding="utf-8")
+        sep = "=" * 70
+        conversation: List[str] = []
+        current_question = args.user_question
+        if not current_question:
+            print(f"\n{sep}\n  INTERACTIVE Q&A (qa-only mode)\n{sep}")
+            try:
+                current_question = input("  Your question: ").strip()
+            except EOFError:
+                current_question = ""
+            if not current_question or current_question.lower() in ("q", "quit", "exit"):
+                return 0
+        while current_question:
+            print(f"\nAnswering: {current_question!r}")
+            prior = "\n\n".join(conversation) if conversation else ""
+            context_for_answer = (prior + "\n\n" + report_text) if prior else report_text
+            raw = answer_user_question(args.model, current_question, context_for_answer,
+                                       mscore_breakdown=mscore_breakdown,
+                                       timeout_s=args.ollama_timeout_s,
+                                       risk_score_context=risk_score_context,
+                                       commit_context=commit_context)
+            answer = strip_thinking_and_fences(raw)
+            print(f"\n{sep}\n  ANSWER\n  Q: {current_question}\n{sep}")
+            print(answer)
+            print(sep)
+            conversation.append(f"Q: {current_question}\nA: {answer}")
+            now = datetime.now()
+            day_str = now.strftime("%Y%m%d")
+            time_str = now.strftime("%H:%M:%S")
+            answer_path = run_folder / f"USER_ANSWER_{day_str}.md"
+            mode = "a" if answer_path.exists() else "w"
+            with open(answer_path, mode, encoding="utf-8") as fh:
+                if mode == "w":
+                    fh.write(f"# Q&A Session — {day_str}\n\n**Model**: {args.model}\n\n---\n\n")
+                fh.write(f"**Q ({time_str})**: {current_question}\n\n{answer}\n")
+            print(f"  Saved: {answer_path}")
+            try:
+                current_question = input(f"\n  Follow-up question (Enter to quit): ").strip()
+            except EOFError:
+                break
+            if not current_question or current_question.lower() in ("q", "quit", "exit"):
+                break
+        return 0
 
     # Create a dated run subfolder — all LLM outputs go here for better organisation
     ts = datetime.now().strftime("%y%m%d_%H%M%S")
@@ -565,14 +774,14 @@ def main() -> int:
 
     if not args.no_overall:
         transitions = list(zip(reversed(nums[1:]), reversed(nums[:-1])))
-        mscore_breakdown = load_mscore_worst_modules(temporal_root)
+        mscore_breakdown = load_mscore_worst_modules(temporal_root, max_revisions=5)
         det_overall = build_deterministic_overall(timeseries.get("repo") or repo_path.name, temporal_root, timeseries, reports, transitions).strip()
         if mscore_breakdown and "(mscore components not available)" not in mscore_breakdown:
             det_overall += "\n\n## M-Score Worst Modules Per Revision\n" + mscore_breakdown
         lines.append(det_overall)
         lines.append("")
         if args.llm_overall and not args.no_llm:
-            mscore_breakdown = load_mscore_worst_modules(temporal_root)
+            mscore_breakdown = load_mscore_worst_modules(temporal_root, max_revisions=5)
             prompt = build_overall_prompt(timeseries.get("repo") or repo_path.name, temporal_root, summaries, timeseries, mscore_breakdown)
             overall = query_ollama(args.model, prompt, timeout_s=args.ollama_timeout_s)
             overall = strip_thinking_and_fences(overall)
@@ -613,7 +822,63 @@ def main() -> int:
 
     # Ensure mscore_breakdown is always available for Q&A (may not be set if --no-overall)
     if not mscore_breakdown:
-        mscore_breakdown = load_mscore_worst_modules(temporal_root)
+        mscore_breakdown = load_mscore_worst_modules(temporal_root, max_revisions=5)
+
+    # --- Load enriched context for Q&A ---
+    # Risk score table (multi-signal per-file composite)
+    risk_score_context = ""
+    risk_json_path = temporal_root / "INPUT_INTERPRETATION" / "file_risk_scores.json"
+    if risk_json_path.exists():
+        try:
+            risk_data = json.loads(risk_json_path.read_text(encoding="utf-8"))
+            top_files = risk_data.get("files", [])[:25]
+            lines_rs = ["rank | file | risk_score | bug_churn | anti_patterns | scc_revisions | co_change | anti_pattern_types"]
+            lines_rs.append("---" * 12)
+            for f in top_files:
+                s = f.get("signals", {})
+                aps = ", ".join(f.get("anti_patterns_seen", [])[:3])
+                lines_rs.append(
+                    f"#{f['rank']:2d} | {f['file'].split('/')[-1]:40s} | {f['risk_score']:.3f} | "
+                    f"bug={s.get('bug_churn_total',0):5d} | ap={s.get('anti_pattern_count',0):3d} revisions | "
+                    f"scc={s.get('scc_membership_count',0):2d} revisions | co={s.get('co_change_without_dep',0):2d} | [{aps}]"
+                )
+            risk_score_context = "\n".join(lines_rs)
+            print(f"  [Q&A] Loaded risk scores for top {len(top_files)} files")
+        except Exception as exc:
+            print(f"  [Q&A] WARNING: Could not load risk scores: {exc}")
+
+    # Commit log with bug-linked commits (for M-score causality)
+    commit_context = ""
+    issue_map_path = temporal_root / "issue_map.json"
+    if issue_map_path.exists():
+        try:
+            issue_data = json.loads(issue_map_path.read_text(encoding="utf-8"))
+            summaries_map = issue_data.get("summaries", {})
+            issues_map = issue_data.get("issues", {})
+            commit_log = issue_data.get("commit_log", [])
+            # Keep only bug-linked commits (JIRA bug reference or keyword match) — last 3 years
+            import re as _re
+            _jira_re = _re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
+            _bug_kw = _re.compile(r"\b(fix|bug|hotfix|patch|defect|regress)\b", _re.IGNORECASE)
+            bug_commits = []
+            for c in commit_log:
+                subj = c.get("subject", "")
+                # Check if references a known bug issue
+                jira_refs = _jira_re.findall(subj)
+                is_bug_jira = any(issues_map.get(k) == "bug" for k in jira_refs)
+                is_bug_kw = bool(_bug_kw.search(subj))
+                if is_bug_jira or is_bug_kw:
+                    issue_title = ""
+                    for k in jira_refs:
+                        if k in summaries_map:
+                            issue_title = f" ({summaries_map[k]})"
+                            break
+                    bug_commits.append(f"- [{c.get('date','')[:10]}] {c.get('hash','')[:8]} {subj}{issue_title}")
+            # Limit to 80 most recent bug commits
+            commit_context = "\n".join(bug_commits[:80])
+            print(f"  [Q&A] Loaded {len(bug_commits)} bug-linked commits for M-score causality")
+        except Exception as exc:
+            print(f"  [Q&A] WARNING: Could not load commit context: {exc}")
 
     # --- Interactive Q&A loop ---
     # Start with the user's initial question (if any), then offer follow-up prompts.
@@ -649,7 +914,9 @@ def main() -> int:
             context_for_answer = (prior + "\n\n" + report_text) if prior else report_text
             raw = answer_user_question(args.model, current_question, context_for_answer,
                                        mscore_breakdown=mscore_breakdown,
-                                       timeout_s=args.ollama_timeout_s)
+                                       timeout_s=args.ollama_timeout_s,
+                                       risk_score_context=risk_score_context,
+                                       commit_context=commit_context)
             answer = strip_thinking_and_fences(raw)
 
             print(f"\n{sep}")

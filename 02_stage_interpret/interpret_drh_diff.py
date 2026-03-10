@@ -50,6 +50,14 @@ except Exception:
 
 from commit_analyzer import CommitAnalyzer
 
+# Stage 3 LLM backend (optional import — falls back to direct subprocess if not available)
+try:
+    sys.path.insert(0, str(Path(__file__).parent.parent / "03_stage_query"))
+    from llm_backend import LLMBackend as _LLMBackend
+    _HAS_LLM_BACKEND = True
+except ImportError:
+    _HAS_LLM_BACKEND = False
+
 
 _NUM_RE = re.compile(r"^-?\d+(?:\.\d+)?$")
 
@@ -227,13 +235,17 @@ def top_module_penalties(mscore_components: Dict[str, Any], n: int = 7) -> Dict[
 
 
 def query_ollama(model: str, prompt: str, timeout_s: int = 900) -> str:
+    """Call LLM via LLMBackend (supports Ollama/vLLM/API via env vars)."""
+    if _HAS_LLM_BACKEND:
+        llm = _LLMBackend(model=model)
+        return llm.generate(prompt, timeout_s=timeout_s)
+    # Fallback: direct subprocess (original behaviour)
     cmd = ["ollama", "run", model, prompt]
     res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
     out = (res.stdout or "").strip()
     if out:
         return out
-    err = (res.stderr or "").strip()
-    return err
+    return (res.stderr or "").strip()
 
 
 def strip_thinking_block(text: str) -> str:

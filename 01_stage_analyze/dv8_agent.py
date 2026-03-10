@@ -2733,7 +2733,7 @@ def main() -> None:
     # If temporal analysis is requested, run it and exit
     if args.temporal:
         branch = args.branch or "main"
-        auto_fine = args.fine_grain or args.revisions <= 10
+        auto_fine = True  # always run full arch-report (DRH, anti-patterns, clustering) for every revision
         scopes = ["full", "prod"] if args.scope == "both" else [args.scope]
         last_output: Optional[Path] = None
         for sc in scopes:

@@ -42,7 +42,7 @@ class Edge:
 
 def parse_edges(matrix: Dict[str, Any]) -> Tuple[List[str], List[Edge]]:
     variables = matrix.get("variables") or []
-    cells = matrix.get("cells") or []
+    cells = matrix.get("cells") or matrix.get("matrix") or []
     edges: List[Edge] = []
     if not isinstance(variables, list) or not isinstance(cells, list):
         return [], edges
@@ -169,7 +169,7 @@ def scc_summary(nodes: List[str], edges: Iterable[Edge]) -> Dict[str, Any]:
     return {
         "scc_count": len(comps),
         "largest_scc_size": sizes[0] if sizes else 0,
-        "top_sccs": [sorted(c)[:20] for c in comps[:5]],
+        "top_sccs": [sorted(c) for c in comps],
     }
 
 
