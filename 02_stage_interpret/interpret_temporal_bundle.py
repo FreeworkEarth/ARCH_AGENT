@@ -1096,6 +1096,36 @@ def _load_fanin_fanout(rev_folder: Path) -> Dict[str, Dict[str, int]]:
         return {}
 
 
+def load_recent_churn_top(temporal_root: Path, top_n: int = 10) -> str:
+    """Load churn_top from the most recent revision's interpretation_payload.json.
+    Returns a formatted string for Q&A context injection, or empty string if unavailable."""
+    srd = temporal_root / "INPUT_INTERPRETATION" / "SINGLE_REVISION_ANALYSIS_DATA"
+    if not srd.exists():
+        return ""
+    rev_dirs = sorted(srd.iterdir())
+    if not rev_dirs:
+        return ""
+    newest_rev = rev_dirs[0]  # sorted: 01_ prefix = most recent
+    payload_path = newest_rev / "OutputData" / "interpretation_payload.json"
+    if not payload_path.exists():
+        return ""
+    try:
+        data = json.loads(payload_path.read_text(encoding="utf-8"))
+        churn_top = data.get("churn_top", [])
+        if not churn_top:
+            return ""
+        meta = data.get("meta", {})
+        rev_date = meta.get("date", "most recent revision")
+        lines = [f"## MOST ACTIVE FILES (last revision: {rev_date} — total lines changed in that window):"]
+        for i, entry in enumerate(churn_top[:top_n], 1):
+            if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                fname = str(entry[0]).split("/")[-1]
+                lines.append(f"  {i:2d}. {fname}: {entry[1]} lines changed")
+        return "\n".join(lines) + "\n"
+    except Exception:
+        return ""
+
+
 def _load_clique_count(rev_folder: Path) -> int:
     """Return total distinct files participating in cliques for this revision."""
     csv_path = rev_folder / "OutputData" / "arch-issue" / "anti-pattern-summary.csv"
@@ -1229,6 +1259,7 @@ def answer_user_question(model: str, question: str, report_text: str,
                          risk_score_context: str = "", commit_context: str = "",
                          antipattern_groups: str = "", hotspot_data: str = "",
                          evidence_evolution: str = "", peaks_section: str = "",
+                         recent_churn_section: str = "",
                          data_quality_warnings: list = None) -> str:
     """Call the LLM to answer a specific user question using the combined report as context.
 
@@ -1308,7 +1339,8 @@ def answer_user_question(model: str, question: str, report_text: str,
     # 6. Remaining narrative (report text minus summary blocks already included)
     narrative = ""
 
-    context = quality_block + priority_context + risk_section + group_section + hotspot_section + evolution_section + peaks_ctx + commit_section + summary_text + ("\n\n" if summary_text else "") + narrative
+    recent_churn_ctx = (recent_churn_section + "\n") if recent_churn_section else ""
+    context = quality_block + priority_context + risk_section + group_section + hotspot_section + evolution_section + peaks_ctx + recent_churn_ctx + commit_section + summary_text + ("\n\n" if summary_text else "") + narrative
 
     q_lower = q_lower_pre
 
@@ -1389,7 +1421,7 @@ Then write group details in two tiers:
 TIER 1 — groups with HIGH SCOPE AND HIGH CHURN (appear in both ranked lists — large AND painful): write FULL details for each. Do not skip any field:
   **Group name**: anti-pattern type + instance ID
   **Size**: number of files and % of system. If % > 100%: explain that DV8 analyses the full history DSM across all revisions — the co-change coupling network is larger than the current code snapshot, meaning the architectural debt spans the entire project history.
-  **Key members**: top 8 files by bug_churn (lines changed in bug-fix commits), each with their bug_churn value
+  **Key members**: top 8 files by bug_churn (lines changed in bug-fix commits), each with their individual bug_churn value from the FILE HOTSPOT SIGNALS table. CRITICAL: do NOT use the group's bug_churn total as an individual file's bug_churn — the group total is the sum across all members. Individual per-file bug_churn values are in the FILE HOTSPOT SIGNALS table under the "bug=" column.
   **Churn breakdown**: bug_churn=X, nonbug_churn=X, total_churn=X. Then one sentence interpreting what this means for THIS specific group — not a generic definition. Good example: "2993 lines changed purely in defect-fix commits means IOUtils, FileUtils and FilenameUtils are touched in virtually every bug in the project." Bad example: "High bug_churn indicates maintenance cost." Be specific to these files.
   **Structural flaw**: 2-3 sentences analysing the co-change pattern of THESE specific files — what does it mean that these specific files change together despite no structural dependency? Why does THAT specific coupling cause ongoing maintenance cost? Do NOT write a generic definition of the anti-pattern type — analyse this instance's members specifically.
   **Refactoring direction**: one concrete action specific to this group (e.g. "Extract the path-manipulation methods from FilenameUtils into a new PathTokenizer class to sever the co-change coupling with IOUtils" — not "reduce coupling").
@@ -1428,6 +1460,8 @@ Then write a "Worst files overall" section — top 5 files ranked by bug_churn (
 Do NOT mention "risk score" — use observable signals only.
 
 End with a short conclusion: worst group (name, %, bug_churn), worst file (name, bug_churn, fan-in), and one concrete first refactoring step.
+
+If MOST ACTIVE FILES data is present in context: after "Worst files overall", add a short "### Most active in last revision" section — list the top 5 files by total lines changed in the most recent window, with their churn count. Note which of these also appear in anti-pattern groups or have high bug_churn (cross-reference with FILE HOTSPOT SIGNALS). This shows current development pressure, not historical pain.
 
 QUESTION: {question}
 
@@ -1737,6 +1771,10 @@ def main() -> int:
         qa_peaks_section = detect_metric_peaks(timeseries, temporal_root, [], top_n=2)
         if qa_peaks_section:
             print(f"  [Q&A] Computed metric peaks cross-reference")
+        # Load most recent revision's raw churn_top (total activity last window)
+        recent_churn_section = load_recent_churn_top(temporal_root)
+        if recent_churn_section:
+            print(f"  [Q&A] Loaded most-active files from last revision")
 
         # Build data quality warnings
         _dqw = []
@@ -1790,6 +1828,7 @@ def main() -> int:
                                        hotspot_data=hotspot_data,
                                        evidence_evolution=evidence_evolution,
                                        peaks_section=qa_peaks_section,
+                                       recent_churn_section=recent_churn_section,
                                        data_quality_warnings=_dqw or None)
             answer = strip_thinking_and_fences(raw)
             print(f"\n{sep}\n  ANSWER\n  Q: {current_question}\n{sep}")
@@ -2029,6 +2068,10 @@ def main() -> int:
     qa_peaks_section = detect_metric_peaks(timeseries, temporal_root, reports, top_n=2)
     if qa_peaks_section:
         print(f"  [Q&A] Computed metric peaks cross-reference")
+    # Load most recent revision's raw churn_top
+    recent_churn_section = load_recent_churn_top(temporal_root)
+    if recent_churn_section:
+        print(f"  [Q&A] Loaded most-active files from last revision")
 
     # Build data quality warnings
     _dqw = []
@@ -2094,6 +2137,7 @@ def main() -> int:
                                        hotspot_data=hotspot_data,
                                        evidence_evolution=evidence_evolution,
                                        peaks_section=qa_peaks_section,
+                                       recent_churn_section=recent_churn_section,
                                        data_quality_warnings=_dqw or None)
             answer = strip_thinking_and_fences(raw)
 

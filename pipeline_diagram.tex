@@ -504,12 +504,12 @@
 % Dedicated lower spines for risk scoring only.
 \draw[dataarr] (apdata.east)
   -- (26.60,-0.4)
-  -- (26.60,-8.4)
-  -- ([xshift=-8mm,yshift=8mm]riskscores.north)
+  -- (26.60,-7.5)
+  -- ([xshift=-8mm,yshift=12mm]riskscores.north)
   -- ([xshift=-8mm]riskscores.north);
 \draw[dataarr] (hotdata.east)
   -- (26.50,-2.2)
-  -- (26.50,-8.6)
+  -- (26.50,-8.1)
   -- ([xshift=+8mm,yshift=6mm]riskscores.north)
   -- ([xshift=+8mm]riskscores.north);
 
@@ -560,12 +560,12 @@
 %-- Git evolutionary data → bundle ----------------------------------------
 \coordinate (gitSignalMerge) at (40.2,-10.8);
 \coordinate (gitSignalTrunkTop) at (40.2,-2.9);
-\coordinate (gitSignalSourceLane) at (40.2,-12.85);
+\coordinate (gitSignalSourceLane) at (40.2,-13.25);
 \coordinate (gitBundleEntry) at ([yshift=-9mm]interpdata.west);
 \coordinate (gitBundlePre) at ([xshift=-10mm,yshift=-9mm]interpdata.west);
 \coordinate (gitSignalTurn) at ($(gitSignalTrunkTop -| gitBundlePre)$);
 \draw[bigarr,gitcol!80] ([yshift=-8mm]issuemap.east)
-  -- ++(0,-1.20)
+  -- ++(0,-1.60)
   -- (gitSignalSourceLane)
   -- (gitSignalMerge);
 \draw[bigarr,gitcol!80] (gitSignalMerge)
