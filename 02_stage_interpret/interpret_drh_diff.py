@@ -1022,7 +1022,14 @@ def main() -> int:
 
     temporal_root = Path(args.temporal_root).expanduser().resolve()
     repo = Path(args.repo).expanduser().resolve()
-    ts_path = temporal_root / "timeseries.json"
+    # Support new location (INPUT_INTERPRETATION/timeseries.json) with legacy fallback
+    ts_path = next(
+        (p for p in [
+            temporal_root / "INPUT_INTERPRETATION" / "timeseries.json",
+            temporal_root / "timeseries.json",
+        ] if p.exists()),
+        temporal_root / "INPUT_INTERPRETATION" / "timeseries.json",
+    )
     if not ts_path.exists():
         raise FileNotFoundError(f"timeseries.json not found: {ts_path}")
 
@@ -1046,9 +1053,15 @@ def main() -> int:
     def rev_dir_for(n: int) -> Path:
         prefix = f"{n:02d}_"
         matches = sorted([p for p in single_root.iterdir() if p.is_dir() and p.name.startswith(prefix)])
-        if not matches:
-            raise FileNotFoundError(f"Revision folder not found for revision_number={n} under {single_root}")
-        return matches[0]
+        if matches:
+            return matches[0]
+        # Fall back to data_repositories/ (new pipeline layout)
+        data_repos = temporal_root / "data_repositories"
+        if data_repos.is_dir():
+            matches = sorted([p for p in data_repos.iterdir() if p.is_dir() and p.name.startswith(prefix)])
+            if matches:
+                return matches[0]
+        raise FileNotFoundError(f"Revision folder not found for revision_number={n} under {single_root}")
 
     new_dir = rev_dir_for(args.new)
     old_dir = rev_dir_for(args.old)

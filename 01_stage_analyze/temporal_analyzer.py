@@ -47,6 +47,15 @@ METRICS_CACHE = TEMPORAL_WORKSPACE / "metrics_cache.json"
 
 # --- Git Operations ---
 
+def _parse_git_commit_datetime(date_str: str) -> datetime:
+    try:
+        return datetime.strptime((date_str or "").strip(), "%Y-%m-%d %H:%M:%S %z")
+    except Exception:
+        try:
+            return datetime.fromisoformat((date_str or "").split()[0])
+        except Exception:
+            return datetime.min
+
 def get_commit_history(
     repo_path: Path,
     branch: str = "main",
@@ -98,6 +107,9 @@ def get_commit_history(
                 'author': author,
                 'message': message.strip()
             })
+
+    # Git log can be topological around merges, so enforce chronological order.
+    commits.sort(key=lambda c: _parse_git_commit_datetime(c.get('date', '')), reverse=True)
 
     # Spacing strategies
     if spacing_mode in ("alltime", "uniform"):

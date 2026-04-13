@@ -12,6 +12,9 @@ Plots produced (all saved to <output_dir>/):
   4. top_files_bar.png              — horizontal bar chart, top-N files by risk score
   5. anti_pattern_risk_boxplot.png  — risk score distribution per anti-pattern type
   6. signals_scatter_matrix.png     — pairwise scatter grid (top 4 signals vs risk_score)
+  7. anti_pattern_instance_load_top_files.png — top files by anti-pattern instance load
+  8. anti_pattern_count_top_files.png — top files by anti-pattern count
+  9. anti_pattern_type_burden_boxplot.png — pure anti-pattern burden distribution by type
 
 Usage:
     python plot_risk_score_stats.py <file_risk_scores.json> [--out <dir>] [--top-n 30]
@@ -56,6 +59,22 @@ AP_COLORS = [
     "#2563EB", "#DC2626", "#16A34A", "#D97706",
     "#7C3AED", "#DB2777", "#0891B2", "#65A30D",
 ]
+
+ANTI_PATTERN_LABELS = {
+    "clique": "Clique",
+    "package-cycle": "Package Cycle",
+    "unhealthy-inheritance": "Unhealthy Inheritance",
+    "unstable-interface": "Unstable Interface",
+    "crossing": "Crossing",
+    "modularity-violation": "Modularity Violation",
+    "DV8-DangerousFile": "DV8 Dangerous File",
+}
+
+HISTORY_ANTI_PATTERN_TYPES = {
+    "unstable-interface",
+    "modularity-violation",
+    "crossing",
+}
 
 SIGNAL_LABELS = {
     "anti_pattern_count":    "Anti-Pattern Count",
@@ -115,6 +134,10 @@ def _annotate_stats(ax, stats: Dict[str, float], x_pos: float = 0.97, y_start: f
         f"std={stats['std']:.4f}\n"
         f"var={stats['var']:.4f}"
     )
+
+
+def _display_ap_name(name: str) -> str:
+    return ANTI_PATTERN_LABELS.get(name, name)
     ax.text(
         x_pos, y_start, txt,
         transform=ax.transAxes,
@@ -285,7 +308,7 @@ def plot_top_files_bar(records: List[Dict], repo: str, out_dir: Path, top_n: int
     top = records[:top_n]
     scores  = np.array([r["risk_score"] for r in top])
     labels  = [Path(r["file"]).name + f"\n({Path(r['file']).parent.name})" for r in top]
-    ap_tags = [", ".join(r.get("anti_patterns_seen", [])) or "—" for r in top]
+    ap_tags = [", ".join(_display_ap_name(ap) for ap in r.get("anti_patterns_seen", [])) or "—" for r in top]
 
     # Color by dominant anti-pattern
     all_aps = sorted({ap for r in top for ap in r.get("anti_patterns_seen", [])})
@@ -316,7 +339,12 @@ def plot_top_files_bar(records: List[Dict], repo: str, out_dir: Path, top_n: int
 
     # Legend for anti-patterns
     if all_aps:
-        patches = [mpatches.Patch(color=ap_color_map[ap], label=ap) for ap in all_aps]
+        patches = []
+        for ap in all_aps:
+            label = _display_ap_name(ap)
+            if ap in HISTORY_ANTI_PATTERN_TYPES:
+                label += " [history]"
+            patches.append(mpatches.Patch(color=ap_color_map[ap], label=label))
         patches.append(mpatches.Patch(color=PALETTE["neutral"], label="(none)"))
         ax.legend(handles=patches, loc="lower right", fontsize=8, title="Anti-patterns")
 
@@ -374,7 +402,7 @@ def plot_antipattern_risk_boxplot(records: List[Dict], repo: str, out_dir: Path)
         patch.set_alpha(0.6)
 
     ax.set_yticks(range(1, n_groups + 1))
-    ax.set_yticklabels(labels, fontsize=9)
+    ax.set_yticklabels([_display_ap_name(x) for x in labels], fontsize=9)
     ax.set_xlabel("Composite Risk Score")
     ax.set_title("Risk Score Distributions per Anti-Pattern")
 
@@ -386,7 +414,7 @@ def plot_antipattern_risk_boxplot(records: List[Dict], repo: str, out_dir: Path)
     for label, vals in zip(labels, data):
         vals_arr = np.array(vals)
         rows.append([
-            label,
+            _display_ap_name(label),
             str(len(vals_arr)),
             f"{np.mean(vals_arr):.4f}",
             f"{np.median(vals_arr):.4f}",
@@ -403,6 +431,160 @@ def plot_antipattern_risk_boxplot(records: List[Dict], repo: str, out_dir: Path)
 
     fig.tight_layout()
     out = out_dir / "anti_pattern_risk_boxplot.png"
+    fig.savefig(out, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {out.name}")
+
+
+def plot_antipattern_burden_top_files(
+    records: List[Dict],
+    repo: str,
+    out_dir: Path,
+    *,
+    top_n: int = 20,
+    metric_key: str,
+    filename: str,
+    title_suffix: str,
+    xlabel: str,
+) -> None:
+    ap_records = [r for r in records if r["signals"].get("anti_pattern_count", 0) > 0]
+    if not ap_records:
+        print("  Skipping anti-pattern burden top-files plot (no anti-pattern data).")
+        return
+
+    metric_vals_all = np.array([r["signals"].get(metric_key, 0) for r in ap_records], dtype=float)
+    metric_mean = float(np.mean(metric_vals_all)) if len(metric_vals_all) else 0.0
+    metric_std = float(np.std(metric_vals_all)) if len(metric_vals_all) else 0.0
+
+    ap_records = sorted(
+        ap_records,
+        key=lambda r: (
+            r["signals"].get(metric_key, 0),
+            r["signals"].get("anti_pattern_instance_load", 0),
+            r["signals"].get("anti_pattern_diversity", 0),
+        ),
+        reverse=True,
+    )[:top_n]
+
+    pattern_types = sorted({ap for r in ap_records for ap in r.get("anti_pattern_type_counts", {}).keys()})
+    color_map = {ap: AP_COLORS[i % len(AP_COLORS)] for i, ap in enumerate(pattern_types)}
+
+    labels = [Path(r["file"]).name for r in ap_records][::-1]
+    y_pos = np.arange(len(ap_records))
+
+    fig, ax = plt.subplots(figsize=(15, max(6, len(ap_records) * 0.45)))
+    fig.suptitle(f"{repo} — Top {len(ap_records)} Files by {title_suffix}", fontsize=13, fontweight="bold")
+
+    left = np.zeros(len(ap_records))
+    for ap in pattern_types:
+        vals = np.array([r.get("anti_pattern_type_counts", {}).get(ap, 0) for r in ap_records], dtype=float)[::-1]
+        ax.barh(y_pos, vals, left=left, color=color_map[ap], edgecolor="white", height=0.72, label=ap)
+        left += vals
+
+    for idx, rec in enumerate(ap_records[::-1]):
+        sig = rec["signals"]
+        metric_val = float(sig.get(metric_key, 0))
+        rel = (metric_val / metric_mean) if metric_mean > 0 else 0.0
+        z = ((metric_val - metric_mean) / metric_std) if metric_std > 0 else 0.0
+        annot = (
+            f"x avg={rel:.2f}  "
+            f"z-score={z:.2f}  "
+            f"revs={sig.get('anti_pattern_revision_count', 0)}"
+        )
+        ax.text(
+            left[idx] + max(left.max() * 0.01, 1.0),
+            y_pos[idx],
+            annot,
+            va="center",
+            ha="left",
+            fontsize=7.5,
+            color=PALETTE["neutral"],
+        )
+
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(labels, fontsize=8)
+    ax.set_xlabel(xlabel)
+    ax.set_title("Pure anti-pattern burden; annotation is computed from the same metric shown in the plot", fontsize=10, pad=8)
+    legend_handles = []
+    for ap in pattern_types:
+        label = _display_ap_name(ap)
+        if ap in HISTORY_ANTI_PATTERN_TYPES:
+            label += " [history]"
+        legend_handles.append(mpatches.Patch(color=color_map[ap], label=label))
+    ax.legend(handles=legend_handles, loc="lower right", fontsize=8, title="Anti-pattern type")
+
+    fig.tight_layout()
+    out = out_dir / filename
+    fig.savefig(out, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {out.name}")
+
+
+def plot_antipattern_type_burden_boxplot(records: List[Dict], repo: str, out_dir: Path) -> None:
+    type_groups: Dict[str, List[float]] = {}
+    for r in records:
+        for ap, count in r.get("anti_pattern_type_counts", {}).items():
+            if count > 0:
+                type_groups.setdefault(ap, []).append(float(count))
+
+    if not type_groups:
+        print("  Skipping pure anti-pattern type burden boxplot (no type counts).")
+        return
+
+    ap_sorted = sorted(type_groups.items(), key=lambda kv: np.median(kv[1]), reverse=True)
+    labels = [ap for ap, _ in ap_sorted]
+    data = [vals for _, vals in ap_sorted]
+
+    fig, axes = plt.subplots(2, 1, figsize=(12, 9),
+                             gridspec_kw={"height_ratios": [3, 1]})
+    fig.suptitle(f"{repo} — Pure Anti-Pattern Burden by Type", fontsize=13, fontweight="bold")
+
+    ax = axes[0]
+    colors = [AP_COLORS[i % len(AP_COLORS)] for i in range(len(labels))]
+    vp = ax.violinplot(data, positions=np.arange(1, len(labels) + 1), showmedians=True, showextrema=True)
+    for body, color in zip(vp["bodies"], colors):
+        body.set_facecolor(color)
+        body.set_alpha(0.5)
+        body.set_edgecolor(color)
+    bp = ax.boxplot(
+        data,
+        vert=True,
+        patch_artist=True,
+        widths=0.18,
+        medianprops=dict(color="black", linewidth=2),
+        flierprops=dict(marker=".", markersize=4, alpha=0.45),
+    )
+    for patch, color in zip(bp["boxes"], colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.35)
+        patch.set_edgecolor(color)
+
+    ax.set_xticks(range(1, len(labels) + 1))
+    ax.set_xticklabels([_display_ap_name(x) for x in labels], rotation=20, ha="right", fontsize=9)
+    ax.set_ylabel("Per-file anti-pattern instance count")
+    ax.set_title("Raw anti-pattern burden per type (structural + history-based)")
+
+    ax2 = axes[1]
+    ax2.axis("off")
+    col_labels = ["Type", "n", "Mean", "Median", "P75"]
+    rows = []
+    for label, vals in zip(labels, data):
+        arr = np.array(vals, dtype=float)
+        rows.append([
+            _display_ap_name(label),
+            str(len(arr)),
+            f"{np.mean(arr):.2f}",
+            f"{np.median(arr):.2f}",
+            f"{np.percentile(arr, 75):.2f}",
+        ])
+    tbl = ax2.table(cellText=rows, colLabels=col_labels, loc="center", cellLoc="center")
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(8)
+    tbl.scale(1, 1.35)
+    ax2.set_title("Statistics", pad=10)
+
+    fig.tight_layout()
+    out = out_dir / "anti_pattern_type_burden_boxplot.png"
     fig.savefig(out, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved: {out.name}")
@@ -479,6 +661,10 @@ def write_summary_stats(records: List[Dict], meta: Dict, out_dir: Path) -> None:
             ap_groups.setdefault(ap, []).append(r["risk_score"])
     for ap, vals_list in ap_groups.items():
         summary["anti_pattern_breakdown"][ap] = _desc_stats(np.array(vals_list))
+    summary["anti_pattern_family_breakdown"] = {
+        "history_based_types": sorted([ap for ap in ap_groups if ap in HISTORY_ANTI_PATTERN_TYPES]),
+        "structural_types": sorted([ap for ap in ap_groups if ap not in HISTORY_ANTI_PATTERN_TYPES]),
+    }
 
     out = out_dir / "risk_score_stats.json"
     out.write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -525,6 +711,27 @@ def main() -> int:
     plot_correlation_heatmap(records, repo, out_dir)
     plot_top_files_bar(records, repo, out_dir, top_n=args.top_n)
     plot_antipattern_risk_boxplot(records, repo, out_dir)
+    plot_antipattern_burden_top_files(
+        records,
+        repo,
+        out_dir,
+        top_n=min(args.top_n, 20),
+        metric_key="anti_pattern_instance_load",
+        filename="anti_pattern_instance_load_top_files.png",
+        title_suffix="Pure Anti-Pattern Instance Load",
+        xlabel="Stacked anti-pattern instance counts",
+    )
+    plot_antipattern_burden_top_files(
+        records,
+        repo,
+        out_dir,
+        top_n=min(args.top_n, 20),
+        metric_key="anti_pattern_count",
+        filename="anti_pattern_count_top_files.png",
+        title_suffix="Pure Anti-Pattern Count",
+        xlabel="Stacked anti-pattern counts",
+    )
+    plot_antipattern_type_burden_boxplot(records, repo, out_dir)
     plot_signals_scatter(records, repo, out_dir)
     write_summary_stats(records, meta, out_dir)
 

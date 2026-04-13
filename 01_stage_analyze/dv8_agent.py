@@ -124,6 +124,17 @@ def guess_project_name(repo_path: Path) -> str:
     return repo_path.resolve().name.replace('-', ' ').replace('_', ' ').title()
 
 
+def parse_git_commit_datetime(date_str: str) -> datetime:
+    """Parse git commit timestamps like '2026-02-23 10:58:51 -0500'."""
+    try:
+        return datetime.strptime((date_str or "").strip(), "%Y-%m-%d %H:%M:%S %z")
+    except Exception:
+        try:
+            return datetime.fromisoformat((date_str or "").split()[0])
+        except Exception:
+            return datetime.min
+
+
 def detect_language(source_root: Path, override: Optional[str] = None) -> str:
     """Detect language by file extension in the source root."""
     if override:
@@ -1369,6 +1380,182 @@ def convert_to_dsm(
             "stderr": res.stderr,
         })
 
+
+def export_git_history_log(
+    repo_root: Path,
+    out_log: Path,
+    logs: list | None = None,
+) -> bool:
+    """Export git log in the DV8-recommended text format for HDSM generation."""
+    git_dir = repo_root / ".git"
+    if not git_dir.exists():
+        return False
+    ensure_dirs(out_log.parent)
+    cmd = ["git", "log", "--numstat", "--date=iso"]
+    res = run(cmd, cwd=repo_root, check=False)
+    if logs is not None:
+        logs.append({
+            "step": "git log --numstat --date=iso",
+            "cmd": ' '.join(str(x) for x in cmd),
+            "rc": res.returncode,
+            "stdout": "",
+            "stderr": res.stderr,
+            "output_file": str(out_log),
+        })
+    if res.returncode != 0:
+        return False
+    out_log.write_text(res.stdout, encoding="utf-8")
+    return True
+
+
+def convert_git_history_to_dsm(
+    dv8_console: Path,
+    git_log_txt: Path,
+    out_dsm: Path,
+    env: dict[str, str],
+    logs: list | None = None,
+) -> bool:
+    """Build a raw HDSM from a git-log text export."""
+    ensure_dirs(out_dsm.parent)
+    cmd = [
+        dv8_console,
+        "scm:history:gittxt:convert-matrix",
+        git_log_txt,
+        "-outputFile",
+        out_dsm,
+    ]
+    res = run(cmd, env=env, check=False)
+    if logs is not None:
+        logs.append({
+            "step": "scm:history:gittxt:convert-matrix",
+            "cmd": ' '.join(str(x) for x in cmd),
+            "rc": res.returncode,
+            "stdout": res.stdout,
+            "stderr": res.stderr,
+        })
+    return res.returncode == 0 and out_dsm.exists()
+
+
+def export_matrix_json(
+    dv8_console: Path,
+    dsm_path: Path,
+    out_json: Path,
+    env: dict[str, str],
+    logs: list | None = None,
+) -> bool:
+    """Export any DV8 DSM to JSON so it can be inspected without DV8."""
+    ensure_dirs(out_json.parent)
+    cmd = [dv8_console, "core:export-matrix", dsm_path, "-outputFile", out_json]
+    res = run(cmd, env=env, check=False)
+    if logs is not None:
+        logs.append({
+            "step": "core:export-matrix",
+            "cmd": ' '.join(str(x) for x in cmd),
+            "rc": res.returncode,
+            "stdout": res.stdout,
+            "stderr": res.stderr,
+        })
+    return res.returncode == 0 and out_json.exists()
+
+
+def generate_git_change_cost(
+    dv8_console: Path,
+    git_log_txt: Path,
+    output_dir: Path,
+    env: dict[str, str],
+    logs: list | None = None,
+) -> bool:
+    """Generate DV8 change-cost artifacts from a git-log text export."""
+    ensure_dirs(output_dir)
+    cmd = [
+        dv8_console,
+        "scm:history:gittxt:change-cost",
+        git_log_txt,
+        "-outputFolder",
+        output_dir,
+    ]
+    res = run(cmd, env=env, check=False)
+    if logs is not None:
+        logs.append({
+            "step": "scm:history:gittxt:change-cost",
+            "cmd": ' '.join(str(x) for x in cmd),
+            "rc": res.returncode,
+            "stdout": res.stdout,
+            "stderr": res.stderr,
+        })
+    return res.returncode == 0
+
+
+def _fix_change_cost_csv(change_cost_dir: Path) -> None:
+    """Fix change-cost CSVs so DV8's ChangeCostParser doesn't crash.
+
+    DV8's ChangeCostParser crashes with ArrayIndexOutOfBoundsException: -1 when:
+    1. all-commits-change-cost.csv has empty Author field (gittxt:change-cost omits it)
+    2. all-file-change-cost.csv has empty FileName rows (git log produces header-only rows
+       for merge commits or binary files — DV8 can't handle them)
+
+    Fixes applied:
+    - all-commits-change-cost.csv: fill empty Author from Committer
+    - all-file-change-cost.csv: drop rows with empty FileName
+    """
+    import csv, io
+
+    def _fix_csv(csv_path: Path, drop_empty_col: str | None = None, fill_col: str | None = None, fill_from: str | None = None) -> None:
+        if not csv_path.exists():
+            return
+        try:
+            text = csv_path.read_text(encoding="utf-8")
+            reader = csv.DictReader(io.StringIO(text))
+            if reader.fieldnames is None:
+                return
+            rows = list(reader)
+            original_count = len(rows)
+            fixed = False
+            if drop_empty_col:
+                rows = [r for r in rows if r.get(drop_empty_col, "").strip()]
+                if len(rows) < original_count:
+                    fixed = True
+                    print(f"  [change-cost] Dropped {original_count - len(rows)} empty-{drop_empty_col} rows from {csv_path.name}")
+            if fill_col and fill_from:
+                for row in rows:
+                    if not row.get(fill_col, "").strip():
+                        row[fill_col] = row.get(fill_from, "")
+                        fixed = True
+            if not fixed:
+                return
+            out = io.StringIO()
+            writer = csv.DictWriter(out, fieldnames=reader.fieldnames, quoting=csv.QUOTE_ALL)
+            writer.writeheader()
+            writer.writerows(rows)
+            csv_path.write_text(out.getvalue(), encoding="utf-8")
+        except Exception as e:
+            print(f"  [change-cost] Warning: could not fix {csv_path.name}: {e}")
+
+    _fix_csv(change_cost_dir / "all-commits-change-cost.csv", fill_col="Author", fill_from="Committer")
+    _fix_csv(change_cost_dir / "all-file-change-cost.csv", drop_empty_col="FileName")
+
+
+def merge_dsms(
+    dv8_console: Path,
+    matrices: list[Path],
+    out_dsm: Path,
+    env: dict[str, str],
+    logs: list | None = None,
+) -> bool:
+    """Merge structural and history DSMs into one matrix for anti-pattern detection."""
+    ensure_dirs(out_dsm.parent)
+    cmd = [dv8_console, "core:merge-matrix", *matrices, "-outputFile", out_dsm]
+    res = run(cmd, env=env, check=False)
+    if logs is not None:
+        logs.append({
+            "step": "core:merge-matrix",
+            "cmd": ' '.join(str(x) for x in cmd),
+            "rc": res.returncode,
+            "stdout": res.stdout,
+            "stderr": res.stderr,
+        })
+    return res.returncode == 0 and out_dsm.exists()
+
 def write_params(
     params_path: Path,
     project_name: str,
@@ -1382,27 +1569,39 @@ def write_params(
     run_metrics: bool = True,
     run_clustering: bool = True,
     run_report_doc: bool = True,
+    change_cost_file: Optional[Path] = None,
 ) -> None:
-    # create the arch-report .properties file pointing to our DSM and desired outputs
-    text = f"""## Auto-generated DV8 arch report parameters
+    """Write a DV8 arch-report .properties file.
 
-inputFolder=.
-outputFolder={output_dir.as_posix() if isinstance(output_dir, Path) else output_dir}
-projectName={project_name}
-
-runMetrics={'on' if run_metrics else 'off'}
-runArchissue={'on' if run_archissue else 'off'}
-runArchroot={'on' if run_archroot else 'off'}
-runHotspot={'on' if run_hotspot else 'off'}
-runClustering={'on' if run_clustering else 'off'}
-runReportDoc={'on' if run_report_doc else 'off'}
-reportDocFormat=web (=html)  OR doc(=pdf)
-runFileStat={'on' if run_file_stat else 'off'}
-runCompress=off
-
-sourceType=dsm
-dependencyFilePath={dsm_path.as_posix() if isinstance(dsm_path, Path) else dsm_path}
-"""
+    change_cost_file: if provided, adds changeCostFile= so DV8 can locate
+    all-file-change-cost.csv for hotspot ranking without searching for it.
+    """
+    dsm_posix = dsm_path.as_posix() if isinstance(dsm_path, Path) else dsm_path
+    out_posix = output_dir.as_posix() if isinstance(output_dir, Path) else output_dir
+    change_cost_line = (
+        f"changeCostFile={change_cost_file.as_posix()}\n" if change_cost_file else ""
+    )
+    text = (
+        f"## Auto-generated DV8 arch report parameters\n"
+        f"\n"
+        f"inputFolder=.\n"
+        f"outputFolder={out_posix}\n"
+        f"projectName={project_name}\n"
+        f"\n"
+        f"runMetrics={'on' if run_metrics else 'off'}\n"
+        f"runArchissue={'on' if run_archissue else 'off'}\n"
+        f"runArchroot={'on' if run_archroot else 'off'}\n"
+        f"runHotspot={'on' if run_hotspot else 'off'}\n"
+        f"runClustering={'on' if run_clustering else 'off'}\n"
+        f"runReportDoc={'on' if run_report_doc else 'off'}\n"
+        f"reportDocFormat=web\n"
+        f"runFileStat={'on' if run_file_stat else 'off'}\n"
+        f"runCompress=off\n"
+        f"\n"
+        f"sourceType=dsm\n"
+        f"dependencyFilePath={dsm_posix}\n"
+        f"{change_cost_line}"
+    )
     params_path.write_text(text, encoding="utf-8")
     print(f"Wrote params file: {params_path}")
 
@@ -1454,7 +1653,10 @@ def run_additional_dv8_tasks(
     dsm_path: Path,
     output_dir: Path,
     env: dict[str, str],
+    arch_issue_dsm_path: Path | None = None,
+    project_name: str = "project",
     logs: list | None = None,
+    mv_cochange: int | None = None,
 ) -> None:
     """Run direct DV8 tasks to extract anti-patterns, debt cost, hotspots, and DRH.
 
@@ -1506,20 +1708,21 @@ def run_additional_dv8_tasks(
     dsm_export_dir = output_dir / "dsm"
     ensure_dirs(arch_issue_dir, arch_issue_cost_dir, hotspot_dir, drh_dir, drh_export_dir, dsm_export_dir)
 
+    arch_issue_input = arch_issue_dsm_path or dsm_path
+
     # 1) Architecture issues (instances)
-    cmd = [dv8_console, "arch-issue:arch-issue", dsm_path, "-outputFolder", arch_issue_dir]
+    cmd = [dv8_console, "arch-issue:arch-issue", arch_issue_input, "-outputFolder", arch_issue_dir]
+    if mv_cochange is not None:
+        cmd += ["-mvCochange", str(mv_cochange)]
     res = run(cmd, env=env, check=False)
     _log(res, "arch-issue:arch-issue", cmd)
 
-    # 2) Debt cost summary for issues (requires -asDir)
-    change_cost = None
-    for cand in sorted(output_dir.rglob("*change*cost*")):
-        if cand.is_file():
-            change_cost = cand
-            break
-    cmd = [dv8_console, "debt:arch-issue-cost", dsm_path, "-asDir", arch_issue_dir, "-outputFolder", arch_issue_cost_dir]
-    if change_cost:
-        cmd += ["-changeCost", change_cost]
+    # 2) Debt cost summary for issues (structural only — no -changeCost).
+    # DV8's ChangeCostParser crashes with ArrayIndexOutOfBoundsException when the
+    # gittxt:change-cost CSV has empty Author/FileName fields (a known DV8 bug).
+    # Running without -changeCost produces structural cost (FileCount per instance)
+    # which is what we need for % coverage. Churn data is sourced from our own pipeline.
+    cmd = [dv8_console, "debt:arch-issue-cost", arch_issue_input, "-asDir", arch_issue_dir, "-outputFolder", arch_issue_cost_dir]
     res = run(cmd, env=env, check=False)
     _log(res, "debt:arch-issue-cost", cmd)
 
@@ -1540,6 +1743,13 @@ def run_additional_dv8_tasks(
     _log(res, "core:export-matrix", cmd)
 
     # 5) Hotspots and hotspot cost (requires change-cost input)
+    # Resolve the file-level CSV specifically — arch-report and standalone hotspot both need
+    # all-file-change-cost.csv (per-file churn). all-commits-change-cost.csv is commits-level
+    # and causes ChangeCostParser crashes when passed to hotspot commands.
+    change_cost = next(
+        (p for p in output_dir.rglob("all-file-change-cost.csv") if p.is_file()),
+        None,
+    )
     if change_cost:
         cmd = [dv8_console, "hotspot:hotspot", dsm_path, "-changeCost", change_cost, "-outputFolder", hotspot_dir]
         _run_with_timeout(cmd, "hotspot:hotspot", timeout_s=180)
@@ -1556,8 +1766,43 @@ def run_additional_dv8_tasks(
             hotspot_dir,
         ]
         _run_with_timeout(cmd, "hotspot:hotspot-cost", timeout_s=180)
+
+        # 5b) Run arch-report with runHotspot=on to get ranked hotspot CSVs
+        # (active-hotspot-index.csv, active-hotspot-roi.csv etc.).
+        # The standalone hotspot:hotspot command only produces change-matrix.dv8-dsm —
+        # ranked output is only generated by arch-report's internal hotspot pipeline.
+        roi_csv = hotspot_dir / "active-hotspot-roi.csv"
+        if not roi_csv.exists():
+            params_dir = output_dir.parent / "InputData"
+            params_dir.mkdir(parents=True, exist_ok=True)
+            hotspot_params = params_dir / "archreport_hotspot.properties"
+            write_params(
+                hotspot_params,
+                project_name,
+                dsm_path,
+                output_dir,
+                run_file_stat=False,
+                run_hotspot=True,
+                run_archissue=False,
+                run_archroot=False,
+                run_metrics=False,
+                run_clustering=False,
+                run_report_doc=False,
+                change_cost_file=change_cost,
+            )
+            try:
+                run_arch_report(dv8_console, hotspot_params, output_dir.parent, env, logs=logs)
+            except SystemExit:
+                print("  [hotspot] arch-report hotspot run failed; falling back to computed hotspot CSV.")
+                try:
+                    from generate_hotspot_csv import generate_hotspot_csv as _gen_hotspot
+                    written = _gen_hotspot(output_dir, force=False)
+                    if written:
+                        print("  [hotspot] Generated active-hotspot-roi.csv from DSM + churn data (arch-report fallback)")
+                except Exception as _exc:
+                    print(f"  [hotspot] Fallback hotspot generation failed: {_exc}")
     else:
-        print("  [hotspot] change-cost file not found; skipping hotspot generation.")
+        print("  [hotspot] all-file-change-cost.csv not found; skipping hotspot generation.")
 
 
 def summarize_outputs(output_dir: Path) -> None:
@@ -1583,11 +1828,19 @@ def summarize_outputs(output_dir: Path) -> None:
         hs = output_dir / "hotspot"
         drh = output_dir / "drh"
         dsm_json = output_dir / "dsm" / "matrix.json"
+        history_dsm = output_dir / "history-dsm" / "history_raw.dv8-dsm"
+        history_dsm_json = output_dir / "history-dsm" / "history_raw.matrix.json"
+        merged_dsm = output_dir / "history-dsm" / "struct_plus_history.dv8-dsm"
+        merged_dsm_json = output_dir / "history-dsm" / "struct_plus_history.matrix.json"
         print(f"  Arch-issues: {ai if ai.exists() else 'not found'}")
         print(f"  Debt cost: {aic if aic.exists() else 'not found'}")
         print(f"  Hotspots: {hs if hs.exists() else 'not found'}")
         print(f"  DR-Hierarchy: {drh if drh.exists() else 'not found'}")
         print(f"  Matrix JSON: {dsm_json if dsm_json.exists() else 'not found'}")
+        print(f"  History DSM: {history_dsm if history_dsm.exists() else 'not found'}")
+        print(f"  History DSM JSON: {history_dsm_json if history_dsm_json.exists() else 'not found'}")
+        print(f"  Merged anti-issue DSM: {merged_dsm if merged_dsm.exists() else 'not found'}")
+        print(f"  Merged anti-issue JSON: {merged_dsm_json if merged_dsm_json.exists() else 'not found'}")
 
         # Tool logs
         tool_log = output_dir / "tool_logs" / "DEPENDS_DV8_OUTPUT.json"
@@ -1815,6 +2068,10 @@ def get_commit_history(
         else:
             i += 1
 
+    # Git log order can be topological around merge commits, which may not be
+    # strictly chronological. Sort explicitly so temporal sampling is monotonic.
+    commits.sort(key=lambda c: parse_git_commit_datetime(c.get('date', '')), reverse=True)
+
     # Apply spacing mode strategies
     if spacing_mode == "alltime":
         # MODE 1: ALL-TIME - First ever, last ever, interpolated in between
@@ -2011,6 +2268,7 @@ def analyze_single_revision(
     neodepends_bin: Optional[str] = None,
     neodepends_resolver: str = "stackgraphs",
     java_depends: bool = False,
+    mv_cochange: int | None = None,
 ) -> Dict[str, Any]:
     """Run complete DV8 analysis pipeline on a single revision. Returns metrics dict."""
     print(f"\n  Analyzing {revision_path.name}...")
@@ -2039,6 +2297,7 @@ def analyze_single_revision(
     depends_output = input_data / "DependsOutput" / "json"
     neodepends_output = input_data / "NeoDependsOutput"
     output_data = revision_path / "OutputData"
+    history_output = output_data / "history-dsm"
     ensure_dirs(input_data, depends_output, output_data, neodepends_output)
 
     project_name = guess_project_name(revision_path)
@@ -2062,24 +2321,31 @@ def analyze_single_revision(
             source_root = scoped
         json_dep: Path
         mapping: _Optional[Path] = None
-        if lang in {"python", "java"} and not (lang == "java" and java_depends):
+        use_neodepends = lang in {"python", "java"} and not (lang == "java" and java_depends)
+        if use_neodepends:
             nd_root = resolve_neodepends_root(neodepends_root)
-            if not nd_root:
-                raise SystemExit("NeoDepends root not found. Set --neodepends-root or NEODEPENDS_ROOT.")
-            if lang == "java":
-                print("  Java source detected. Using NeoDepends for dependency extraction.")
+            if nd_root:
+                if lang == "java":
+                    print("  Java source detected. Using NeoDepends for dependency extraction.")
+                else:
+                    print("  Python source detected. Using NeoDepends for dependency extraction.")
+                json_dep = run_neodepends_python_export(
+                    source_root=source_root,
+                    output_dir=neodepends_output,
+                    neodepends_root=nd_root,
+                    neodepends_bin=neodepends_bin,
+                    resolver=neodepends_resolver,
+                    config="default",
+                    langs=lang,
+                    logs=step_logs,
+                )
+            elif lang == "java":
+                print("  NeoDepends not available for Java. Falling back to DV8 Depends.")
+                json_dep, mapping = run_depends_via_dv8(
+                    dv8_console, source_root, depends_output, basename, env, logs=step_logs
+                )
             else:
-                print("  Python source detected. Using NeoDepends for dependency extraction.")
-            json_dep = run_neodepends_python_export(
-                source_root=source_root,
-                output_dir=neodepends_output,
-                neodepends_root=nd_root,
-                neodepends_bin=neodepends_bin,
-                resolver=neodepends_resolver,
-                config="default",
-                langs=lang,
-                logs=step_logs,
-            )
+                raise SystemExit("NeoDepends root not found. Set --neodepends-root or NEODEPENDS_ROOT.")
         else:
             json_dep, mapping = run_depends_via_dv8(
                 dv8_console, source_root, depends_output, basename, env, logs=step_logs
@@ -2088,6 +2354,54 @@ def analyze_single_revision(
         # Step 2: Convert to DSM
         dsm_path = output_data / "repo.dv8-dsm"
         convert_to_dsm(dv8_console, json_dep, mapping, dsm_path, env, logs=step_logs)
+
+        # Step 2b: Build history DSM from git log and merge it with the structural DSM
+        history_log_path = history_output / "git-history.txt"
+        history_dsm_path = history_output / "history_raw.dv8-dsm"
+        history_dsm_json_path = history_output / "history_raw.matrix.json"
+        merged_arch_issue_dsm_path = history_output / "struct_plus_history.dv8-dsm"
+        merged_arch_issue_json_path = history_output / "struct_plus_history.matrix.json"
+        has_history_dsm = False
+        if export_git_history_log(revision_path, history_log_path, logs=step_logs):
+            generate_git_change_cost(
+                dv8_console,
+                history_log_path,
+                history_output / "change-cost",
+                env,
+                logs=step_logs,
+            )
+            _fix_change_cost_csv(history_output / "change-cost")
+            has_history_dsm = convert_git_history_to_dsm(
+                dv8_console,
+                history_log_path,
+                history_dsm_path,
+                env,
+                logs=step_logs,
+            )
+            if has_history_dsm:
+                export_matrix_json(
+                    dv8_console,
+                    history_dsm_path,
+                    history_dsm_json_path,
+                    env,
+                    logs=step_logs,
+                )
+                has_history_dsm = merge_dsms(
+                    dv8_console,
+                    [dsm_path, history_dsm_path],
+                    merged_arch_issue_dsm_path,
+                    env,
+                    logs=step_logs,
+                )
+                if has_history_dsm:
+                    export_matrix_json(
+                        dv8_console,
+                        merged_arch_issue_dsm_path,
+                        merged_arch_issue_json_path,
+                        env,
+                        logs=step_logs,
+                    )
+        arch_issue_dsm_path = merged_arch_issue_dsm_path if has_history_dsm else dsm_path
 
         # Step 3: Compute metrics
         all_metrics = compute_all_metrics(dv8_console, dsm_path, output_data, env, logs=step_logs)
@@ -2098,12 +2412,14 @@ def analyze_single_revision(
                 params_dir = revision_path / "InputData"
                 params_dir.mkdir(parents=True, exist_ok=True)
 
-                # Only attempt hotspot if a change-cost file exists (otherwise it often fails).
-                change_cost = None
-                for cand in sorted(output_data.rglob("*change*cost*")):
-                    if cand.is_file():
-                        change_cost = cand
-                        break
+                # Only attempt hotspot if the file-level change-cost CSV exists.
+                # Use all-file-change-cost.csv specifically — arch-report's hotspot needs
+                # per-file churn data, not the commits-level all-commits-change-cost.csv
+                # (which alphabetically sorts first and was previously picked by the rglob).
+                change_cost = next(
+                    (p for p in output_data.rglob("all-file-change-cost.csv") if p.is_file()),
+                    None,
+                )
                 run_hotspot = change_cost is not None
 
                 params_path = params_dir / "archreport.properties"
@@ -2114,11 +2430,12 @@ def analyze_single_revision(
                     output_data,
                     run_file_stat=False,
                     run_hotspot=run_hotspot,
-                    run_archissue=True,
-                    run_archroot=True,
+                    run_archissue=False,
+                    run_archroot=False,  # NPE in createVersionsLanguageOverview when runArchissue=off seeds DB first
                     run_metrics=True,
                     run_clustering=True,
-                    run_report_doc=True,
+                    run_report_doc=False,  # requires runArchroot=on, skip to avoid cascade NPE
+                    change_cost_file=change_cost,
                 )
                 try:
                     run_arch_report(dv8_console, params_path, revision_path, env, logs=step_logs)
@@ -2126,8 +2443,19 @@ def analyze_single_revision(
                     # Best-effort only; fall back to direct tasks below.
                     pass
 
-            # Regardless of arch-report success, also run direct DV8 tasks for anti-patterns/debt/hotspots/DRH
-            run_additional_dv8_tasks(dv8_console, dsm_path, output_data, env, logs=step_logs)
+        # Always run direct DV8 tasks for anti-patterns/debt/hotspots/DRH — regardless of
+        # fine_grain flag. This ensures hotspot ROI CSVs are produced whenever a DSM exists,
+        # and arch-issue/cost data is always available for the QA pipeline.
+        run_additional_dv8_tasks(
+            dv8_console,
+            dsm_path,
+            output_data,
+            env,
+            arch_issue_dsm_path=arch_issue_dsm_path,
+            project_name=project_name,
+            logs=step_logs,
+            mv_cochange=mv_cochange,
+        )
 
         # Extract values
         metrics = {}
@@ -2236,8 +2564,8 @@ def analyze_single_revision(
 
 def generate_plots(timeseries_file: Path, output_dir: Path) -> Path:
     """Generate beautiful plots with threshold zones using metric_plotter.py."""
-    # Create plots directory
-    plots_dir = output_dir / "plots"
+    # Create plots directory inside INPUT_INTERPRETATION
+    plots_dir = output_dir / "INPUT_INTERPRETATION" / "plots" / "time_evolution_modularity_metrics"
     ensure_dirs(plots_dir)
 
     # Call the existing metric_plotter.py script
@@ -2309,6 +2637,7 @@ def run_temporal_analysis(
     skip_arch_report: bool = False,
     use_worktree: bool = True,
     spacing_mode: str = "intelligent",
+    mv_cochange: int | None = None,
 ) -> Path:
     """Analyze multiple Git revisions and save time-series data with flexible spacing strategies."""
 
@@ -2408,6 +2737,9 @@ def run_temporal_analysis(
 
     revisions_workspace = repo_folder / folder_name
     ensure_dirs(revisions_workspace)
+    # All numbered repo snapshots go into data_repositories/ to keep the analysis root clean
+    data_repos_dir = revisions_workspace / "data_repositories"
+    ensure_dirs(data_repos_dir)
 
     # Analyze each revision
     timeseries_data = []
@@ -2430,13 +2762,13 @@ def run_temporal_analysis(
         if use_worktree:
             try:
                 revision_path = checkout_commit_to_worktree(
-                    repo_path, commit['hash'], commit['date'], revisions_workspace, i
+                    repo_path, commit['hash'], commit['date'], data_repos_dir, i
                 )
             except Exception as e:
                 print(f"  Worktree failed ({e}); falling back to archive snapshot.")
-                revision_path = checkout_commit_to_folder(repo_path, commit['hash'], commit['date'], revisions_workspace, i)
+                revision_path = checkout_commit_to_folder(repo_path, commit['hash'], commit['date'], data_repos_dir, i)
         else:
-            revision_path = checkout_commit_to_folder(repo_path, commit['hash'], commit['date'], revisions_workspace, i)
+            revision_path = checkout_commit_to_folder(repo_path, commit['hash'], commit['date'], data_repos_dir, i)
 
         # Analyze
         metrics = analyze_single_revision(
@@ -2452,6 +2784,7 @@ def run_temporal_analysis(
             neodepends_bin=neodepends_bin,
             neodepends_resolver=neodepends_resolver,
             java_depends=java_depends,
+            mv_cochange=mv_cochange,
         )
 
         if fine_grain and arch_report_enabled:
@@ -2482,8 +2815,10 @@ def run_temporal_analysis(
             if k != "error":
                 print(f"    {k}: {v}")
 
-    # Save time-series data inside the specific temporal folder to avoid overwrites across modes
-    output_file = revisions_workspace / "timeseries.json"
+    # Save time-series data into INPUT_INTERPRETATION for clean folder structure
+    interp_input_dir = revisions_workspace / "INPUT_INTERPRETATION"
+    ensure_dirs(interp_input_dir)
+    output_file = interp_input_dir / "timeseries.json"
     with open(output_file, 'w') as f:
         json.dump({
             'repo': repo_name,
@@ -2581,7 +2916,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-commits-apart", type=int, default=0, help="Minimum number of commits between selected revisions (0=disabled). Example: 100 means pick HEAD, then ~100 commits back, etc.")
     parser.add_argument("--since-date", help="Limit analysis to commits on/after this date (YYYY or YYYY-MM or YYYY-MM-DD).")
     parser.add_argument("--until-date", help="Limit analysis to commits on/before this date (YYYY or YYYY-MM or YYYY-MM-DD).")
-    parser.add_argument("--fine-grain", action="store_true", help="In temporal mode, also run full arch-report (anti-patterns, clustering, hotspots) for each revision.")
+    parser.add_argument("--no-fine-grain", action="store_true", help="Skip full arch-report (anti-patterns, clustering, hotspots) per revision. Fine-grain is ON by default.")
+    parser.add_argument("--mv-cochange", type=int, default=None, help="Modularity Violation co-change threshold (passed to DV8 arch-issue:arch-issue as -mvCochange). Default: DV8's built-in default (2). Use higher values (e.g. 5) to filter out process-noise co-changes (license headers, formatting) and keep only semantically meaningful co-changes.")
     parser.add_argument("--spacing-mode", choices=["intelligent", "interpolate", "all-time-major", "smart", "uniform"], default="intelligent",
                        help="Revision selection mode: smart (most file changes), uniform/alltime (evenly spaced), intelligent (default filtering).")
     parser.add_argument("--no-temporal-worktree", action="store_true",
@@ -2719,12 +3055,13 @@ def main() -> None:
                 dv8_console,
                 env,
                 args.source_path,
-                fine_grain=args.fine_grain,
+                fine_grain=not args.no_fine_grain,
                 scope=args.scope,
                 language=args.language,
                 neodepends_root=args.neodepends_root,
                 neodepends_bin=args.neodepends_bin,
                 neodepends_resolver=args.neodepends_resolver,
+                mv_cochange=args.mv_cochange if hasattr(args, "mv_cochange") else None,
             )
 
         print(f"\nFocus commit analysis complete: {focus_ws}")
@@ -2733,7 +3070,7 @@ def main() -> None:
     # If temporal analysis is requested, run it and exit
     if args.temporal:
         branch = args.branch or "main"
-        auto_fine = True  # always run full arch-report (DRH, anti-patterns, clustering) for every revision
+        auto_fine = not args.no_fine_grain  # fine-grain (arch-report per revision) is ON by default; --no-fine-grain disables it
         scopes = ["full", "prod"] if args.scope == "both" else [args.scope]
         last_output: Optional[Path] = None
         for sc in scopes:
@@ -2760,7 +3097,8 @@ def main() -> None:
                 fine_grain=auto_fine,
                 skip_arch_report=args.skip_arch_report,
                 use_worktree=not args.no_temporal_worktree,
-                spacing_mode=args.spacing_mode
+                spacing_mode=args.spacing_mode,
+                mv_cochange=args.mv_cochange if hasattr(args, "mv_cochange") else None,
             )
 
         print(f"\nTemporal analysis complete!")
@@ -2862,6 +3200,7 @@ def main() -> None:
             return
 
     # reuse cached outputs unless user forced regeneration
+    needs_depends_fallback = False
     if use_neodepends:
         neodep_json = neodepends_output / "dependencies.full.dv8-dependency.json"
         if neodep_json.is_file() and not args.force_depends:
@@ -2870,19 +3209,23 @@ def main() -> None:
             mapping = None
         else:
             nd_root = resolve_neodepends_root(args.neodepends_root)
-            if not nd_root:
+            if nd_root:
+                json_dep = run_neodepends_python_export(
+                    source_root=source_root,
+                    output_dir=neodepends_output,
+                    neodepends_root=nd_root,
+                    neodepends_bin=args.neodepends_bin,
+                    resolver=args.neodepends_resolver,
+                    config="default",
+                    langs=detected_language,
+                )
+                mapping = None
+            elif detected_language == "java":
+                print("NeoDepends not available for Java. Falling back to DV8 Depends.")
+                needs_depends_fallback = True
+            else:
                 raise SystemExit("NeoDepends root not found. Set --neodepends-root or NEODEPENDS_ROOT.")
-            json_dep = run_neodepends_python_export(
-                source_root=source_root,
-                output_dir=neodepends_output,
-                neodepends_root=nd_root,
-                neodepends_bin=args.neodepends_bin,
-                resolver=args.neodepends_resolver,
-                config="default",
-                langs=detected_language,
-            )
-            mapping = None
-    else:
+    if (not use_neodepends) or needs_depends_fallback:
         cache_available = json_dep.is_file()
         if cache_available and not args.force_depends:
             print("Reusing existing Depends output (use --force-depends to regenerate).")

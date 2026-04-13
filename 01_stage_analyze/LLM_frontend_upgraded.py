@@ -29,7 +29,7 @@ COMPUTE_RISK = os.path.join(THIS_DIR, "compute_file_risk_scores.py")
 PLOT_RISK = os.path.join(THIS_DIR, "plot_risk_score_stats.py")
 
 # Config
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "deepseek-r1:8b")
 OLLAMA_ENDPOINT = os.getenv("OLLAMA_ENDPOINT", "http://127.0.0.1:11434")
 # Prefer explicit env, then TEST_AUTO/RAG_KnowledgeBase, else legacy KB/archdia
 _PARENT = os.path.dirname(THIS_DIR)
@@ -70,8 +70,14 @@ Output ONLY JSON:
   "min_months_apart": <number> (for temporal_analysis: 0=all-time mode, 1-12=recent mode with N months spacing),
   "model": "<ollama_model>" (for interpret_metrics/interpret_temporal/query, default: "deepseek-r1:32b", recommended: "deepseek-r1:70b" for best quality),
   "question": "<question text>" (for query tool: the full question to answer),
-  "user_question": "<question text>" (for temporal_analysis/interpret_temporal: question answered after analysis)
+  "user_question": "<question text>" (for temporal_analysis/interpret_temporal: question answered after analysis),
+  "mv_cochange": <integer> (optional: modularity violation co-change threshold passed to DV8; default=DV8 built-in (2); use 5 for medium repos to filter process-noise)
 }
+
+MV_COCHANGE EXTRACTION RULES:
+- If user mentions "mv threshold 5", "mv cochange 5", "mvCochange 5", "modularity violation threshold 5" → "mv_cochange": 5
+- If user mentions "with mv threshold N" or "threshold N for modularity" → "mv_cochange": N
+- Do NOT set mv_cochange if user does not mention it (leave out of JSON — use DV8 default)
 
 MODEL EXTRACTION RULES:
 - If user mentions "deepseek-r1:14b", "14b", "14B" → "model": "deepseek-r1:14b"
@@ -102,6 +108,12 @@ Reasoning:
 - User says "major changes" or "X months apart" → min_months_apart=3 (RECENT-MAJOR)
 - User says "1 month" → min_months_apart=1
 - User says "3 months" → min_months_apart=3
+- User says "X years Y months apart" → count = X * (12 / Y), min_months_apart = Y
+  - "5 years 3 months apart" → count=20, min_months_apart=3
+  - "3 years 6 months apart" → count=6, min_months_apart=6
+  - "10 years 1 month apart" → count=120, min_months_apart=1
+- ALWAYS use tool="temporal_analysis" when user says "analyze and interpret" (not "interpret_temporal")
+- NEVER output placeholder paths like "/path/to/..." — use ONLY short repo names from KNOWN REPOSITORIES
 
 Examples:
 - "analyze 5 revisions of all time for pdfbox" → {"tool": "temporal_analysis", "repo": "pdfbox", "count": 5, "branch": "trunk", "min_months_apart": 0}
@@ -109,6 +121,8 @@ Examples:
 - "analyze last 7 major revisions with 1 month spacing" → {"tool": "temporal_analysis", "repo": "pdfbox", "count": 7, "branch": "trunk", "min_months_apart": 1}
 - "analyze jsoup all-time with 10 timesteps 3 months apart and then interpret with deepseek-r1:32b" → {"tool": "temporal_analysis", "repo": "jsoup", "count": 10, "branch": "main", "min_months_apart": 3, "model": "deepseek-r1:32b"}
 - "analyze commons-io all-time in 5 timesteps and then interpret with deepseek-r1:70b" → {"tool": "temporal_analysis", "repo": "commons-io", "count": 5, "branch": "main", "min_months_apart": 0, "model": "deepseek-r1:70b"}
+- "analyze and interpret commons-io with 5 years 3 months apart with deepseek-r1:32b" → {"tool": "temporal_analysis", "repo": "commons-io", "count": 20, "branch": "main", "min_months_apart": 3, "model": "deepseek-r1:32b"}
+- "analyze and interpret commons-io 3 years 6 months apart with deepseek-r1:32b" → {"tool": "temporal_analysis", "repo": "commons-io", "count": 6, "branch": "main", "min_months_apart": 6, "model": "deepseek-r1:32b"}
 - "interpret the temporal analysis for jsoup with deepseek-r1:32b" → {"tool": "interpret_temporal", "repo": "jsoup", "model": "deepseek-r1:32b"}
 - "interpret this temporal analysis folder '/.../temporal_analysis_alltime_...'" → {"tool": "interpret_temporal", "repo": "/.../temporal_analysis_alltime_.../INPUT_INTERPRETATION", "model": "deepseek-r1:32b"}
 - "analyze ARCH_ANALYSIS_TRAINTICKET_TOY_EXAMPLES_MULTILANG all-time in 2 timesteps on branch temporal and then interpret with deepseek-r1:32b" → {"tool": "temporal_analysis", "repo": "ARCH_ANALYSIS_TRAINTICKET_TOY_EXAMPLES_MULTILANG", "count": 2, "branch": "temporal", "min_months_apart": 0, "model": "deepseek-r1:32b"}
@@ -137,7 +151,7 @@ IMPORTANT: If no URL is given, use the exact short name from KNOWN REPOSITORIES 
 IMPORTANT: Always extract the branch from the prompt. "on branch temporal" or "temporal branch" → "branch": "temporal". Default is "main" only if no branch is mentioned.
 """
 
-def _http_json(method: str, path: str, payload: dict | None, timeout=120):
+def _http_json(method: str, path: str, payload: dict | None, timeout=300):
     url = f"{OLLAMA_ENDPOINT}{path}"
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method=method)
@@ -318,6 +332,19 @@ def _resolve_repo_and_source(repo: str, source_path: str | None) -> tuple[str, s
         cur = cur.parent
     return str(p), source_path
 
+def _ts_path(root: pathlib.Path) -> pathlib.Path:
+    """Return the timeseries.json path for a temporal root, preferring new INPUT_INTERPRETATION location."""
+    new_loc = root / "INPUT_INTERPRETATION" / "timeseries.json"
+    if new_loc.exists():
+        return new_loc
+    return root / "timeseries.json"  # legacy fallback
+
+
+def _has_timeseries(root: pathlib.Path) -> bool:
+    """Check if a temporal root has a timeseries.json (in either location)."""
+    return _ts_path(root).exists()
+
+
 def _temporal_root_from_interpretation_path(p: str) -> str | None:
     """Given a path to INPUT_INTERPRETATION, OUTPUT_INTERPRETATION, or their parent temporal folder, return the temporal root."""
     try:
@@ -328,33 +355,38 @@ def _temporal_root_from_interpretation_path(p: str) -> str | None:
         pp = pp.parent
     if pp.name in ("INPUT_INTERPRETATION", "OUTPUT_INTERPRETATION"):
         tr = pp.parent
-        if (tr / "timeseries.json").exists():
+        if _has_timeseries(tr):
             return str(tr)
         # Common user mistake: path points to a placeholder folder without timeseries.json.
-        # Try siblings like "<repo>/(temporal_analysis*/timeseries.json)" and pick newest.
+        # Try siblings like "<repo>/(temporal_analysis*/)" and pick newest.
         try:
             sib = tr.parent
-            candidates = list(sib.glob("temporal_analysis*/timeseries.json"))
+            candidates = [d for d in sib.glob("temporal_analysis*/") if _has_timeseries(d)]
             if candidates:
                 newest = max(candidates, key=lambda x: x.stat().st_mtime)
-                return str(newest.parent)
+                return str(newest)
         except Exception:
             pass
         return None
     # If path itself is temporal root
-    if (pp / "timeseries.json").exists():
+    if _has_timeseries(pp):
         return str(pp)
     # Walk upwards a bit
     cur = pp
     for _ in range(4):
-        if (cur / "timeseries.json").exists():
+        if _has_timeseries(cur):
             return str(cur)
         if cur.parent == cur:
             break
         cur = cur.parent
     return None
 
-def _run_risk_pipeline(temporal_root: pathlib.Path, repo_name: str, git_root: pathlib.Path | None = None) -> None:
+def _run_risk_pipeline(
+    temporal_root: pathlib.Path,
+    repo_name: str,
+    git_root: pathlib.Path | None = None,
+    review_model: str | None = None,
+) -> None:
     """
     Run the full per-file risk scoring pipeline after backfill completes:
       1. fetch_github_issues   — build issue_map.json (JIRA/GitHub auto-detected)
@@ -367,7 +399,11 @@ def _run_risk_pipeline(temporal_root: pathlib.Path, repo_name: str, git_root: pa
     interp_root = temporal_root / "INPUT_INTERPRETATION"
 
     # --- Step 1: Issue map (JIRA/GitHub auto-detected from commit history) ---
-    issue_map_path = temporal_root / "issue_map.json"
+    # New location: INPUT_INTERPRETATION/issue_map.json; legacy fallback: temporal root
+    issue_map_path = next(
+        (p for p in [interp_root / "issue_map.json", temporal_root / "issue_map.json"] if p.exists()),
+        interp_root / "issue_map.json",  # default write target for new runs
+    )
     if not issue_map_path.exists() and os.path.isfile(FETCH_ISSUES):
         print("\n[risk-pipeline] Fetching issue map (JIRA/GitHub auto-detection)...")
         fi_cmd = [sys.executable, FETCH_ISSUES, "--out", str(issue_map_path)]
@@ -394,13 +430,17 @@ def _run_risk_pipeline(temporal_root: pathlib.Path, repo_name: str, git_root: pa
 
     # --- Step 3: Compute multi-signal file risk scores ---
     risk_json = interp_root / "file_risk_scores.json"
-    if risk_json.exists():
+    bug_review_json = interp_root / "bug_churn_commits_llm_review.json"
+    need_bug_review = bool(review_model) and not bug_review_json.exists()
+    if risk_json.exists() and not need_bug_review:
         print(f"\n[risk-pipeline] Reusing existing file_risk_scores.json")
     elif os.path.isfile(COMPUTE_RISK) and interp_root.exists():
         print("\n[risk-pipeline] Computing file risk scores...")
         cr_cmd = [sys.executable, COMPUTE_RISK, str(interp_root), "--verbose"]
         if git_root and git_root.exists():
             cr_cmd += ["--git-root", str(git_root)]
+        if review_model:
+            cr_cmd += ["--bug-churn-review-model", str(review_model)]
         if issue_map_path and pathlib.Path(str(issue_map_path)).exists():
             # Pass issue map to backfill if it was generated — already baked into payloads,
             # but log for traceability
@@ -434,6 +474,7 @@ def _run_risk_pipeline(temporal_root: pathlib.Path, repo_name: str, git_root: pa
                         f"       fan-in={sigs.get('hotspot_fanin_score',0):.0f}  "
                         f"scc={sigs.get('scc_membership_count',0)}  "
                         f"anti_pattern_count={sigs.get('anti_pattern_count',0)}  "
+                        f"anti_pattern_load={sigs.get('anti_pattern_instance_load',0)}  "
                         f"bug_churn={sigs.get('bug_churn_total',0)}"
                     )
                 print(f"{'='*60}")
@@ -465,10 +506,11 @@ def _load_rich_qa_context(temporal_root: pathlib.Path) -> tuple:
             lines_rs.append("---" * 12)
             for f in top_files:
                 s = f.get("signals", {})
-                aps = ", ".join(f.get("anti_patterns_seen", [])[:3])
+                ap_counts = f.get("anti_pattern_type_counts", {})
+                aps = ", ".join(f"{k}:{v}" for k, v in list(ap_counts.items())[:4])
                 lines_rs.append(
                     f"#{f['rank']:2d} | {f['file'].split('/')[-1]:40s} | {f['risk_score']:.3f} | "
-                    f"bug={s.get('bug_churn_total',0):5d} | ap={s.get('anti_pattern_count',0):3d} revisions | "
+                    f"bug={s.get('bug_churn_total',0):5d} | ap={s.get('anti_pattern_count',0):3d} counts / load={s.get('anti_pattern_instance_load',0):3d} | "
                     f"scc={s.get('scc_membership_count',0):2d} revisions | co={s.get('co_change_without_dep',0):2d} | [{aps}]"
                 )
             risk_score_context = "\n".join(lines_rs)
@@ -476,9 +518,15 @@ def _load_rich_qa_context(temporal_root: pathlib.Path) -> tuple:
         except Exception as exc:
             print(f"  [query] WARNING: Could not load risk scores: {exc}")
 
-    # Bug-linked commits from issue_map
-    issue_map_path = temporal_root / "issue_map.json"
-    if issue_map_path.exists():
+    # Bug-linked commits from issue_map (new location: INPUT_INTERPRETATION/issue_map.json, legacy: root)
+    issue_map_path = next(
+        (p for p in [
+            temporal_root / "INPUT_INTERPRETATION" / "issue_map.json",
+            temporal_root / "issue_map.json",
+        ] if p.exists()),
+        None,
+    )
+    if issue_map_path is not None:
         try:
             issue_data = json.loads(issue_map_path.read_text(encoding="utf-8"))
             summaries_map = issue_data.get("summaries", {})
@@ -536,7 +584,7 @@ def tool_query(plan: dict) -> int:
         repos_dir = test_auto_dir / "REPOS_ANALYZED" / repo
         if repos_dir.exists():
             candidates = [p for p in repos_dir.glob("temporal_analysis*/") if p.is_dir()
-                          and (p / "timeseries.json").exists()]
+                          and _has_timeseries(p)]
             if candidates:
                 temporal_root = max(candidates, key=lambda p: p.stat().st_mtime)
                 print(f"[query] Using temporal analysis: {temporal_root.name}")
@@ -718,15 +766,15 @@ def tool_interpret_temporal(plan: dict) -> int:
             pp = pathlib.Path(folder).expanduser().resolve()
             base = pp.parent if pp.name in ("INPUT_INTERPRETATION", "OUTPUT_INTERPRETATION") else pp
             if base.exists():
-                candidates = list(base.glob("temporal_analysis*/timeseries.json"))
+                candidates = [d for d in base.glob("temporal_analysis*/") if _has_timeseries(d)]
                 if candidates:
                     newest = max(candidates, key=lambda x: x.stat().st_mtime)
-                    print(f"Hint: try temporal root: {newest.parent}")
+                    print(f"Hint: try temporal root: {newest}")
         except Exception:
             pass
         return 1
     tr = pathlib.Path(temporal_root)
-    ts_path = tr / "timeseries.json"
+    ts_path = _ts_path(tr)
     ts = {}
     if ts_path.exists():
         try:
@@ -786,7 +834,16 @@ def tool_interpret_temporal(plan: dict) -> int:
             return 1
 
     # --- Risk pipeline: issue fetch → DV8 export → risk scores → plots ---
-    _run_risk_pipeline(tr, repo_name, git_root=repo if (repo / ".git").exists() else None)
+    # review_model=None: skip slow LLM commit review (step 6b) by default.
+    # The core signals (bug_churn, anti_pattern, fan_in, scc, co_change) are
+    # computed without LLM. The review step only re-classifies ambiguous commits
+    # and is not needed for Q&A quality.
+    _run_risk_pipeline(
+        tr,
+        repo_name,
+        git_root=repo if (repo / ".git").exists() else None,
+        review_model=None,
+    )
 
     # --- Check for existing interpretation runs ---
     model_safe = model.replace("/", "_").replace(":", "_")
@@ -1113,11 +1170,18 @@ def tool_temporal_analysis(plan: dict) -> int:
     force_depends = plan.get("force_depends", False)
     workspace = plan.get("workspace")
     java_depends = plan.get("java_depends", True)  # Default True: use Depends for Java (NeoDepends still testing)
+    mv_cochange = plan.get("mv_cochange")  # Modularity Violation co-change threshold (DV8 -mvCochange)
+    if mv_cochange is not None:
+        try:
+            mv_cochange = int(mv_cochange)
+        except (ValueError, TypeError):
+            mv_cochange = None
 
     # Infer params from natural language if present
     ur = (plan.get("user_request") or "").lower()
     if ur:
         import re
+        from datetime import date
         # Branch override: "on branch temporal", "temporal branch", "branch=temporal"
         m_branch = re.search(r"\bon\s+branch\s+([A-Za-z0-9._\-/]+)", ur, re.I) or \
                    re.search(r"([A-Za-z0-9._\-/]+)\s+branch\b", ur, re.I) or \
@@ -1133,7 +1197,7 @@ def tool_temporal_analysis(plan: dict) -> int:
                 pass
         # Months spacing: "with 3 months in between"
         m_mon = re.search(r"(\d+)\s*\.?\s*months?", ur)
-        if m_mon and ("between" in ur or "in between" in ur or "apart" in ur or "spacing" in ur):
+        if m_mon and ("between" in ur or "in between" in ur or "apart" in ur or "spacing" in ur or "every" in ur):
             try:
                 min_months_apart = int(m_mon.group(1))
                 min_commits_apart = 0
@@ -1145,6 +1209,21 @@ def tool_temporal_analysis(plan: dict) -> int:
             try:
                 min_commits_apart = int(m_com.group(1))
                 min_months_apart = 0
+            except ValueError:
+                pass
+        # Relative history window: "last 10 years"
+        m_years = re.search(r"last\s+(\d+)\s+years?", ur)
+        if m_years:
+            try:
+                years = int(m_years.group(1))
+                today = date.today()
+                until_date = until_date or f"{today.year:04d}-{today.month:02d}-{today.day:02d}"
+                since_year = today.year - years
+                since_date = since_date or f"{since_year:04d}-{today.month:02d}-01"
+                # If the planner forgot the count but we do have month spacing,
+                # derive a reasonable number of revisions for the requested window.
+                if min_months_apart > 0 and (not plan.get("count") or int(plan.get("count", 5)) == 5):
+                    count = max(2, int((years * 12) / min_months_apart))
             except ValueError:
                 pass
         # Smart commit selection: pick commits with most file changes
@@ -1219,6 +1298,20 @@ def tool_temporal_analysis(plan: dict) -> int:
             m_jd = re.search(r"java[_-]?depends\s*=\s*(true|false)", plan.get("user_request") or "", re.I)
             if m_jd:
                 java_depends = (m_jd.group(1).strip().lower() == "true")
+        # MV co-change threshold: "mv threshold 5", "mv cochange 5", "mvCochange 5", "threshold 5"
+        if mv_cochange is None:
+            m_mv = re.search(
+                r"(?:mv[_\s-]?(?:co[_\s-]?change|threshold)|mvCochange|modularity[_\s-]?violation[_\s-]?threshold)\s*[=:\s]+(\d+)",
+                plan.get("user_request") or "", re.I
+            ) or re.search(
+                r"(?:with\s+)?(?:mv|modularity[_\s-]?violation)\s+threshold\s+(\d+)",
+                plan.get("user_request") or "", re.I
+            )
+            if m_mv:
+                try:
+                    mv_cochange = int(m_mv.group(1))
+                except ValueError:
+                    pass
         if "python" in ur and "java" not in ur:
             lang_hint = "python"
         if "java" in ur and "python" not in ur:
@@ -1231,6 +1324,10 @@ def tool_temporal_analysis(plan: dict) -> int:
         elif "production" in ur or "prod" in ur:
             # Only override if user explicitly asked; keep default otherwise.
             scope = plan.get("scope", "prod")
+
+        # Known branch defaults for common repos when the planner falls back to "main".
+        if branch == "main" and "commons-io" in ur:
+            branch = "master"
 
     # If user asked for both languages, do not lock to a single source_path
     force_dual = bool(ur and ("java" in ur and "python" in ur))
@@ -1291,6 +1388,8 @@ def tool_temporal_analysis(plan: dict) -> int:
             cmd += ["--until-date", until_date]
         if fine_grain:
             cmd += ["--fine-grain"]
+        if mv_cochange is not None:
+            cmd += ["--mv-cochange", str(mv_cochange)]
         return cmd
     # If user specified a source_path, run once.
     json_file = None
@@ -1345,23 +1444,26 @@ def tool_temporal_analysis(plan: dict) -> int:
         json_file = None
         repo_name = None
         repos_dir = None
+        temporal_root_dir = None
 
         if workspace:
             search_root = pathlib.Path(workspace).expanduser().resolve()
-            all_candidates = list(search_root.glob("*/temporal_analysis*/timeseries.json"))
         else:
             search_root = test_auto_dir / "REPOS_ANALYZED"
-            all_candidates = list(search_root.glob("*/temporal_analysis*/timeseries.json"))
+        all_temporal = [d for d in search_root.glob("*/temporal_analysis*/") if d.is_dir() and _has_timeseries(d)]
 
-        if all_candidates:
-            json_file = max(all_candidates, key=lambda p: p.stat().st_mtime)
-            repos_dir = json_file.parent.parent   # REPOS_ANALYZED/<repo_name>/
+        if all_temporal:
+            newest_tr = max(all_temporal, key=lambda d: d.stat().st_mtime)
+            json_file = _ts_path(newest_tr)
+            temporal_root_dir = newest_tr          # always the temporal_analysis_* dir
+            repos_dir = newest_tr.parent   # REPOS_ANALYZED/<repo_name>/
             repo_name = repos_dir.name
         else:
             # Fallback: derive from repo variable as before
             repo_name = pathlib.Path(repo).name if "://" not in repo else pathlib.Path(repo.rstrip('/').split('/')[-1]).stem.replace(".git", "")
             repos_dir = search_root / repo_name
             json_file = repos_dir / "timeseries.json"
+            temporal_root_dir = repos_dir  # best guess in fallback
 
         print(f"\nOutput files:")
         print(f"   Time-series data: {json_file}")
@@ -1374,7 +1476,11 @@ def tool_temporal_analysis(plan: dict) -> int:
 
     if json_file and json_file.exists():
             # Auto-run backfill to prepare interpretation bundle
-            temporal_folder = json_file.parent
+            # Use temporal_root_dir (the temporal_analysis_* dir) — NOT json_file.parent,
+            # which may be INPUT_INTERPRETATION/ and would cause double-nesting.
+            temporal_folder = temporal_root_dir if temporal_root_dir else (
+                json_file.parent.parent if json_file.parent.name == "INPUT_INTERPRETATION" else json_file.parent
+            )
             print("\nPreparing interpretation bundle...")
             bf_cmd = ["python3", BACKFILL_TEMPORAL, str(temporal_folder), "--meta-repo", repo_name]
             bf_rc = subprocess.call(bf_cmd)
@@ -1386,7 +1492,12 @@ def tool_temporal_analysis(plan: dict) -> int:
                     _candidate = pathlib.Path(repo).expanduser().resolve()
                     if (_candidate / ".git").exists():
                         _git_root = _candidate
-                _run_risk_pipeline(temporal_folder, repo_name, git_root=_git_root)
+                _run_risk_pipeline(
+                    temporal_folder,
+                    repo_name,
+                    git_root=_git_root,
+                    review_model=None,  # skip slow LLM commit review by default
+                )
             else:
                 print("Warning: Backfill failed; interpretation may not work.")
 
@@ -1536,7 +1647,7 @@ def tool_interpret_metrics(plan: dict) -> int:
     # Prefer a folder matching hints in the user request (months/commits/all-time), else fallback to newest
     ur = (plan.get('user_request') or '').lower() if isinstance(plan, dict) else ''
     json_file = None
-    json_candidates = list(repos_dir.glob("temporal_analysis*/timeseries.json"))
+    json_candidates = [_ts_path(d) for d in repos_dir.glob("temporal_analysis*/") if d.is_dir() and _has_timeseries(d)]
     if json_candidates:
         # Try pattern match
         import re
@@ -1546,7 +1657,7 @@ def tool_interpret_metrics(plan: dict) -> int:
         m_com = re.search(r"(\d+)\s*commits?", ur or '')
         want_alltime = any(k in (ur or '') for k in ["all time", "all-time", "entire history", "from beginning"])
         for c in json_candidates:
-            folder = c.parent.name.lower()
+            folder = c.parent.parent.name.lower() if "INPUT_INTERPRETATION" in str(c) else c.parent.name.lower()
             ok = True
             if want_alltime and "alltime" not in folder:
                 ok = False
@@ -1638,7 +1749,7 @@ def tool_peak_full_arch(plan: dict) -> int:
     repo_name = pathlib.Path(repo).name if not re.match(r"^https?://", repo) else pathlib.Path(repo.rstrip('/')).name.replace(".git", "")
     test_auto_dir = pathlib.Path(THIS_DIR).parent
     repos_dir = test_auto_dir / "REPOS_ANALYZED" / repo_name
-    json_candidates = list(repos_dir.glob("temporal_analysis*/timeseries.json"))
+    json_candidates = [_ts_path(d) for d in repos_dir.glob("temporal_analysis*/") if d.is_dir() and _has_timeseries(d)]
     if not json_candidates:
         print("No timeseries found. Run temporal analysis first (all-time or window).")
         return 1
@@ -1704,7 +1815,7 @@ def tool_full_arch_at_dates(plan: dict) -> int:
     repo_name = pathlib.Path(repo).name if not re.match(r"^https?://", repo) else pathlib.Path(repo.rstrip('/')).name.replace(".git", "")
     test_auto_dir = pathlib.Path(THIS_DIR).parent
     repos_dir = test_auto_dir / "REPOS_ANALYZED" / repo_name
-    json_candidates = list(repos_dir.glob("temporal_analysis*/timeseries.json"))
+    json_candidates = [_ts_path(d) for d in repos_dir.glob("temporal_analysis*/") if d.is_dir() and _has_timeseries(d)]
     if not json_candidates:
         print("No timeseries found. Run a temporal analysis first.")
         return 1
@@ -1780,8 +1891,8 @@ def tool_plot_refined(plan: dict) -> int:
     if not anti_plotter.exists():
         print(f"Plotter not found at {anti_plotter}")
         return 1
-    # Detect mode by presence of timeseries.json
-    if (pathlib.Path(folder) / 'timeseries.json').exists():
+    # Detect mode by presence of timeseries.json (check both old and new location)
+    if _has_timeseries(pathlib.Path(folder)):
         cmd = ["python3", str(anti_plotter), "--temporal", folder]
     else:
         cmd = ["python3", str(anti_plotter), "--focus", folder]
@@ -1828,6 +1939,16 @@ def run_tool(plan: dict, user_request: str) -> int:
 
     # Guardrails: if the user is clearly asking to explain/define, prefer RAG explain
     ur = (user_request or '').lower()
+    repo_field = str(plan.get("repo") or "")
+    looks_like_temporal_root = (
+        "temporal_analysis" in repo_field
+        or "input_interpretation" in repo_field.lower()
+        or "output_interpretation" in repo_field.lower()
+    )
+    asks_to_analyze = any(k in ur for k in ["analyze", "run a temporal analysis", "temporal analysis", "track", "evolution"])
+    asks_to_interpret = any(k in ur for k in ["interpret", "explain", "answer:"])
+    if tool == "interpret_temporal" and asks_to_analyze and (asks_to_interpret or plan.get("user_question")) and not looks_like_temporal_root:
+        tool = "temporal_analysis"
     # Heuristic: if user mentions biggest/peak m-score difference and full arch/anti-patterns, route to peak_full_arch
     if any(k in ur for k in ["biggest m-score", "peak m-score", "largest m-score", "biggest mscore", "largest mscore"]) and any(k in ur for k in ["full arch", "anti pattern", "antipattern", "arch report", "arch-report"]):
         tool = "peak_full_arch"
@@ -2008,6 +2129,82 @@ def main():
             _fast_plan["interp_model"] = _qm.group(2).strip()
         if model_override and not _fast_plan.get("model"):
             _fast_plan["model"] = model_override
+        print(f"Plan (fast-path): {json.dumps(_fast_plan, indent=2)}\n")
+        rc = run_tool(_fast_plan, user_req)
+        sys.exit(rc)
+
+    # ── Fast-path: "analyze and interpret <repo> with X years Y months apart [with <model>]"
+    # Bypasses Ollama planner entirely — no LLM needed, pure regex.
+    _am = re.match(
+        r'^(?:analyze\s+and\s+interpret|analyze|temporal)\s+([\w\-]+)\s+with\s+'
+        r'(\d+)\s+years?\s+(\d+)\s+months?\s+apart'
+        r'(?:\s+with\s+(deepseek[-_]r1:\w+|\d+b))?',
+        user_req.strip(), re.I,
+    )
+    if not _am:
+        # Also match: "analyze and interpret <repo> <X> years <Y> months apart"
+        _am = re.match(
+            r'^(?:analyze\s+and\s+interpret|analyze|temporal)\s+([\w\-]+)\s+'
+            r'(\d+)\s+years?\s+(\d+)\s+months?\s+apart'
+            r'(?:\s+with\s+(deepseek[-_]r1:\w+|\d+b))?',
+            user_req.strip(), re.I,
+        )
+    if _am:
+        _repo_name = _am.group(1).strip()
+        _years = int(_am.group(2))
+        _months = int(_am.group(3))
+        _count = _years * (12 // _months)
+        _model_raw = (_am.group(4) or "").strip().lower()
+        if _model_raw and not _model_raw.startswith("deepseek"):
+            _model_raw = f"deepseek-r1:{_model_raw}"
+        _fast_plan = {
+            "tool": "temporal_analysis",
+            "repo": _repo_name,
+            "count": _count,
+            "branch": "trunk" if _repo_name.lower() == "pdfbox" else "main",
+            "min_months_apart": _months,
+            "model": _model_raw or model_override or "deepseek-r1:32b",
+        }
+        print(f"Plan (fast-path): {json.dumps(_fast_plan, indent=2)}\n")
+        rc = run_tool(_fast_plan, user_req)
+        sys.exit(rc)
+
+    # ── Fast-path: "analyze <repo> last N revisions M months apart [with mv threshold T] [model]"
+    # Handles: "analyze commons-io last 4 revisions 3 months apart with mv threshold 5 and deepseek-r1:32b"
+    _lm = re.match(
+        r'^(?:analyze(?:\s+and\s+interpret)?|temporal)\s+([\w\-]+)\s+'
+        r'(?:last\s+)?(\d+)\s+revisions?\s+(\d+)\s+months?\s+apart'
+        r'(.*)',
+        user_req.strip(), re.I,
+    )
+    if _lm:
+        _repo_name = _lm.group(1).strip()
+        _count = int(_lm.group(2))
+        _months = int(_lm.group(3))
+        _rest = _lm.group(4).lower()
+        # Extract model
+        _model_raw = ""
+        _mm = re.search(r'(deepseek[-_]r1:[\w]+|\d+b)', _rest, re.I)
+        if _mm:
+            _model_raw = _mm.group(1).strip().lower()
+            if not _model_raw.startswith("deepseek"):
+                _model_raw = f"deepseek-r1:{_model_raw}"
+        # Extract mv threshold
+        _mv = None
+        _mv_m = re.search(r'(?:mv\s+threshold|mv[_\s-]?co[_\s-]?change|mvCochange)\s+(\d+)', _rest, re.I)
+        if _mv_m:
+            _mv = int(_mv_m.group(1))
+        _fast_plan = {
+            "tool": "temporal_analysis",
+            "repo": _repo_name,
+            "count": _count,
+            "branch": "trunk" if _repo_name.lower() == "pdfbox" else "master" if "commons" in _repo_name.lower() else "main",
+            "min_months_apart": _months,
+            "model": _model_raw or model_override or "deepseek-r1:32b",
+            "user_request": user_req,
+        }
+        if _mv is not None:
+            _fast_plan["mv_cochange"] = _mv
         print(f"Plan (fast-path): {json.dumps(_fast_plan, indent=2)}\n")
         rc = run_tool(_fast_plan, user_req)
         sys.exit(rc)

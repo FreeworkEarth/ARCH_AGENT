@@ -122,7 +122,10 @@ def compute_dl_approx(drh_json: Path) -> dict:
 
 
 def find_rev_dirs(root: Path):
-    return sorted([p for p in root.iterdir() if p.is_dir() and p.name[:2].isdigit()])
+    # New pipeline stores revision folders in data_repositories/; legacy puts them directly in root.
+    data_repos = root / "data_repositories"
+    search_root = data_repos if data_repos.is_dir() else root
+    return sorted([p for p in search_root.iterdir() if p.is_dir() and p.name[:2].isdigit()])
 
 
 def rev_number_from_dir(path: Path) -> int:
@@ -144,6 +147,11 @@ def write_mscore_components(output_dir: Path):
         dsm = candidate
         drh = candidate.parent / "drh-clustering.json"
         if drh.exists():
+            break
+        # drh may be at the flat OutputData/dv8-analysis-result/dsm/ path (new pipeline layout)
+        flat_drh = output_dir / "dv8-analysis-result" / "dsm" / "drh-clustering.json"
+        if flat_drh.exists():
+            drh = flat_drh
             break
     if not (dsm and drh and dsm.exists() and drh.exists()):
         return False
@@ -178,7 +186,11 @@ def main():
     args = ap.parse_args()
 
     root = Path(args.temporal_root).resolve()
-    ts_path = root / "timeseries.json"
+    # Support new location (INPUT_INTERPRETATION/timeseries.json) with legacy fallback
+    ts_path = next(
+        (p for p in [root / "INPUT_INTERPRETATION" / "timeseries.json", root / "timeseries.json"] if p.exists()),
+        root / "INPUT_INTERPRETATION" / "timeseries.json",
+    )
     timeseries = json.load(ts_path.open()) if ts_path.exists() else {}
     revisions_meta = timeseries.get("revisions", [])
     repo_name = timeseries.get("repo") if isinstance(timeseries, dict) else None
@@ -220,6 +232,13 @@ def main():
                 # Keep original path if copy fails (e.g., permissions).
                 pass
 
+    # Generate hotspot ROI CSVs for any revision where arch-report hotspot failed.
+    try:
+        from generate_hotspot_csv import generate_hotspot_csv as _gen_hotspot
+        _hotspot_available = True
+    except ImportError:
+        _hotspot_available = False
+
     rev_dirs = find_rev_dirs(root)
     for idx, rev_dir in enumerate(rev_dirs):
         print(f"\n=== {rev_dir.name} ===")
@@ -228,6 +247,12 @@ def main():
         if not mscore_done:
             print("  ! Skipped (no DSM/DRH JSON found)")
             continue
+
+        # Generate hotspot CSV if missing (arch-report NPE workaround)
+        if _hotspot_available:
+            hotspot_written = _gen_hotspot(out_dir)
+            if hotspot_written:
+                print("  [hotspot] Generated active-hotspot-roi.csv from DSM + churn data")
 
         # meta info
         meta = revisions_meta[idx] if idx < len(revisions_meta) else {}
@@ -291,7 +316,15 @@ def main():
                 print(f"  ! DV8 binary export failed for {rev_dir.name}: {_exc}")
 
     # Copy aggregate artifacts useful for the interpreter (plots + timeseries)
-    plots_src = root / "plots"
+    # Support new location (INPUT_INTERPRETATION/plots/time_evolution_modularity_metrics) with legacy fallback
+    plots_src = next(
+        (p for p in [
+            root / "INPUT_INTERPRETATION" / "plots" / "time_evolution_modularity_metrics",
+            root / "INPUT_INTERPRETATION" / "plots",
+            root / "plots",
+        ] if p.exists()),
+        root / "plots",
+    )
     if plots_src.exists():
         for p in plots_src.iterdir():
             if p.is_file():
@@ -302,8 +335,9 @@ def main():
                     shutil.rmtree(dest_dir)
                 shutil.copytree(p, dest_dir)
 
-    if ts_path.exists():
-        shutil.copy2(ts_path, interp_root / "timeseries.json")
+    dest_ts = interp_root / "timeseries.json"
+    if ts_path.exists() and ts_path.resolve() != dest_ts.resolve():
+        shutil.copy2(ts_path, dest_ts)
 
     # Build pairwise evidence graph diffs (matrix.json) for adjacent revisions.
     evidence_dir = interp_root / "EVIDENCE_GRAPH_DIFF"

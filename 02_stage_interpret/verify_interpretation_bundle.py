@@ -122,7 +122,14 @@ def verify_revision(rev_dir: Path) -> Tuple[List[Finding], Dict[str, Any]]:
 
 def verify_bundle(temporal_root: Path) -> Tuple[List[Finding], Dict[str, Any]]:
     findings: List[Finding] = []
-    ts_path = temporal_root / "timeseries.json"
+    # Support new location (INPUT_INTERPRETATION/timeseries.json) with legacy fallback
+    ts_path = next(
+        (p for p in [
+            temporal_root / "INPUT_INTERPRETATION" / "timeseries.json",
+            temporal_root / "timeseries.json",
+        ] if p.exists()),
+        temporal_root / "INPUT_INTERPRETATION" / "timeseries.json",
+    )
     if not ts_path.exists():
         findings.append(Finding("ISSUE", f"Missing timeseries.json: {ts_path}"))
         return findings, {}

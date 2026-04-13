@@ -159,16 +159,19 @@ def parse_timeseries_data(data: Dict[str, Any]) -> Tuple[List[datetime], Dict[st
     for rev in revisions:
         # Parse date - handle both 'date' and 'commit_date' fields
         date_str = (rev.get('commit_date') or rev.get('date', '')).strip()
-        # Normalize common forms: 'YYYY-MM-DD hh:mm:ss +0000' or 'YYYY-MM-DD'
-        clean = date_str.split('+')[0].strip()
         dt = None
         try:
-            dt = datetime.fromisoformat(clean.replace(' ', 'T'))
+            # Handle git timestamps like 'YYYY-MM-DD hh:mm:ss -0500' or '+0200'
+            dt = datetime.strptime(date_str, '%Y-%m-%d %H:%M:%S %z').replace(tzinfo=None)
         except Exception:
             try:
-                dt = datetime.strptime(clean.split()[0], '%Y-%m-%d')
+                clean = re.sub(r'\s[+-]\d{4}$', '', date_str).strip()
+                dt = datetime.fromisoformat(clean.replace(' ', 'T'))
             except Exception:
-                dt = datetime.now()
+                try:
+                    dt = datetime.strptime(date_str.split()[0], '%Y-%m-%d')
+                except Exception:
+                    dt = datetime.now()
 
         dates.append(dt)
 
@@ -177,6 +180,14 @@ def parse_timeseries_data(data: Dict[str, Any]) -> Tuple[List[datetime], Dict[st
         for metric_name in metrics.keys():
             value = _to_float(rev_metrics.get(metric_name))
             metrics[metric_name].append(value)
+
+    # Older runs may contain revisions in git topo-order rather than strict
+    # chronological order. Sort plot inputs by date so time-series lines remain
+    # monotonic on the x-axis.
+    order = sorted(range(len(dates)), key=lambda i: dates[i])
+    dates = [dates[i] for i in order]
+    for metric_name in metrics.keys():
+        metrics[metric_name] = [metrics[metric_name][i] for i in order]
 
     return dates, metrics
 

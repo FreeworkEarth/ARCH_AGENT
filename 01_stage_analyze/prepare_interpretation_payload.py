@@ -23,6 +23,50 @@ from typing import Dict, List, Tuple
 from collections import defaultdict
 
 
+ANTI_PATTERN_ALIASES = {
+    "clique": "clique",
+    "packagecycle": "package-cycle",
+    "package-cycle": "package-cycle",
+    "unhealthyinheritance": "unhealthy-inheritance",
+    "unhealthy-inheritance": "unhealthy-inheritance",
+    "unstableinterface": "unstable-interface",
+    "unstable-interface": "unstable-interface",
+    "crossing": "crossing",
+    "modularityviolation": "modularity-violation",
+    "modularity-violation": "modularity-violation",
+    "modularity-violation-group": "modularity-violation",
+}
+
+ANTI_PATTERN_LABELS = {
+    "clique": "Clique",
+    "package-cycle": "Package Cycle",
+    "unhealthy-inheritance": "Unhealthy Inheritance",
+    "unstable-interface": "Unstable Interface",
+    "crossing": "Crossing",
+    "modularity-violation": "Modularity Violation",
+}
+
+HISTORY_ANTI_PATTERN_TYPES = {
+    "unstable-interface",
+    "modularity-violation",
+    "crossing",
+}
+
+
+def canonicalise_antipattern_type(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return raw
+    key = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")
+    key = key.replace("--", "-")
+    return ANTI_PATTERN_ALIASES.get(key, key)
+
+
+def display_antipattern_type(value: str) -> str:
+    canonical = canonicalise_antipattern_type(value)
+    return ANTI_PATTERN_LABELS.get(canonical, canonical)
+
+
 def load_json(path: Path) -> Dict:
     if not path.exists():
         return {}
@@ -216,11 +260,26 @@ def load_antipattern_summary(output_dir: Path) -> Tuple[List[Dict], Dict]:
     with open(summary_path, newline="") as f:
         reader = csv.DictReader(f)
         for r in reader:
-            rows.append(r)
-            typ = r.get("type")
+            typ = canonicalise_antipattern_type(r.get("Type") or r.get("type") or "")
             if typ:
-                counts[typ] = counts.get(typ, 0) + 1
+                rows.append({**r, "canonical_type": typ, "display_type": display_antipattern_type(typ)})
+                try:
+                    counts[typ] = counts.get(typ, 0) + int(
+                        r.get("InstanceCount") or r.get("instanceCount") or r.get("instance_count") or 1
+                    )
+                except Exception:
+                    counts[typ] = counts.get(typ, 0) + 1
     return rows, counts
+
+
+def split_antipattern_counts(counts: Dict[str, int]) -> Tuple[Dict[str, int], Dict[str, int]]:
+    structural: Dict[str, int] = {}
+    history: Dict[str, int] = {}
+    for typ, count in counts.items():
+        canonical = canonicalise_antipattern_type(typ)
+        target = history if canonical in HISTORY_ANTI_PATTERN_TYPES else structural
+        target[canonical] = count
+    return structural, history
 
 
 def git_churn(
@@ -454,10 +513,20 @@ def build_markdown(payload: Dict) -> str:
     # Do not list all modules in Markdown to keep it short.
 
     ap_counts = payload.get("anti_pattern_counts", {})
+    ap_structural = payload.get("anti_pattern_counts_structural", {})
+    ap_history = payload.get("anti_pattern_counts_history", {})
     if ap_counts:
         lines.append("## Anti-Patterns (counts)")
         for k, v in ap_counts.items():
-            lines.append(f"- {k}: {v}")
+            lines.append(f"- {display_antipattern_type(k)}: {v}")
+    if ap_structural:
+        lines.append("## Structural Anti-Patterns")
+        for k, v in ap_structural.items():
+            lines.append(f"- {display_antipattern_type(k)}: {v}")
+    if ap_history:
+        lines.append("## History-Based Anti-Patterns")
+        for k, v in ap_history.items():
+            lines.append(f"- {display_antipattern_type(k)}: {v}")
 
     dangerous = payload.get("dangerous_files", {})
     if dangerous and dangerous.get("rows"):
@@ -536,6 +605,7 @@ def main():
 
     metrics = load_metrics(out_dir)
     ap_rows, ap_counts = load_antipattern_summary(out_dir)
+    ap_counts_structural, ap_counts_history = split_antipattern_counts(ap_counts)
     churn_top = git_churn(git_root, top_n=10, commit_range=args.churn_range)
     git_recent = git_recent_commits(git_root, top_n=5)
     drh_png = out_dir / "plots" / "drh_layers.png"
@@ -565,6 +635,8 @@ def main():
         },
         "metrics": metrics,
         "anti_pattern_counts": ap_counts,
+        "anti_pattern_counts_structural": ap_counts_structural,
+        "anti_pattern_counts_history": ap_counts_history,
         "anti_pattern_rows": ap_rows,
         "churn_top": churn_top,
         "churn_range": args.churn_range,
@@ -589,6 +661,7 @@ def main():
 meta: name, commit, date, repo
 metrics: DV8 metrics (m-score, pc, dl, il) plus m_score_from_dsm_drh {mscore, modules[], layer_module_counts}
 anti_pattern_counts/rows: counts and raw CSV rows
+anti_pattern_counts_structural/history: canonical split of structural vs history-based DV8 anti-patterns
 churn_top: top files by git log LOC change (optionally scoped to churn_range)
 issue_typed_churn: typed churn/frequency over churn_range using issue IDs in commit messages (optional)
 git_recent: last few commits (hash, date, subject)
