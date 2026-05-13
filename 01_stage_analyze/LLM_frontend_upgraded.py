@@ -41,6 +41,59 @@ RAG_KB_DIR = os.getenv("RAG_KB_DIR") or os.getenv("ARCHDIA_KB_DIR") or (_RAG_LOC
 _REPOS_ANALYZED_DIR = os.path.join(os.path.dirname(THIS_DIR), "REPOS_ANALYZED")
 os.makedirs(_REPOS_ANALYZED_DIR, exist_ok=True)
 
+# NeoDepends: canonical repo URL and local clone path
+_NEODEPENDS_REPO_URL = "https://github.com/FreeworkEarth/neodepends.git"
+_NEODEPENDS_LOCAL = os.path.join(os.path.dirname(THIS_DIR), "00_CORE", "NEODEPENDS_DEICIDE", "00_NEODEPENDS", "neodepends")
+
+def _ensure_neodepends() -> str | None:
+    """
+    Pull the NeoDepends production branch and return the path to dist/dependency-analyzer.
+
+    Called automatically when the user's prompt mentions 'python' or 'neodepends'.
+    - If the local clone already exists: git pull origin production + git checkout production
+    - If not: git clone --branch production <url>
+    Returns the absolute path to dist/dependency-analyzer, or None on failure.
+    """
+    nd_path = pathlib.Path(_NEODEPENDS_LOCAL)
+    bin_path = nd_path / "dist" / "dependency-analyzer"
+
+    if nd_path.exists() and (nd_path / ".git").exists():
+        print("[neodepends] Pulling latest production branch...")
+        try:
+            subprocess.run(
+                ["git", "-C", str(nd_path), "fetch", "origin"],
+                check=True, capture_output=True
+            )
+            subprocess.run(
+                ["git", "-C", str(nd_path), "checkout", "production"],
+                check=True, capture_output=True
+            )
+            subprocess.run(
+                ["git", "-C", str(nd_path), "pull", "origin", "production"],
+                check=True, capture_output=True
+            )
+            print("[neodepends] Up to date on production branch.")
+        except subprocess.CalledProcessError as e:
+            print(f"[neodepends] Warning: git pull failed — using existing local copy. ({e})")
+    else:
+        print(f"[neodepends] Cloning production branch to {nd_path} ...")
+        nd_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            subprocess.run(
+                ["git", "clone", "--branch", "production", "--depth", "1",
+                 _NEODEPENDS_REPO_URL, str(nd_path)],
+                check=True
+            )
+        except subprocess.CalledProcessError as e:
+            print(f"[neodepends] Clone failed: {e}")
+            return None
+
+    if bin_path.exists():
+        bin_path.chmod(bin_path.stat().st_mode | 0o111)  # ensure executable
+        return str(bin_path)
+    print(f"[neodepends] Warning: dist/dependency-analyzer not found at {bin_path}")
+    return None
+
 # Enhanced system prompt with tool-calling
 SYSTEM_PROMPT = """You are a DV8 architecture analysis assistant with the following tools:
 
@@ -145,6 +198,15 @@ KNOWN REPOSITORIES (use EXACTLY these short names when no URL is given):
 - "commons-io" → Apache Commons IO
 - "pdfbox" → Apache PDFBox (branch: trunk)
 - "ARCH_ANALYSIS_TRAINTICKET_TOY_EXAMPLES_MULTILANG" → Train ticket toy example (also known as "train ticket toy", "trainticket toy", "TTS toy", "toy example", "multilang toy")
+
+For the toy example with language-specific branches, use the FULL GitHub URL and set branch accordingly:
+- Python toy (2-commit temporal): repo="https://github.com/FreeworkEarth/ARCH_ANALYSIS_TRAINTICKET_TOY_EXAMPLES_MULTILANG.git", branch="temporal_PYTHON"
+- Java toy (2-commit temporal):   repo="https://github.com/FreeworkEarth/ARCH_ANALYSIS_TRAINTICKET_TOY_EXAMPLES_MULTILANG.git", branch="temporal_JAVA"
+- Both languages:                  repo="https://github.com/FreeworkEarth/ARCH_ANALYSIS_TRAINTICKET_TOY_EXAMPLES_MULTILANG.git", branch="temporal"
+
+Examples for the toy:
+- "analyze and interpret the python toy all time" → {"tool": "temporal_analysis", "repo": "https://github.com/FreeworkEarth/ARCH_ANALYSIS_TRAINTICKET_TOY_EXAMPLES_MULTILANG.git", "count": 2, "branch": "temporal_PYTHON", "min_months_apart": 0, "model": "deepseek-r1:32b"}
+- "analyze and interpret the java toy all time" → {"tool": "temporal_analysis", "repo": "https://github.com/FreeworkEarth/ARCH_ANALYSIS_TRAINTICKET_TOY_EXAMPLES_MULTILANG.git", "count": 2, "branch": "temporal_JAVA", "min_months_apart": 0, "model": "deepseek-r1:32b"}
 
 IMPORTANT: If the user provides a full GitHub/git URL (starts with https:// or git://), use the FULL URL as the "repo" value — do NOT replace it with a short name.
 IMPORTANT: If no URL is given, use the exact short name from KNOWN REPOSITORIES above. If user says "train ticket toy", "TTS toy", "toy example", "multilang" → use "ARCH_ANALYSIS_TRAINTICKET_TOY_EXAMPLES_MULTILANG". Never invent placeholder paths.
@@ -1316,6 +1378,16 @@ def tool_temporal_analysis(plan: dict) -> int:
             lang_hint = "python"
         if "java" in ur and "python" not in ur:
             lang_hint = "java"
+
+        # Auto-pull NeoDepends production branch when Python analysis is requested
+        # and no explicit neodepends_bin was provided.
+        # Triggered by: "python" or "neodepends" in the prompt.
+        if not neodepends_bin and any(kw in ur for kw in ("python", "neodepends")):
+            pulled_bin = _ensure_neodepends()
+            if pulled_bin:
+                neodepends_bin = pulled_bin
+                print(f"[neodepends] Auto-configured: {neodepends_bin}")
+
         # Scope hints
         if any(k in ur for k in ["both scopes", "scope both", "full and prod", "prod and full"]):
             scope = "both"
