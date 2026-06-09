@@ -267,6 +267,64 @@ Information Bottleneck clustering of file pairs by co-change pattern is theoreti
 
 ---
 
+## 7. NeoDepends Stage 3 — Interprocedural Return-Type Tracking (close 3 remaining FNs)
+
+**Status**: Future — not yet implemented. Stage 2 (return-type annotation extraction) was implemented 2026-05-12.
+
+### The 3 remaining false-negative file-pairs (Toy Python FIRST)
+
+After Stage 2, NeoDepends achieves **91.7% file-pair recall** on the Python toy. The 3 remaining FNs all share the same root cause: **2-hop interprocedural reasoning** across field accesses and method return values, which is hard without either type annotations or a runtime trace.
+
+| FN pair | Access pattern | Why it fails |
+|---------|---------------|-------------|
+| `ticket.py → train_station.py` | `self.route.get_origin().get_name()` | `Route.get_origin()` returns a `TrainStation`, but `Route.origin` field's type is unknown — param is named `origin`, which doesn't map to `TrainStation` by name convention |
+| `ticket_booking_system.py → person.py` | `passenger.name` where `.name` is on parent `Person` | Requires: (1) infer `passenger` var type = `Passenger`, (2) look up `name` field on `Passenger`, (3) resolve inherited field upward to `Person` class in a different file |
+| `train_station.py → route.py` | `train.route.destination == destination` | `train` is a local var of type `Train`, `.route` is a field of type `Route`, `.destination` is a field of `Route`. Requires tracking `var.field.field` chains — 2 hops through the type graph |
+
+### What Stage 2 already does (implemented)
+
+In `tools/enhance_python_deps.py`, Stage 2 handles:
+1. Methods with explicit `-> ClassName` return annotations → `method_return_types[mid] = {ClassName}`
+2. Methods that `return self.field` where `field` has an inferred type → propagate to `method_return_types`
+3. In C2 (`self.field.method()` calls): after resolving the called method, emit a `Method → ReturnClass Use` edge if the callee has a known return type
+
+This works for annotated real-world code but **not** for the toy because:
+- `Route.get_origin()` has no annotation and `self.origin` field type is unknown (param name `origin` ≠ class `TrainStation`)
+- `train.route.destination` is a `var.field.field` chain, not a method call
+
+### What Stage 3 needs to implement
+
+**Option A — `var.field.field` chain tracking** (closes `train_station.py → route.py`):
+- In `_MethodBodyFacts`, detect `var.attr1.attr2` attribute chains where `var` has a known type `T`
+- Look up `attr1` field type on `T` → yields type `U`
+- If `U` is a known internal class, emit a `Method → U Use` edge
+- Implementation: extend `visit_Attribute` in `_MethodBodyFacts` to walk chained attribute accesses
+
+**Option B — Inherited field resolution for var types** (closes `ticket_booking_system.py → person.py`):
+- Currently `var.field` is not tracked when `var` type is inferred in `env`
+- Extend section D (var_calls) to also detect `var.attr` attribute reads (not just `var.method()` calls)
+- When `env[var] = "Passenger"`, `passenger.name` → look up `name` in `Passenger` fields, traverse inheritance to `Person` → emit Use edge to `Person`
+- Implementation: add `var_attr_reads: List[Tuple[str, str]]` to `_MethodBodyFacts` via new `visit_Attribute` detection
+
+**Option C — Untyped param name → class matching** (closes `ticket.py → train_station.py` fully):
+- `Route.__init__(self, route_id, origin, destination, ...)`: params `origin`/`destination` don't map to `TrainStation` by camelCase
+- Would need a "usage-based type inference": if `self.origin.get_name()` is called later and `get_name()` is only defined on `TrainStation`, infer `self.origin: TrainStation`
+- Or: if caller always passes a `TrainStation` instance to `origin` (interprocedural flow)
+- This is the hardest case and requires true dataflow analysis
+
+### Recommended implementation order
+
+1. **Stage 3A** — `var.field` attribute read tracking in section D (~50 lines) — closes the `person.py` FN
+2. **Stage 3B** — `var.field.field` chain tracking in `_MethodBodyFacts` (~80 lines) — closes the `route.py` FN
+3. **Stage 3C** — usage-based method dispatch → type inference (most complex) — closes `train_station.py` FN
+
+### Expected impact on benchmark
+
+After Stage 3A+B: **~97%+ file-pair recall** on toy Python FIRST (36 → 35 GT pairs detected, or possibly 36/36).
+The toy's 3 FNs are intentionally hard coupling patterns — real-world codebases with type annotations will benefit from Stage 2 already.
+
+---
+
 ## 6. 25-Project Empirical Study — Data Plan
 
 **Status**: Planning

@@ -79,10 +79,15 @@ def parse_dv8_clsx(path: Path) -> List[str]:
             if end <= len(body):
                 try:
                     s = body[i + 3:end].decode("utf-8", errors="replace").strip()
-                    if s and "." in s and not s.startswith("\x00"):
-                        ext = s.rsplit(".", 1)[-1].lower()
+                    # Strip DV8 entity suffix (e.g. "/self (File)", "/ClassName (Class)")
+                    if "/" in s:
+                        candidate = s.rsplit("/", 1)[0]
+                    else:
+                        candidate = s
+                    if candidate and "." in candidate and not candidate.startswith("\x00"):
+                        ext = candidate.rsplit(".", 1)[-1].lower()
                         if ext in _SOURCE_EXTS:
-                            paths.append(s)
+                            paths.append(candidate)
                 except Exception:
                     pass
                 i = end

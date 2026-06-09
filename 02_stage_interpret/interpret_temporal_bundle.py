@@ -521,26 +521,27 @@ def load_evidence_graph_evolution(temporal_root: Path, max_transitions: int = 3)
     return header + "\n\n".join(sections) + "\n\n"
 
 
-def load_antipattern_groups(temporal_root: Path, max_groups_per_type: int = 5) -> str:
+def load_antipattern_groups(temporal_root: Path, max_groups_per_type: int = 5):
     """Build a structured group-level summary from the most recent revision's arch-issue CSVs.
 
     For each anti-pattern type (Clique, MVG, Package-Cycle, Unhealthy-Inheritance) returns the
     top instances sorted by group-level combined bug_churn, with member file names and per-file
     risk scores — so the LLM can answer professor-style "which parts of the system..." questions.
 
-    Returns a formatted string ready for injection into the Q&A context.
+    Returns a tuple (formatted_str, raw_groups_list) where raw_groups_list is a list of dicts
+    {ap_type, id, size, total_bug_churn, members} for use by build_refactoring_context().
     """
     # Find the most recent revision folder (rev 01 = newest = lowest sort key)
     single_rev_root = temporal_root / "INPUT_INTERPRETATION" / "SINGLE_REVISION_ANALYSIS_DATA"
     if not single_rev_root.exists():
-        return ""
+        return "", []
     rev_dirs = sorted(single_rev_root.iterdir())
     if not rev_dirs:
-        return ""
+        return "", []
     newest_rev = rev_dirs[0]  # 01_* is most recent
     arch_issue_root = newest_rev / "OutputData" / "arch-issue"
     if not arch_issue_root.exists():
-        return ""
+        return "", []
 
     # Load per-file risk scores for aggregation
     risk_lookup: Dict[str, Dict] = {}
@@ -589,7 +590,23 @@ def load_antipattern_groups(temporal_root: Path, max_groups_per_type: int = 5) -
         for inst_dir in instance_dirs:
             files_csv = inst_dir / f"{inst_dir.name}-clsx_files.csv"
             if not files_csv.exists():
-                continue
+                # CSV missing — try to generate it on-the-fly from the .dv8-clsx binary
+                clsx_bin = inst_dir / f"{inst_dir.name}-clsx.dv8-clsx"
+                if clsx_bin.exists():
+                    try:
+                        import sys as _sys_exp
+                        import importlib.util as _ilu
+                        _exp_path = Path(__file__).parent.parent / "01_stage_analyze" / "export_dv8_binary_files.py"
+                        if not _exp_path.exists():
+                            _exp_path = Path(__file__).parent / "export_dv8_binary_files.py"
+                        _spec = _ilu.spec_from_file_location("export_dv8_binary_files", _exp_path)
+                        _mod = _ilu.module_from_spec(_spec)
+                        _spec.loader.exec_module(_mod)
+                        _mod.export_clsx(clsx_bin)
+                    except Exception as _e:
+                        pass  # give up — skip this instance
+                if not files_csv.exists():
+                    continue
             try:
                 lines = files_csv.read_text(encoding="utf-8").splitlines()
                 # Skip header line "file_path"
@@ -703,7 +720,7 @@ def load_antipattern_groups(temporal_root: Path, max_groups_per_type: int = 5) -
         sections.append((max_size_in_type, "\n".join(lines_out)))
 
     if not sections:
-        return ""
+        return "", []
     # Sort anti-pattern types by their largest group size descending —
     # the type whose biggest instance affects most of the system comes first.
     sections.sort(key=lambda x: -x[0])
@@ -753,11 +770,122 @@ def load_antipattern_groups(temporal_root: Path, max_groups_per_type: int = 5) -
         "  WORST BY PAIN (bug_churn, descending):\n" + "\n".join(pain_lines) + "\n\n"
     )
 
+    # Build raw groups list for build_refactoring_context()
+    raw_groups: list = []
+    for ap_type, grp_list in all_top_groups.items():
+        for g in grp_list:
+            raw_groups.append({
+                "ap_type": ap_type,
+                "id": g["id"],
+                "size": g["size"],
+                "total_bug_churn": g["total_bug_churn"],
+                "arch_issue_root": str(arch_issue_root),
+            })
+
     return (
         "## ANTI-PATTERN GROUP MEMBERSHIPS (most recent revision, grouped by shared structural flaw, ordered by largest instance size):\n\n"
         + ranking_header
-        + "\n\n".join(s for _, s in sections) + "\n\n"
+        + "\n\n".join(s for _, s in sections) + "\n\n",
+        raw_groups,
     )
+
+
+def build_refactoring_context(top_groups_raw: list, top_n: int = 3) -> str:
+    """Load per-instance clsx_files.json + merge_deps.json for the top-churn groups and build
+    a structured context string for Q2 refactoring strategy prompts.
+
+    top_groups_raw: list of dicts from load_antipattern_groups() second return value.
+    top_n: how many groups to include (sorted by total_bug_churn descending).
+    """
+    if not top_groups_raw:
+        return ""
+
+    sorted_groups = sorted(top_groups_raw, key=lambda g: -g["total_bug_churn"])[:top_n]
+    blocks: list = []
+
+    for g in sorted_groups:
+        ap_type = g["ap_type"]
+        inst_id = g["id"]
+        bug_churn = g["total_bug_churn"]
+        arch_issue_root = Path(g["arch_issue_root"])
+        inst_dir = arch_issue_root / ap_type / str(inst_id)
+
+        # Load member list from clsx_files.json
+        clsx_path = inst_dir / f"{inst_id}-clsx_files.json"
+        member_files: list = []
+        if clsx_path.exists():
+            try:
+                clsx_data = json.loads(clsx_path.read_text(encoding="utf-8"))
+                member_files = clsx_data.get("files", [])
+            except Exception:
+                pass
+
+        # Load dependency graph from merge_deps.json
+        merge_path = inst_dir / f"{inst_id}-merge_deps.json"
+        dep_types: list = []
+        cluster_files: Dict[str, list] = {}
+        if merge_path.exists():
+            try:
+                merge_data = json.loads(merge_path.read_text(encoding="utf-8"))
+                dep_types = merge_data.get("dep_types", [])
+                for raw_path in merge_data.get("files", []):
+                    # DV8 prefixes each path with a cluster letter (A, B, C, ...)
+                    # Files with no letter prefix (or digit prefix) are the CORE cluster —
+                    # the dense hub that co-changes with / directly depends on all other clusters.
+                    if raw_path and raw_path[0].isupper() and not raw_path[0].isdigit():
+                        label = raw_path[0]
+                        clean = raw_path[1:]  # strip cluster letter prefix
+                    else:
+                        label = "CORE"
+                        clean = raw_path
+                    cluster_files.setdefault(label, []).append(clean.split("/")[-1])
+            except Exception:
+                pass
+
+        # Semantic meaning of CORE cluster per anti-pattern type
+        core_meaning = {
+            "modularity-violation": "CORE = files that co-change with ALL other clusters despite no declared structural dependency — the hidden coupling hub",
+            "clique": "CORE = the dense mutual-dependency hub (files in CORE directly depend on each other via Call/Import/Extend)",
+            "package-cycle": "CORE = files participating in the circular import chain across package boundaries",
+            "unhealthy-inheritance": "CORE = base classes / root of the problematic inheritance chain",
+        }.get(ap_type, "CORE = the central coupling hub for this instance")
+
+        # Build the block
+        lines: list = [f"### {ap_type.upper()} Instance {inst_id} — {g['size']} files, bug_churn={bug_churn}"]
+
+        if cluster_files:
+            lines.append("Cluster layout (DV8 merge DSM cluster labels):")
+            # Show CORE first, then alphabetical
+            ordered_labels = (["CORE"] if "CORE" in cluster_files else []) + sorted(
+                k for k in cluster_files if k != "CORE"
+            )
+            for label in ordered_labels:
+                files_in_cluster = cluster_files[label][:8]  # cap at 8 per cluster
+                extra = f" (+{len(cluster_files[label]) - 8} more)" if len(cluster_files[label]) > 8 else ""
+                lines.append(f"  Cluster {label} ({len(cluster_files[label])} files): {', '.join(files_in_cluster)}{extra}")
+            if "CORE" in cluster_files:
+                lines.append(f"  Note: {core_meaning}")
+        elif member_files:
+            lines.append("Members (from clsx_files.json):")
+            for f in member_files[:12]:
+                lines.append(f"  {f.split('/')[-1]}")
+            if len(member_files) > 12:
+                lines.append(f"  ... +{len(member_files) - 12} more")
+
+        if dep_types:
+            lines.append(f"Dependency types present: {', '.join(dep_types)}")
+
+        # Append DV8 generic refactoring guide path
+        refactor_html = arch_issue_root / ap_type / f"refactor-{ap_type}.html"
+        if refactor_html.exists():
+            lines.append(f"DV8 Refactoring Guide: {refactor_html}")
+
+        blocks.append("\n".join(lines))
+
+    if not blocks:
+        return ""
+
+    return "## REFACTORING CONTEXT (per-instance structural dependency data from DV8):\n\n" + "\n\n".join(blocks) + "\n\n"
 
 
 def _metric_delta_line(old_metrics: Dict[str, Any], new_metrics: Dict[str, Any], key: str) -> str | None:
@@ -774,6 +902,70 @@ def _metric_delta_line(old_metrics: Dict[str, Any], new_metrics: Dict[str, Any],
         base += f", {rel:+.2f}% relative"
     base += ")"
     return base
+
+
+def build_all_transitions_summary(
+    timeseries: Dict[str, Any],
+    transition_reports: List[Path],
+) -> str:
+    """Build a chronological summary of ALL transitions for Metric Trajectory context.
+
+    Unlike detect_metric_peaks (which deduplicates to top-N pairs), this function
+    emits every transition exactly once, ordered oldest→newest.
+    """
+    revs = timeseries.get("revisions") or []
+    by_num: Dict[int, Dict[str, Any]] = {}
+    for r in revs:
+        if isinstance(r, dict) and r.get("revision_number"):
+            try:
+                by_num[int(r["revision_number"])] = r
+            except Exception:
+                continue
+
+    nums = sorted(by_num.keys())
+    if len(nums) < 2:
+        return ""
+
+    # Build all transitions as (newer_n, older_n); iterate oldest→newest
+    transitions = [(nums[i], nums[i + 1]) for i in range(len(nums) - 1)]
+    transitions_chrono = list(reversed(transitions))
+
+    report_by_pair: Dict[Tuple[int, int], Path] = {}
+    for p in transition_reports:
+        m = re.search(r"_new(\d+)_old(\d+)\.md$", p.name)
+        if m:
+            report_by_pair[(int(m.group(1)), int(m.group(2)))] = p
+
+    lines = ["## ALL TRANSITIONS (chronological, oldest→newest — use this for Metric Trajectory)"]
+    for new_n, old_n in transitions_chrono:
+        new_r = by_num.get(new_n) or {}
+        old_r = by_num.get(old_n) or {}
+        new_m = new_r.get("metrics") or {}
+        old_m = old_r.get("metrics") or {}
+        new_date = (new_r.get("commit_date") or "")[:10]
+        old_date = (old_r.get("commit_date") or "")[:10]
+        new_hash = (new_r.get("commit_hash") or "")[:7]
+        old_hash = (old_r.get("commit_hash") or "")[:7]
+
+        lines.append(f"\n### rev{old_n} ({old_date} `{old_hash}`) → rev{new_n} ({new_date} `{new_hash}`)")
+
+        for key in ("m-score", "propagation-cost", "decoupling-level", "independence-level"):
+            dl = _metric_delta_line(old_m, new_m, key)
+            if dl:
+                lines.append(f"  - {dl}")
+
+        rp = report_by_pair.get((new_n, old_n))
+        if rp:
+            try:
+                txt = rp.read_text(encoding="utf-8")
+                m2 = re.search(r"DRH file count:\s*old=(\d+)\s*→\s*new=(\d+)", txt)
+                if m2:
+                    old_fc, new_fc = int(m2.group(1)), int(m2.group(2))
+                    lines.append(f"  - DRH file count: {old_fc} → {new_fc} (Δ={new_fc - old_fc:+d})")
+            except Exception:
+                pass
+
+    return "\n".join(lines)
 
 
 def detect_metric_peaks(
@@ -1096,6 +1288,109 @@ def _load_fanin_fanout(rev_folder: Path) -> Dict[str, Dict[str, int]]:
         return {}
 
 
+def load_worst_transition_drh(temporal_root: Path, timeseries: Dict[str, Any]) -> tuple:
+    """Find the worst transition by propagation-cost delta and load its DRH diff report.
+
+    Returns (content_str, file_path_str) — both empty strings if not found.
+    Content is trimmed to the most useful sections: Likely Drivers, Structural Summary,
+    Notable Layer/Module Moves, and SCC diff (largest SCC members).
+    """
+    revs = timeseries.get("revisions") or []
+    by_num: Dict[int, Dict[str, Any]] = {}
+    for r in revs:
+        if isinstance(r, dict) and r.get("revision_number"):
+            try:
+                by_num[int(r["revision_number"])] = r
+            except Exception:
+                continue
+    nums = sorted(by_num.keys())
+    if len(nums) < 2:
+        return "", ""
+
+    # Find worst transition by propagation-cost delta (largest increase)
+    worst_pair: Optional[tuple] = None
+    worst_delta = 0.0
+    for i in range(len(nums) - 1):
+        new_n, old_n = nums[i], nums[i + 1]
+        new_m = (by_num.get(new_n) or {}).get("metrics") or {}
+        old_m = (by_num.get(old_n) or {}).get("metrics") or {}
+        ov = old_m.get("propagation-cost")
+        nv = new_m.get("propagation-cost")
+        if isinstance(ov, (int, float)) and isinstance(nv, (int, float)):
+            delta = float(nv) - float(ov)
+            if delta > worst_delta:
+                worst_delta = delta
+                worst_pair = (new_n, old_n)
+
+    if not worst_pair:
+        return "", ""
+
+    new_n, old_n = worst_pair
+
+    # Search all output interpretation subfolders for the matching DRH diff report
+    output_root = temporal_root / "OUTPUT_INTERPRETATION"
+    if not output_root.exists():
+        return "", ""
+
+    candidates = list(output_root.glob(f"*/drh_diff_report_*_new{new_n}_old{old_n}.md"))
+    if not candidates:
+        return "", ""
+
+    report_path = candidates[0]
+    try:
+        full_text = report_path.read_text(encoding="utf-8")
+    except Exception:
+        return "", ""
+
+    # Extract the most useful sections only (keep context window lean)
+    useful_sections = []
+    # Always include the header (first ~5 lines)
+    header_lines = full_text.split("\n")[:6]
+    useful_sections.append("\n".join(header_lines))
+
+    for section_title in (
+        "## Likely Drivers",
+        "### Structural Summary",
+        "### Notable Layer Moves",
+        "### Notable Module Moves",
+        "### Commit Context",
+    ):
+        idx = full_text.find(section_title)
+        if idx == -1:
+            continue
+        # Find end of section (next ## or ###)
+        rest = full_text[idx:]
+        end = len(rest)
+        for marker in ("\n## ", "\n### "):
+            pos = rest.find(marker, len(section_title))
+            if pos != -1:
+                end = min(end, pos)
+        useful_sections.append(rest[:end].strip())
+
+    # Include SCC size info from Metrics section (just the scc lines, not the full JSON)
+    metrics_idx = full_text.find("## Metrics & Evidence")
+    if metrics_idx != -1:
+        metrics_block = full_text[metrics_idx:metrics_idx + 800]
+        scc_lines = [ln for ln in metrics_block.split("\n") if "scc" in ln.lower() or "largest_scc" in ln.lower()]
+        if scc_lines:
+            useful_sections.append("### SCC Change (from Metrics & Evidence)\n" + "\n".join(scc_lines[:6]))
+
+    content = "\n\n".join(useful_sections)
+    # Cap at 6000 chars to avoid dominating context
+    if len(content) > 6000:
+        content = content[:6000] + "\n[...truncated — see full report at path below]"
+
+    new_date = (by_num.get(new_n) or {}).get("commit_date", "")[:10]
+    old_date = (by_num.get(old_n) or {}).get("commit_date", "")[:10]
+    header = (
+        f"## WORST TRANSITION DRH REPORT: rev{old_n} ({old_date}) → rev{new_n} ({new_date})\n"
+        f"(Δ propagation-cost = +{worst_delta:.2f} points — the single largest structural degradation step)\n"
+        f"Full report: {report_path}\n\n"
+    )
+
+    return header + content, str(report_path)
+
+
 def load_recent_churn_top(temporal_root: Path, top_n: int = 10) -> str:
     """Load churn_top from the most recent revision's interpretation_payload.json.
     Returns a formatted string for Q&A context injection, or empty string if unavailable."""
@@ -1259,8 +1554,11 @@ def answer_user_question(model: str, question: str, report_text: str,
                          risk_score_context: str = "", commit_context: str = "",
                          antipattern_groups: str = "", hotspot_data: str = "",
                          evidence_evolution: str = "", peaks_section: str = "",
-                         recent_churn_section: str = "",
-                         data_quality_warnings: list = None) -> str:
+                         recent_churn_section: str = "", worst_drh_section: str = "",
+                         all_transitions_section: str = "",
+                         data_quality_warnings: list = None,
+                         prior_answer: str = "",
+                         refactoring_context: str = "") -> str:
     """Call the LLM to answer a specific user question using the combined report as context.
 
     Builds a priority context: M-score worst modules first (most useful for file-level questions),
@@ -1322,6 +1620,9 @@ def answer_user_question(model: str, question: str, report_text: str,
             + peaks_section + "\n\n"
         )
 
+    # 3e. All transitions chronological (for Metric Trajectory — no deduplication)
+    all_transitions_ctx = (all_transitions_section + "\n\n") if all_transitions_section else ""
+
     # 4. Bug-linked commits — cap at 800 commits (~12k chars) to avoid dominating
     commit_section = ""
     if commit_context:
@@ -1340,7 +1641,9 @@ def answer_user_question(model: str, question: str, report_text: str,
     narrative = ""
 
     recent_churn_ctx = (recent_churn_section + "\n") if recent_churn_section else ""
-    context = quality_block + priority_context + risk_section + group_section + hotspot_section + evolution_section + peaks_ctx + recent_churn_ctx + commit_section + summary_text + ("\n\n" if summary_text else "") + narrative
+    worst_drh_ctx = (worst_drh_section + "\n\n") if worst_drh_section else ""
+    prior_block = f"## PRIOR ANSWER (Q1 analysis — use this as context for refactoring advice)\n{prior_answer}\n\n" if prior_answer else ""
+    context = prior_block + quality_block + priority_context + risk_section + group_section + hotspot_section + evolution_section + peaks_ctx + all_transitions_ctx + worst_drh_ctx + recent_churn_ctx + commit_section + summary_text + ("\n\n" if summary_text else "") + narrative
 
     q_lower = q_lower_pre
 
@@ -1383,6 +1686,14 @@ def answer_user_question(model: str, question: str, report_text: str,
         "quality decrease", "quality declin", "decreasing in quality", "decrease in quality",
     ])
 
+    # Detect refactoring strategy questions — use per-instance structural data (Q2)
+    is_refactoring_strategy = any(k in q_lower for k in [
+        "how would you refactor", "how to refactor", "refactor this",
+        "refactoring strategy", "refactoring plan", "how do i fix",
+        "how should i refactor", "where to start refactoring",
+        "how would i refactor", "concrete refactor",
+    ])
+
     # Detect refactor/structural questions — use M-score module data
     is_files_question = any(k in q_lower for k in [
         "refactor", "specific file", "which file", "file to fix", "file to improve",
@@ -1397,7 +1708,51 @@ def answer_user_question(model: str, question: str, report_text: str,
         "fan-out", "scc", "cycl", "more dependen", "gaining depend",
     ])
 
-    if is_group_question and group_section:
+    if is_refactoring_strategy and refactoring_context:
+        prompt = f"""You are a software architect providing a prioritized, iterative refactoring plan based on DV8 structural analysis.
+
+Hard rules:
+- Output Markdown only. No <think> blocks.
+- Do NOT invent file names, cluster labels, or dependency types not present in REFACTORING CONTEXT below.
+- Every action must cite specific files by name, cluster labels (A/B/C/CORE), and dependency types (Call, Extend, Import, etc.) from REFACTORING CONTEXT.
+- Output EXACTLY 3 to 5 prioritized actions total — NOT one section per instance. Rank across ALL instances by expected bug_churn reduction (highest impact first).
+- Frame each action as one discrete step: do it, re-run DV8, measure if M-score or propagation-cost improved.
+
+CORE cluster semantics (read before writing):
+- In a modularity-violation: CORE = files that co-change with ALL other clusters despite no declared structural dependency
+- In a clique: CORE = the dense mutual-dependency hub (every file in CORE directly depends on the others via Call/Import/Extend)
+- In a package-cycle: CORE = files forming the circular import chain
+- In an unhealthy-inheritance: CORE = base classes at the root of the problematic hierarchy
+
+Output this exact format:
+
+## Refactoring Priority List (do in order, re-measure DV8 after each)
+
+### Action 1 — [short descriptive title] | targets: [instance name] | impact: highest
+**What to do**: [name the specific files, which cluster they are in, which dep types to cut — e.g. "Extract interface IOReader from IOUtils.java (CORE cluster) so that Cluster A files (DeletingPathVisitor, FileTimes) depend on IOReader instead of IOUtils directly, severing the Call coupling from A→CORE"]
+**Why first**: bug_churn=[X] — [explain what makes this the highest-impact first move, citing cluster sizes and dep types]
+**How to measure**: re-run DV8 — expect [specific metric to improve, e.g. "modularity-violation Instance 1 shrinks or disappears", "propagation-cost drops"]
+**Risk**: [what breaks if done wrong, and one mitigation step]
+
+### Action 2 — ...
+[same format]
+
+[3 to 5 actions total]
+
+## What to measure after each step
+- Re-run the full pipeline on the same temporal root
+- Check: did M-score increase? Did propagation-cost drop? Did any anti-pattern instance disappear or shrink?
+- If yes: proceed to next action. If no: the cluster coupling was not fully severed — identify which remaining dep type still links the clusters.
+
+If PRIOR ANSWER is present: reference the worst file and worst group named in Q1's conclusion when choosing action targets — do not repeat Q1's analysis, only build on it.
+
+QUESTION: {question}
+
+{refactoring_context}
+{context}
+"""
+
+    elif is_group_question and group_section:
         prompt = f"""You are a software architect answering a professor's question about software quality. Answer by grouping files according to their shared structural flaw (anti-pattern instance).
 
 CHURN DEFINITIONS (use these exact terms in your answer):
@@ -1411,10 +1766,17 @@ Hard rules:
 - Do NOT invent numbers. Use only values present in the data below.
 - No word limit. Do NOT skip, abbreviate, or merge any group.
 
+ANTI-PATTERN COVERAGE CHECK — do this BEFORE writing anything else:
+  1. Scan the data for every distinct anti-pattern type present (modularity-violation, unhealthy-inheritance, clique, package-cycle, etc.).
+  2. Every type with ANY instance (even size=1, bug_churn=0) MUST appear as a separate named entry in the ranked lists below AND in TIER 1 or TIER 2.
+  3. If you omit any detected anti-pattern type from your answer, your answer is INCOMPLETE and WRONG.
+  4. If ALL groups have bug_churn=0, that does NOT excuse omitting any type — list all types by scope descending.
+
 Start with two SHORT ranked lists (one line per entry, no field labels):
   "Worst by scope" — top 5 groups by % of system descending. Each line: bold name, size/%, bug_churn. Mark any group that ALSO appears in the pain list with [HIGH SCOPE + HIGH CHURN].
   "Worst by pain" — top 5 groups by bug_churn descending. Each line: bold name, bug_churn, %. Mark any group that ALSO appears in the scope list with [HIGH SCOPE + HIGH CHURN].
   Keep these lists brief — full details follow.
+  CRITICAL: Every distinct anti-pattern TYPE present in the data (modularity-violation, unhealthy-inheritance, clique, package-cycle, etc.) MUST appear at least once across the two lists — even if bug_churn=0 for all. If all groups have bug_churn=0, the pain list equals the scope list; in that case list by scope descending for both, but still include ALL distinct anti-pattern types. Do NOT omit any type.
 
 Then write group details in two tiers:
 
@@ -1435,21 +1797,24 @@ TIER 2 — groups that appear in only ONE list (large but low churn = structural
   **Size**: files and %. **Key members**: top 3 files. **Churn**: bug_churn only.
   **Why notable**: one sentence on what makes this group specifically worth watching.
   Include DV8 Refactoring Guide path if this is the first instance of that anti-pattern type.
+  IMPORTANT: Include ALL groups here whose anti-pattern type was not fully covered in TIER 1 — even if bug_churn=0. A group with bug_churn=0 that represents a distinct anti-pattern type (e.g. unhealthy-inheritance when TIER 1 only covered modularity-violation) MUST appear in TIER 2.
 
 Then write TWO sub-sections under "Files that got worse over time":
 
 **A) Worst cumulative fan-in growth (structural centralisation)** — top 5 files by `fan_in_delta` from the FILE HOTSPOT SIGNALS table, sorted descending. For each: bold filename, `fan_in_delta` value, which anti-pattern instances it belongs to, one-sentence structural meaning (e.g. "became a dependency magnet — every new class now imports it"). This is the primary signal for files becoming structurally worse over time.
 
 **B) Worst single-transition spike** — up to 3 files with the largest fan-in jump in a single transition window from DEPENDENCY EVOLUTION. For each: bold filename, exact delta and which transition (e.g. "gained +104 fan-in in rev2→rev1"), which anti-pattern instances it NEWLY JOINED in that same transition (if any).
-Then write a "## Metric Trajectory" section. Use the METRIC PEAKS data (if present) — it contains the 2 worst transition windows ranked by metric degradation. For each of those transitions (show both, worst first):
-- State the revision window (dates + commit hashes if available)
-- State the exact Δ M-score and Δ propagation-cost for that window (use the Δ= values verbatim)
-- State whether DRH file count grew or shrank (cite the number)
-- Name the top 2-3 files that gained the most fan-in that window (with exact Δ values from the data)
-- State the total new dependency edges added that window
-- Cross-reference with APs: note which anti-pattern instances were active or grew during that window (link to the group memberships above)
-- End with one-sentence interpretation: what was happening architecturally (e.g. "IOUtils absorbed path operations, driving +104 fan-in and raising propagation-cost by +0.90 — this is when Modularity Violation Instance 1 grew to 85 files")
-If METRIC PEAKS data is absent, omit the Metric Trajectory section entirely.
+Then write a "## Metric Trajectory" section showing ALL transitions in chronological order (oldest→newest). For EACH transition:
+- State the revision window (dates)
+- State the exact Δ M-score and Δ propagation-cost (use the Δ= values verbatim from ALL TRANSITIONS data — NOT from METRIC PEAKS)
+- State DRH file count change
+- Name the top 2 files with most fan-in growth that window (with Δ values)
+- Note which AP instances were active or grew
+- End with one-sentence architectural interpretation
+
+For the WORST transition (largest propagation-cost jump): add a sub-section "#### Why this was the worst transition" using the WORST TRANSITION DRH REPORT data (if present). Explain specifically: which files joined the coupling network, what structural changes drove the metric spike (layer moves, SCC expansion, new dependency edges by type), and what the commit activity shows. Link to the full report: "Full DRH report: <path from WORST TRANSITION DRH REPORT header>".
+
+If ALL TRANSITIONS data is absent, omit the Metric Trajectory section entirely.
 
 Then write a "Worst files overall" section — top 5 files ranked by bug_churn (most lines changed in bug-fix commits). For each file include ALL of these observable signals:
 - **bug_churn**: lines changed in bug-fix commits
@@ -1594,7 +1959,7 @@ Hard rules:
 - For each flagged file explain: what changed (fan-in/fan-out delta), why it is dangerous (blast radius, fragility), and how it compares to prior revisions if multiple transitions show the same file worsening.
 - Cross-reference with MULTI-SIGNAL RISK SCORES and ANTI-PATTERN GROUPS — a file that both grew in dependencies AND belongs to a Clique/Modularity Violation is multiply confirmed as a priority.
 - If SCCs grew in count or size, explain what that means: a larger cyclic cluster means more files are architecturally trapped together.
-- If METRIC PEAKS data is present: write a "## Metric Trajectory" section. The data contains the 2 worst transition windows. Show both (worst first). For each: state the revision window (dates), exact Δ M-score and Δ propagation-cost, DRH file count change, top 2-3 files with most fan-in growth (cite Δ values), total new dependency edges, which AP instances were active or grew, and a one-sentence architectural interpretation. Omit only if METRIC PEAKS data is absent.
+- If METRIC PEAKS data is present: write a "## Metric Trajectory" section showing ALL transitions chronologically (oldest→newest). For each: state the revision window (dates), exact Δ M-score and Δ propagation-cost, DRH file count change, top 2 files with most fan-in growth (Δ values), total new dependency edges, which AP instances were active or grew, and a one-sentence architectural interpretation. For the WORST transition (largest propagation-cost jump): add a "#### Why this was the worst transition" sub-section using the WORST TRANSITION DRH REPORT data — explain which files joined the coupling network, what structural changes drove the spike (layer moves, SCC expansion, new edge types), what the commits show, and link to "Full DRH report: <path>". Omit only if METRIC PEAKS data is absent.
 - Rank your findings: worst evolution first. For each: (1) filename, (2) what signal worsened and by how much, (3) architectural implication, (4) one concrete fix.
 - Do NOT invent numbers. Use only values from the data below.
 
@@ -1755,9 +2120,12 @@ def main() -> int:
                 print(f"  [Q&A] WARNING: Could not load risk scores: {exc}")
         commit_context, bug_commit_count, bug_commit_source = load_bug_commit_context(temporal_root)
         print(f"  [Q&A] Loaded {bug_commit_count} bug-linked commits from {bug_commit_source}")
-        antipattern_groups = load_antipattern_groups(temporal_root)
+        antipattern_groups, top_groups_raw = load_antipattern_groups(temporal_root)
         if antipattern_groups:
             print(f"  [Q&A] Loaded anti-pattern group memberships for most recent revision")
+        refactoring_ctx = build_refactoring_context(top_groups_raw, top_n=3)
+        if refactoring_ctx:
+            print(f"  [Q&A] Loaded per-instance refactoring context for top-3 groups")
         hotspot_data = load_hotspot_data(temporal_root)
         if hotspot_data:
             print(f"  [Q&A] Loaded hotspot ROI data for most recent revision")
@@ -1768,9 +2136,17 @@ def main() -> int:
             n_transitions = evidence_evolution.count("### Transition")
             print(f"  [Q&A] Loaded evidence graph evolution across {n_transitions} transition(s)")
         # Compute metric peaks for Q&A context (no DRH reports in qa-only mode — pass empty list)
-        qa_peaks_section = detect_metric_peaks(timeseries, temporal_root, [], top_n=2)
+        qa_peaks_section = detect_metric_peaks(timeseries, temporal_root, [], top_n=5)
         if qa_peaks_section:
             print(f"  [Q&A] Computed metric peaks cross-reference")
+        # All-transitions summary (chronological, for Metric Trajectory — no deduplication)
+        qa_all_transitions_section = build_all_transitions_summary(timeseries, [])
+        if qa_all_transitions_section:
+            print(f"  [Q&A] Built all-transitions summary")
+        # Load worst transition DRH diff report for deep "why" explanation
+        worst_drh_section, worst_drh_path = load_worst_transition_drh(temporal_root, timeseries)
+        if worst_drh_section:
+            print(f"  [Q&A] Loaded worst-transition DRH report: {worst_drh_path}")
         # Load most recent revision's raw churn_top (total activity last window)
         recent_churn_section = load_recent_churn_top(temporal_root)
         if recent_churn_section:
@@ -1819,6 +2195,7 @@ def main() -> int:
             print(f"\nAnswering: {current_question!r}")
             prior = "\n\n".join(conversation) if conversation else ""
             context_for_answer = (prior + "\n\n" + report_text) if prior else report_text
+            prior_answer = conversation[-1] if conversation else ""
             raw = answer_user_question(args.model, current_question, context_for_answer,
                                        mscore_breakdown=mscore_breakdown,
                                        timeout_s=args.ollama_timeout_s,
@@ -1829,7 +2206,11 @@ def main() -> int:
                                        evidence_evolution=evidence_evolution,
                                        peaks_section=qa_peaks_section,
                                        recent_churn_section=recent_churn_section,
-                                       data_quality_warnings=_dqw or None)
+                                       worst_drh_section=worst_drh_section,
+                                       all_transitions_section=qa_all_transitions_section,
+                                       data_quality_warnings=_dqw or None,
+                                       prior_answer=prior_answer,
+                                       refactoring_context=refactoring_ctx)
             answer = strip_thinking_and_fences(raw)
             print(f"\n{sep}\n  ANSWER\n  Q: {current_question}\n{sep}")
             print(answer)
@@ -2048,9 +2429,12 @@ def main() -> int:
     print(f"  [Q&A] Loaded {bug_commit_count} bug-linked commits from {bug_commit_source}")
 
     # Anti-pattern group memberships (for professor-style "parts of the system" questions)
-    antipattern_groups = load_antipattern_groups(temporal_root)
+    antipattern_groups, top_groups_raw = load_antipattern_groups(temporal_root)
     if antipattern_groups:
         print(f"  [Q&A] Loaded anti-pattern group memberships for most recent revision")
+    refactoring_ctx = build_refactoring_context(top_groups_raw, top_n=3)
+    if refactoring_ctx:
+        print(f"  [Q&A] Loaded per-instance refactoring context for top-3 groups")
 
     # Hotspot ROI data (for "which files are hotspots?" questions)
     hotspot_data = load_hotspot_data(temporal_root)
@@ -2065,9 +2449,17 @@ def main() -> int:
         print(f"  [Q&A] Loaded evidence graph evolution across {n_transitions} transition(s)")
 
     # Metric peaks cross-reference: worst metric jumps linked to structural causes
-    qa_peaks_section = detect_metric_peaks(timeseries, temporal_root, reports, top_n=2)
+    qa_peaks_section = detect_metric_peaks(timeseries, temporal_root, reports, top_n=5)
     if qa_peaks_section:
         print(f"  [Q&A] Computed metric peaks cross-reference")
+    # All-transitions summary (chronological, for Metric Trajectory — no deduplication)
+    qa_all_transitions_section = build_all_transitions_summary(timeseries, reports)
+    if qa_all_transitions_section:
+        print(f"  [Q&A] Built all-transitions summary")
+    # Load worst transition DRH diff report for deep "why" explanation
+    worst_drh_section, worst_drh_path = load_worst_transition_drh(temporal_root, timeseries)
+    if worst_drh_section:
+        print(f"  [Q&A] Loaded worst-transition DRH report: {worst_drh_path}")
     # Load most recent revision's raw churn_top
     recent_churn_section = load_recent_churn_top(temporal_root)
     if recent_churn_section:
@@ -2128,6 +2520,7 @@ def main() -> int:
             # Build context: report + prior Q&A turns
             prior = "\n\n".join(conversation) if conversation else ""
             context_for_answer = (prior + "\n\n" + report_text) if prior else report_text
+            prior_answer = conversation[-1] if conversation else ""
             raw = answer_user_question(args.model, current_question, context_for_answer,
                                        mscore_breakdown=mscore_breakdown,
                                        timeout_s=args.ollama_timeout_s,
@@ -2138,7 +2531,11 @@ def main() -> int:
                                        evidence_evolution=evidence_evolution,
                                        peaks_section=qa_peaks_section,
                                        recent_churn_section=recent_churn_section,
-                                       data_quality_warnings=_dqw or None)
+                                       worst_drh_section=worst_drh_section,
+                                       all_transitions_section=qa_all_transitions_section,
+                                       data_quality_warnings=_dqw or None,
+                                       prior_answer=prior_answer,
+                                       refactoring_context=refactoring_ctx)
             answer = strip_thinking_and_fences(raw)
 
             print(f"\n{sep}")

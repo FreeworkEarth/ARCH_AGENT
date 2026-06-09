@@ -335,6 +335,51 @@ def main():
                     shutil.rmtree(dest_dir)
                 shutil.copytree(p, dest_dir)
 
+    # Backfill computed metrics into timeseries.json for any revisions with empty metrics.
+    # This ensures the plotter has data for AI-generated action folders.
+    if ts_path.exists():
+        ts_data = json.loads(ts_path.read_text())
+        ts_revisions = ts_data.get("revisions", [])
+        # Build a map: folder-name-fragment → metrics dict from all-metrics.json
+        for rev_dir in rev_dirs:
+            all_metrics_path = rev_dir / "OutputData" / "metrics" / "all-metrics.json"
+            if not all_metrics_path.exists():
+                continue
+            try:
+                raw = json.loads(all_metrics_path.read_text())
+            except Exception:
+                continue
+            def _pct(v):
+                if v is None:
+                    return None
+                s = str(v).strip().rstrip("%")
+                try:
+                    return float(s)
+                except ValueError:
+                    return None
+            computed = {
+                "m-score": _pct(raw.get("m-score", {}).get("mScore")),
+                "propagation-cost": _pct(raw.get("propagation-cost", {}).get("propagationCost")),
+                "decoupling-level": _pct(raw.get("decoupling-level", {}).get("decouplingLevel")),
+                "independence-level": _pct(raw.get("independence-level", {}).get("independenceLevel")),
+            }
+            computed = {k: v for k, v in computed.items() if v is not None}
+            if not computed:
+                continue
+            # Match revision: try commit_hash containing folder action slug, or date match
+            folder_lower = rev_dir.name.lower()
+            for rev in ts_revisions:
+                if rev.get("metrics"):
+                    continue  # already has metrics, don't overwrite
+                h = (rev.get("commit_hash") or "").lower()
+                # ai-action1 → matches folder containing "action1"
+                action_slug = h.replace("-", "")  # "aiaction1"
+                action_num = h.split("action")[-1] if "action" in h else ""
+                if action_num and f"action{action_num}" in folder_lower:
+                    rev["metrics"] = computed
+                    break
+        ts_path.write_text(json.dumps(ts_data, indent=2))
+
     dest_ts = interp_root / "timeseries.json"
     if ts_path.exists() and ts_path.resolve() != dest_ts.resolve():
         shutil.copy2(ts_path, dest_ts)
@@ -348,8 +393,10 @@ def main():
         old_dir = rev_dirs[i + 1]
         new_out = new_dir / "OutputData"
         old_out = old_dir / "OutputData"
-        new_n = rev_number_from_dir(new_dir)
-        old_n = rev_number_from_dir(old_dir)
+        # Use sort index rather than prefix integer to avoid collisions between
+        # 2-digit original folders (01_, 02_) and 3-digit action folders (001_, 002_).
+        new_n = i
+        old_n = i + 1
         out_path = evidence_dir / f"evidence_graph_diff_new{new_n}_old{old_n}.json"
         cmd = [
             sys.executable,
@@ -365,8 +412,8 @@ def main():
             subprocess.run(cmd, check=True)
             evidence_index.append(
                 {
-                    "new_revision_number": new_n,
-                    "old_revision_number": old_n,
+                    "new_revision_number": new_n + 1,
+                    "old_revision_number": old_n + 1,
                     "new_dir": new_dir.name,
                     "old_dir": old_dir.name,
                     "path": str(out_path.relative_to(interp_root)),

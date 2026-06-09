@@ -1189,6 +1189,7 @@ def main() -> int:
     new_hash = (new_rev.get("commit_hash") or "")[:7]   # 7-char short hash
     default_out = interp_root / f"drh_diff_report_{model_safe}_{old_date}_to_{new_date}_{new_hash}_new{args.new}_old{args.old}.md"
     out_path = Path(args.output).expanduser().resolve() if args.output else default_out
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     prompt_path = out_path.with_suffix(".prompt.txt")
 
     prompt = build_prompt(context)

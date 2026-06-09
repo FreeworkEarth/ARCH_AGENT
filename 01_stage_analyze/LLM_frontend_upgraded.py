@@ -15,6 +15,19 @@ from typing import Optional
 # Paths
 THIS_DIR = os.path.dirname(__file__)
 AGENT = os.path.join(THIS_DIR, "dv8_agent.py")
+
+# Known toy repo snapshots — used for single-revision godclass tests
+# Keys: (language, snapshot_name)  Values: (repo_url, commit_hash)
+_TOY_SNAPSHOTS = {
+    ("python", "godclass"): (
+        "https://github.com/FreeworkEarth/ARCH_ANALYSIS_TRAINTICKET_TOY_EXAMPLES_MULTILANG",
+        "d5f99d1ff0b55b1556ee11300bf2c953076c53c2",
+    ),
+    ("java", "godclass"): (
+        "https://github.com/FreeworkEarth/ARCH_ANALYSIS_TRAINTICKET_TOY_EXAMPLES_MULTILANG",
+        "8c99861f3873c890ac5ad096c9bf267b21d51596",
+    ),
+}
 # Use the shared RAG explainer location
 EXPLAINER = os.path.join(os.path.dirname(THIS_DIR), "04_RAG_EXPLAINER", "integrated_explainer.py")
 TEMPORAL = os.path.join(THIS_DIR, "temporal_analyzer.py")
@@ -29,7 +42,7 @@ COMPUTE_RISK = os.path.join(THIS_DIR, "compute_file_risk_scores.py")
 PLOT_RISK = os.path.join(THIS_DIR, "plot_risk_score_stats.py")
 
 # Config
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "deepseek-r1:8b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:latest")
 OLLAMA_ENDPOINT = os.getenv("OLLAMA_ENDPOINT", "http://127.0.0.1:11434")
 # Prefer explicit env, then TEST_AUTO/RAG_KnowledgeBase, else legacy KB/archdia
 _PARENT = os.path.dirname(THIS_DIR)
@@ -41,58 +54,26 @@ RAG_KB_DIR = os.getenv("RAG_KB_DIR") or os.getenv("ARCHDIA_KB_DIR") or (_RAG_LOC
 _REPOS_ANALYZED_DIR = os.path.join(os.path.dirname(THIS_DIR), "REPOS_ANALYZED")
 os.makedirs(_REPOS_ANALYZED_DIR, exist_ok=True)
 
-# NeoDepends: canonical repo URL and local clone path
-_NEODEPENDS_REPO_URL = "https://github.com/FreeworkEarth/neodepends.git"
-_NEODEPENDS_LOCAL = os.path.join(os.path.dirname(THIS_DIR), "00_CORE", "NEODEPENDS_DEICIDE", "00_NEODEPENDS", "neodepends")
+def _update_neodepends_if_local() -> None:
+    """If a local NeoDepends clone exists, pull latest production branch (best-effort).
 
-def _ensure_neodepends() -> str | None:
+    dv8_agent.py handles full discovery and GitHub fallback — this only keeps an
+    existing local clone fresh. Never crashes; never sets any paths.
     """
-    Pull the NeoDepends production branch and return the path to dist/dependency-analyzer.
-
-    Called automatically when the user's prompt mentions 'python' or 'neodepends'.
-    - If the local clone already exists: git pull origin production + git checkout production
-    - If not: git clone --branch production <url>
-    Returns the absolute path to dist/dependency-analyzer, or None on failure.
-    """
-    nd_path = pathlib.Path(_NEODEPENDS_LOCAL)
-    bin_path = nd_path / "dist" / "dependency-analyzer"
-
-    if nd_path.exists() and (nd_path / ".git").exists():
-        print("[neodepends] Pulling latest production branch...")
-        try:
-            subprocess.run(
-                ["git", "-C", str(nd_path), "fetch", "origin"],
-                check=True, capture_output=True
-            )
-            subprocess.run(
-                ["git", "-C", str(nd_path), "checkout", "production"],
-                check=True, capture_output=True
-            )
-            subprocess.run(
-                ["git", "-C", str(nd_path), "pull", "origin", "production"],
-                check=True, capture_output=True
-            )
-            print("[neodepends] Up to date on production branch.")
-        except subprocess.CalledProcessError as e:
-            print(f"[neodepends] Warning: git pull failed — using existing local copy. ({e})")
-    else:
-        print(f"[neodepends] Cloning production branch to {nd_path} ...")
-        nd_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            subprocess.run(
-                ["git", "clone", "--branch", "production", "--depth", "1",
-                 _NEODEPENDS_REPO_URL, str(nd_path)],
-                check=True
-            )
-        except subprocess.CalledProcessError as e:
-            print(f"[neodepends] Clone failed: {e}")
-            return None
-
-    if bin_path.exists():
-        bin_path.chmod(bin_path.stat().st_mode | 0o111)  # ensure executable
-        return str(bin_path)
-    print(f"[neodepends] Warning: dist/dependency-analyzer not found at {bin_path}")
-    return None
+    candidates = [
+        pathlib.Path(__file__).resolve().parents[3] / "TEST_AUTO" / "00_CORE" / "NEODEPENDS_DEICIDE" / "00_NEODEPENDS" / "neodepends",
+        pathlib.Path.home() / ".dv8_agent" / "neodepends" / "neodepends_repo",
+    ]
+    for nd_path in candidates:
+        if nd_path.exists() and (nd_path / ".git").exists():
+            try:
+                subprocess.run(["git", "-C", str(nd_path), "fetch", "origin"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(nd_path), "checkout", "production"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(nd_path), "pull", "origin", "production"], check=True, capture_output=True)
+                print(f"[neodepends] Pulled latest production branch at {nd_path}")
+            except subprocess.CalledProcessError:
+                print(f"[neodepends] Warning: git pull failed at {nd_path} — continuing with existing copy.")
+            break
 
 # Enhanced system prompt with tool-calling
 SYSTEM_PROMPT = """You are a DV8 architecture analysis assistant with the following tools:
@@ -319,6 +300,12 @@ def _sanitize_repo(value: str | None) -> str | None:
     # Treat any angle-bracketed text as placeholder
     if v in {".", "./"} or any(p in v.lower() for p in placeholders) or ("<" in v or ">" in v):
         return None
+    # Normalize GitHub tree/blob URLs → bare clone URL
+    # e.g. https://github.com/owner/repo/tree/branch → https://github.com/owner/repo.git
+    if re.match(r"^https?://github\.com/", v):
+        v = re.sub(r"/(tree|blob)/[^/]+.*$", "", v)
+        if not v.endswith(".git"):
+            v = v.rstrip("/") + ".git"
     return v
 
 _QUESTION_KEYWORDS = ("why", "how", "what", "which", "explain", "show me",
@@ -512,9 +499,12 @@ def _run_risk_pipeline(
         print(f"\n[risk-pipeline] Skipping risk scores (script not found or INPUT_INTERPRETATION missing)")
 
     # --- Step 4: Statistical plots ---
-    if os.path.isfile(PLOT_RISK) and risk_json.exists():
+    plots_dir = interp_root / "plots" / "risk_stats"
+    if os.path.isfile(PLOT_RISK) and risk_json.exists() and not any(plots_dir.glob("*.png")):
         print("\n[risk-pipeline] Generating risk score statistical plots...")
         subprocess.call([sys.executable, PLOT_RISK, str(risk_json), "--top-n", "30"])
+    elif plots_dir.exists() and any(plots_dir.glob("*.png")):
+        print("\n[risk-pipeline] Reusing existing risk score plots.")
 
     print("\n[risk-pipeline] Done.")
     if risk_json.exists():
@@ -772,6 +762,10 @@ def tool_interpret_temporal(plan: dict) -> int:
       - <temporal_root>/INPUT_INTERPRETATION
     """
     ur = (plan.get("user_request") or "")
+    auto_refactor = bool(plan.get("auto_refactor", False))
+    force_reinterpret = bool(plan.get("force_reinterpret", False))
+    refactor_model = plan.get("refactor_model") or "qwen3-coder-30b-refactor"
+    refactor_loop_count = int(plan.get("refactor_loop_count") or 0)
 
     # Extract model from prompt if not set (e.g. "with deepseek-r1:32b" or "32b")
     raw_model = plan.get("model") or ""
@@ -895,17 +889,10 @@ def tool_interpret_temporal(plan: dict) -> int:
             print(f"Missing backfill script: {BACKFILL_TEMPORAL}")
             return 1
 
-    # --- Risk pipeline: issue fetch → DV8 export → risk scores → plots ---
-    # review_model=None: skip slow LLM commit review (step 6b) by default.
-    # The core signals (bug_churn, anti_pattern, fan_in, scc, co_change) are
-    # computed without LLM. The review step only re-classifies ambiguous commits
-    # and is not needed for Q&A quality.
-    _run_risk_pipeline(
-        tr,
-        repo_name,
-        git_root=repo if (repo / ".git").exists() else None,
-        review_model=None,
-    )
+    # --- Risk pipeline: DISABLED ---
+    # Custom risk scores are unproven. Q&A and refactoring use only DV8's native
+    # metrics (M-score, anti-patterns, fan-in/out, SCC, bug churn, co-change)
+    # which are already in the DV8 output files.
 
     # --- Check for existing interpretation runs ---
     model_safe = model.replace("/", "_").replace(":", "_")
@@ -923,14 +910,78 @@ def tool_interpret_temporal(plan: dict) -> int:
         print()
         print("  [s] Use latest report — go straight to Q&A (fast)")
         print("  [r] Re-interpret from scratch (slow, re-runs LLM on all transitions)")
-        try:
-            choice = input("  Choice [s/r, default=s]: ").strip().lower()
-        except EOFError:
-            choice = "s"
+        if force_reinterpret:
+            choice = "r"  # --reinterpret flag: always regenerate
+        elif auto_refactor:
+            choice = "s"  # --auto without --reinterpret: reuse existing report
+        else:
+            try:
+                choice = input("  Choice [s/r, default=s]: ").strip().lower()
+            except EOFError:
+                choice = "s"
         if choice != "r":
             report_text = latest.read_text(encoding="utf-8")
             print(f"\nUsing: {latest}")
             user_question = _extract_user_question(ur)
+
+            # ------------------------------------------------------------------
+            # AUTO MODE: inject Q1 -> Q2 -> Stage 4 without any human input
+            # ------------------------------------------------------------------
+            if auto_refactor and not user_question:
+                import importlib.util
+                _spec = importlib.util.spec_from_file_location("itb", pathlib.Path(INTERPRET_TEMPORAL))
+                _mod = importlib.util.module_from_spec(_spec)
+                _spec.loader.exec_module(_mod)
+                _risk_ctx, _commit_ctx, _ = _load_rich_qa_context(tr)
+                _mscore_bd = _mod.load_mscore_worst_modules(tr)
+                sep = "=" * 70
+                conversation = []
+                from datetime import datetime as _dt
+
+                def _auto_ask(question: str) -> str:
+                    print(f"\n[AUTO] Asking: {question!r}")
+                    prior = "\n\n".join(conversation)
+                    ctx = (prior + "\n\n" + report_text) if prior else report_text
+                    raw = _mod.answer_user_question(model, question, ctx,
+                                                    mscore_breakdown=_mscore_bd,
+                                                    timeout_s=900,
+                                                    risk_score_context=_risk_ctx,
+                                                    commit_context=_commit_ctx)
+                    answer = _mod.strip_thinking_and_fences(raw)
+                    print(f"\n{sep}\n  ANSWER\n  Q: {question}\n{sep}\n{answer}\n{sep}")
+                    conversation.append(f"Q: {question}\nA: {answer}")
+                    now = _dt.now()
+                    answer_path = run_folder / f"USER_ANSWER_{now.strftime('%Y%m%d')}.md"
+                    entry = f"\n---\n\n**Q ({now.strftime('%H:%M:%S')})**: {question}\n\n{answer}\n"
+                    if answer_path.exists():
+                        with open(answer_path, "a", encoding="utf-8") as f:
+                            f.write(entry)
+                    else:
+                        answer_path.write_text(
+                            f"# Q&A Session — {now.strftime('%Y%m%d')}\n\n**Model**: {model}\n\n---\n\n"
+                            f"**Q ({now.strftime('%H:%M:%S')})**: {question}\n\n{answer}\n",
+                            encoding="utf-8"
+                        )
+                    print(f"Saved: {answer_path}")
+                    return answer
+
+                # Q1 — identify worst anti-patterns and files
+                _auto_ask("Which parts got worse over time — show anti-pattern groups, "
+                          "files with most dependency growth, and worst files overall.")
+                # Q2 — 3 prioritized actions (for manual reference); Stage 4 loop applies only Action 1 per iteration
+                _auto_ask("How would you refactor the worst anti-pattern? "
+                          "Give EXACTLY 3 concrete code-level refactoring actions using ### Action 1 / ### Action 2 / ### Action 3 headings. "
+                          "Each action must describe specific file changes (rename, split class, remove extends, extract interface, move method, etc). "
+                          "Do NOT include process actions like 'code reviews' or 'documentation'. Only structural code changes. "
+                          "Action 1 must be the single most impactful change right now.")
+                # Stage 4 — loop mode: applies Action 1 only, re-runs Q1+Q2 fresh each iteration
+                print(f"\n[AUTO] Triggering Stage 4 (loop refactor: Action 1 per iteration, re-analyze between each)...")
+                _run_refactor_stage(tr, conversation, model=refactor_model, loop_count=refactor_loop_count)
+                return 0
+
+            # ------------------------------------------------------------------
+            # INTERACTIVE MODE (unchanged)
+            # ------------------------------------------------------------------
             if not user_question:
                 sep = "=" * 70
                 print(f"\n{sep}\n  INTERACTIVE Q&A\n  (Press Enter / 'q' to quit.)\n{sep}")
@@ -978,7 +1029,7 @@ def tool_interpret_temporal(plan: dict) -> int:
                             encoding="utf-8"
                         )
                     print(f"Saved: {answer_path}")
-                    print(f"\n{sep}\n  FOLLOW-UP (Enter / 'q' to finish)\n{sep}")
+                    print(f"\n{sep}\n  FOLLOW-UP (Enter / 'q' to finish, or ask to refactor+reanalyze)\n{sep}")
                     try:
                         next_q = input("  Your question: ").strip()
                     except EOFError:
@@ -986,6 +1037,10 @@ def tool_interpret_temporal(plan: dict) -> int:
                     if not next_q or next_q.lower() in ("q", "quit", "exit"):
                         break
                     if not any(c.isalpha() or c.isdigit() for c in next_q):
+                        break
+                    # Stage 4 trigger: refactor + re-analyse
+                    if _is_refactor_trigger(next_q):
+                        _run_refactor_stage(tr, conversation, model=refactor_model, loop_count=refactor_loop_count)
                         break
                     current_question = next_q
             return 0
@@ -996,13 +1051,780 @@ def tool_interpret_temporal(plan: dict) -> int:
     if user_question:
         cmd += ["--user-question", user_question]
     print("Running:", " ".join(cmd))
-    rc = subprocess.call(cmd)
+    # In auto mode, pipe /dev/null to stdin so all input() calls return "" immediately
+    # (interpret_temporal_bundle exits cleanly on empty Q&A input)
+    import subprocess as _sp
+    if auto_refactor or force_reinterpret:
+        with open(os.devnull, "r") as _devnull:
+            rc = subprocess.call(cmd, stdin=_devnull)
+    else:
+        rc = subprocess.call(cmd)
     if rc == 0:
         # Find the newest combined report (filenames now include a timestamp suffix).
         candidates = sorted(interp_dir.glob(f"*/temporal_interpretation_report_{model_safe}*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
         if candidates:
             print(f"\nTemporal interpretation report: {candidates[0]}")
+
+        # AUTO MODE: after fresh interpretation, run Q1 -> Q2 -> Stage 4
+        if auto_refactor:
+            latest = candidates[0] if candidates else None
+            if latest:
+                run_folder = latest.parent
+                report_text = latest.read_text(encoding="utf-8")
+                import importlib.util
+                _spec = importlib.util.spec_from_file_location("itb", pathlib.Path(INTERPRET_TEMPORAL))
+                _mod = importlib.util.module_from_spec(_spec)
+                _spec.loader.exec_module(_mod)
+                _risk_ctx, _commit_ctx, _ = _load_rich_qa_context(tr)
+                _mscore_bd = _mod.load_mscore_worst_modules(tr)
+                sep = "=" * 70
+                conversation = []
+                from datetime import datetime as _dt
+
+                def _auto_ask_fresh(question: str) -> str:
+                    print(f"\n[AUTO] Asking: {question!r}")
+                    prior = "\n\n".join(conversation)
+                    ctx = (prior + "\n\n" + report_text) if prior else report_text
+                    raw = _mod.answer_user_question(model, question, ctx,
+                                                    mscore_breakdown=_mscore_bd,
+                                                    timeout_s=900,
+                                                    risk_score_context=_risk_ctx,
+                                                    commit_context=_commit_ctx)
+                    answer = _mod.strip_thinking_and_fences(raw)
+                    print(f"\n{sep}\n  ANSWER\n  Q: {question}\n{sep}\n{answer}\n{sep}")
+                    conversation.append(f"Q: {question}\nA: {answer}")
+                    now = _dt.now()
+                    answer_path = run_folder / f"USER_ANSWER_{now.strftime('%Y%m%d')}.md"
+                    entry = f"\n---\n\n**Q ({now.strftime('%H:%M:%S')})**: {question}\n\n{answer}\n"
+                    if answer_path.exists():
+                        with open(answer_path, "a", encoding="utf-8") as f:
+                            f.write(entry)
+                    else:
+                        answer_path.write_text(
+                            f"# Q&A Session — {now.strftime('%Y%m%d')}\n\n**Model**: {model}\n\n---\n\n"
+                            f"**Q ({now.strftime('%H:%M:%S')})**: {question}\n\n{answer}\n",
+                            encoding="utf-8"
+                        )
+                    print(f"Saved: {answer_path}")
+                    return answer
+
+                _auto_ask_fresh("Which parts got worse over time — show anti-pattern groups, "
+                                "files with most dependency growth, and worst files overall.")
+                _auto_ask_fresh("How would you refactor the worst anti-pattern? "
+                               "Give EXACTLY 3 concrete code-level refactoring actions using ### Action 1 / ### Action 2 / ### Action 3 headings. "
+                               "Each action must describe specific file changes (rename, split class, remove extends, extract interface, move method, etc). "
+                               "Do NOT include process actions like 'code reviews' or 'documentation'. Only structural code changes. "
+                               "Action 1 must be the single most impactful change right now.")
+                print(f"\n[AUTO] Triggering Stage 4 (loop refactor: Action 1 per iteration, re-analyze between each)...")
+                _run_refactor_stage(tr, conversation, model=refactor_model, loop_count=refactor_loop_count)
+            else:
+                print("[AUTO] No interpretation report found — cannot run Q&A.")
     return rc
+
+def _is_refactor_trigger(question: str) -> bool:
+    """Return True if the user wants to trigger Stage 4 (refactor + re-analyse)."""
+    q = question.lower()
+    return (
+        "refactor" in q
+        and ("run" in q or "rerun" in q or "re-run" in q or "analysis" in q or "dv8" in q or "analyze" in q)
+    )
+
+
+def _stage4_clean_copy(folder: pathlib.Path) -> None:
+    """Remove stale analysis outputs and .git worktree pointer from a copied folder."""
+    import shutil
+    for stale_name in ("InputData", "OutputData"):
+        stale = folder / stale_name
+        if stale.exists():
+            shutil.rmtree(stale)
+    git_marker = folder / ".git"
+    if git_marker.exists():
+        if git_marker.is_dir():
+            shutil.rmtree(git_marker)
+        else:
+            git_marker.unlink()
+
+
+def _stage4_apply_action(folder: pathlib.Path, action_num: str, action_text: str,
+                          model: str) -> list:
+    """Ask qwen3 to apply a single refactoring action to the relevant files in folder.
+    Returns list of new relative file paths created."""
+    import re as _re, json as _json, urllib.request as _ur
+
+    _SKIP = ("__pycache__", "InputData", "OutputData", ".git", "test", "tests")
+
+    # Detect language from source files present in folder
+    all_java = [p for p in folder.rglob("*.java") if not any(s in p.parts for s in _SKIP)]
+    all_py   = [p for p in folder.rglob("*.py")   if not any(s in p.parts for s in _SKIP)]
+
+    if all_java:
+        lang = "java"
+        all_src = all_java
+        ext = ".java"
+    elif all_py:
+        lang = "python"
+        all_src = all_py
+        ext = ".py"
+    else:
+        print(f"[stage4]   No source files found in {folder.name}")
+        return []
+
+    lang_label = "Java" if lang == "java" else "Python"
+    fence = lang  # "java" or "python" for markdown code fence
+    if lang == "java":
+        new_file_example = f"// NEW_FILE: <relative/path{ext}>\n<file content>\n// END_NEW_FILE"
+    else:
+        new_file_example = f"# NEW_FILE: <relative/path{ext}>\n<file content>\n# END_NEW_FILE"
+
+    # Target only files explicitly mentioned in this action's text (exact word boundary match)
+    import re as _re_tgt
+    def _file_mentioned(fname: str, stem: str, text: str) -> bool:
+        return bool(_re_tgt.search(r'\b' + _re_tgt.escape(fname) + r'\b', text)
+                    or _re_tgt.search(r'\b' + _re_tgt.escape(stem) + r'\b', text))
+    target = [f for f in all_src if _file_mentioned(f.name, f.stem, action_text)]
+    if not target:
+        target = all_src[:3]  # fallback: top 3
+
+    print(f"[stage4]   Action {action_num} ({lang_label}) → targeting: {[f.name for f in target]}")
+    new_files = []
+
+    # NEW_FILE marker pattern — supports both Python (#) and Java (//) comment styles
+    _new_file_pat = r"(?:#|//) NEW_FILE: (.+?)\n(.*?)(?:#|//) END_NEW_FILE"
+
+    for src_file in target:
+        rel = src_file.relative_to(folder)
+        original = src_file.read_text(encoding="utf-8", errors="replace")
+        prompt = (
+            f"/no_think\n"
+            f"You are a senior software engineer applying a single refactoring step to a {lang_label} codebase.\n\n"
+            f"REFACTORING ACTION:\n{action_text}\n\n"
+            f"RULES:\n"
+            f"1. Apply ONLY the action above. Do not add other changes.\n"
+            f"2. Output the COMPLETE modified file — not a diff, not partial code.\n"
+            f"3. No markdown fences, no explanation, no commentary.\n"
+            f"4. If this file is unchanged by the action, output it exactly as-is.\n"
+            f"5. If a NEW file must be created (e.g. an interface), output it using:\n"
+            f"   {new_file_example}\n\n"
+            f"FILE TO MODIFY: {rel}\n"
+            f"{original}"
+        )
+        try:
+            req_body = _json.dumps({
+                "model": model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {"num_predict": 8192, "temperature": 0.3},
+            }).encode()
+            req = _ur.Request("http://localhost:11434/api/generate", data=req_body,
+                              headers={"Content-Type": "application/json"})
+            with _ur.urlopen(req, timeout=300) as resp:
+                raw_output = _json.loads(resp.read().decode()).get("response", "")
+        except Exception as e:
+            print(f"[stage4]   qwen3 failed for {rel}: {e}")
+            continue
+
+        # Parse NEW_FILE blocks (supports # and // comment markers)
+        for m in _re.finditer(_new_file_pat, raw_output, _re.DOTALL):
+            new_rel, new_content = m.group(1).strip(), m.group(2)
+            new_path = folder / new_rel
+            new_path.parent.mkdir(parents=True, exist_ok=True)
+            new_path.write_text(new_content, encoding="utf-8")
+            new_files.append(new_rel)
+            print(f"[stage4]   Created: {new_rel}")
+
+        main_output = _re.sub(_new_file_pat + r"\n?", "", raw_output, flags=_re.DOTALL).strip()
+        if main_output and main_output != original.strip():
+            src_file.write_text(main_output, encoding="utf-8")
+            print(f"[stage4]   Refactored: {rel}")
+        else:
+            print(f"[stage4]   No changes: {rel}")
+
+    return new_files
+
+
+def _stage4_read_mscore(folder: pathlib.Path) -> float | None:
+    """Read M-score from DV8 OutputData after a Stage 4 DV8 run. Returns None if not found."""
+    import json as _j
+    metrics_path = folder / "OutputData" / "metrics" / "all-metrics.json"
+    if not metrics_path.exists():
+        return None
+    try:
+        raw = _j.loads(metrics_path.read_text())
+        val = raw.get("m-score", {}).get("mScore")
+        if val is None:
+            return None
+        return float(str(val).strip().rstrip("%"))
+    except Exception:
+        return None
+
+
+def _stage4_run_dv8(folder: pathlib.Path) -> int:
+    """Run DV8 on a single folder. Returns subprocess return code."""
+    print(f"\n[stage4] Running DV8 on {folder.name} ...")
+    nd_cmd = [
+        sys.executable, AGENT,
+        "--repo", str(folder),
+        "--ask", "all",
+    ]
+    # Java repos: force Depends (not NeoDepends) to match the tool used for original temporal commits.
+    # Without --java-depends, dv8_agent.py defaults to NeoDepends for Java, which produces
+    # far fewer dependency cells (11 vs 49) and an artificially inflated M-score.
+    has_java = any(folder.rglob("*.java"))
+    if has_java:
+        nd_cmd.append("--java-depends")
+        print(f"[stage4] Java source detected — using Depends (--java-depends) for tool consistency.")
+    rc = subprocess.call(nd_cmd)
+    if rc != 0:
+        print(f"[stage4] DV8 run failed (rc={rc}) for {folder.name}")
+    return rc
+
+
+def _run_refactor_loop(temporal_root: pathlib.Path, model: str = "qwen3-coder-30b-refactor",
+                       max_iterations: int = 5) -> int:
+    """Loop mode Stage 4: each iteration re-runs Q1+Q2 on current state, applies ONE action, checks M-score.
+
+    Stops when: max_iterations reached, M-score stops improving, or DV8 fails.
+    """
+    import shutil as _sh, datetime as _dt, json as _js, importlib.util as _ilu, re as _re_l
+    sep = "=" * 70
+    print(f"\n{sep}\n  STAGE 4 (LOOP MODE): max {max_iterations} iterations\n{sep}")
+
+    data_repos = temporal_root / "data_repositories"
+    if not data_repos.is_dir():
+        print("[loop] No data_repositories/ folder found.")
+        return 1
+
+    # Find most recent hand-written revision (2-digit prefix, lowest = most recent)
+    def _get_source_revs():
+        return sorted(
+            [p for p in data_repos.iterdir()
+             if p.is_dir() and len(p.name) > 2 and p.name[:2].isdigit() and p.name[2] == "_"],
+            key=lambda p: p.name
+        )
+
+    # Load interpret_temporal_bundle for Q1/Q2
+    _spec = _ilu.spec_from_file_location("itb", pathlib.Path(INTERPRET_TEMPORAL))
+    _mod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+
+    prev_mscore: float | None = None
+    iteration_dirs: list[tuple[str, pathlib.Path, _dt.date, float | None]] = []
+    stall_count: int = 0          # consecutive iterations with no significant improvement
+    STALL_LIMIT: int = 3          # stop after this many consecutive stalls
+    today = _dt.date.today()
+    # Track folders created by THIS run so we don't delete them on the next iteration
+    this_run_folders: set[str] = set()
+
+    # Find the baseline source revision (most recent hand-written commit = lowest 2-digit prefix)
+    rev_dirs = _get_source_revs()
+    if not rev_dirs:
+        print("[loop] No source revision found.")
+        return 1
+    current_source = rev_dirs[0]
+    # Cache the repo name parts from the ORIGINAL source so folder names stay clean across iterations
+    _orig_src_parts = current_source.name.split("_")
+    _base_name_parts = _orig_src_parts[1:-2]  # e.g. ["ARCH_ANALYSIS_TRAINTICKET_TOY_EXAMPLES_MULTILANG"]
+
+    # Delete any stale loop folders from previous runs before we start
+    for _old in list(data_repos.iterdir()):
+        if _old.is_dir():
+            _pfx = _old.name.split("_")[0]
+            if _pfx.isdigit() and len(_pfx) >= 3:
+                _sh.rmtree(_old)
+
+    for iteration in range(1, max_iterations + 1):
+        print(f"\n{sep}\n  LOOP ITERATION {iteration}/{max_iterations}\n{sep}")
+
+        if prev_mscore is None:
+            prev_mscore = _stage4_read_mscore(current_source)
+            if prev_mscore is not None:
+                print(f"[loop] Baseline M-score: {prev_mscore:.2f}%")
+
+        # Re-run backfill + re-generate report for current state
+        import subprocess as _sp_l
+        bf_cmd = [sys.executable, BACKFILL_TEMPORAL, str(temporal_root)]
+        _sp_l.call(bf_cmd)
+
+        # Load fresh report text
+        interp_dir = temporal_root / "OUTPUT_INTERPRETATION"
+        candidates = sorted(
+            [d for d in interp_dir.iterdir() if d.is_dir()] if interp_dir.exists() else [],
+            key=lambda d: d.stat().st_mtime, reverse=True
+        )
+        report_text = ""
+        if candidates:
+            run_folder = candidates[0]
+            for rp in ["INTERPRETATION_REPORT.md", "report.md", "interpretation.md"]:
+                rpath = run_folder / rp
+                if rpath.exists():
+                    report_text = rpath.read_text(encoding="utf-8", errors="replace")
+                    break
+
+        _risk_ctx, _commit_ctx, _ = _load_rich_qa_context(temporal_root)
+        _mscore_bd = _mod.load_mscore_worst_modules(temporal_root)
+        conversation: list[str] = []
+
+        def _loop_ask(question: str) -> str:
+            prior = "\n\n".join(conversation)
+            ctx = (prior + "\n\n" + report_text) if prior else report_text
+            raw = _mod.answer_user_question(model, question, ctx,
+                                            mscore_breakdown=_mscore_bd,
+                                            timeout_s=900,
+                                            risk_score_context=_risk_ctx,
+                                            commit_context=_commit_ctx)
+            answer = _mod.strip_thinking_and_fences(raw)
+            print(f"\n[loop] Q: {question}\n[loop] A (trimmed): {answer[:300]}...")
+            conversation.append(f"Q: {question}\nA: {answer}")
+            return answer
+
+        print(f"[loop] Running Q1 (anti-pattern analysis)...")
+        _loop_ask("Which parts got worse over time — show anti-pattern groups, "
+                  "files with most dependency growth, and worst files overall.")
+        print(f"[loop] Running Q2 (get 3 prioritized actions, will apply only Action 1)...")
+        _loop_ask("How would you refactor the worst anti-pattern? "
+                  "Give EXACTLY 3 concrete code-level refactoring actions using ### Action 1 / ### Action 2 / ### Action 3 headings. "
+                  "Each action must describe specific file changes (rename, split class, remove extends, extract interface, move method, etc). "
+                  "Do NOT include process actions like 'code reviews' or 'documentation'. Only structural code changes. "
+                  "Action 1 must be the single most impactful change right now.")
+
+        # Parse top action from Q2 answer
+        action_match = _re_l.search(
+            r"### Action 1[^\n]*\n(.*?)(?=\n### Action \d+|\n## |\Z)",
+            conversation[-1], _re_l.DOTALL
+        )
+        if not action_match:
+            print(f"[loop] Could not parse ### Action 1 from Q2 answer. Stopping.")
+            break
+        action_text = action_match.group(1).strip()
+
+        # Build new folder for this iteration
+        action_date = today - _dt.timedelta(weeks=max_iterations - iteration + 1)
+        date_str = action_date.strftime("%d%m%Y")
+        prefix = str(max_iterations - iteration + 1).zfill(3)
+        new_name = prefix + "_" + "_".join(_base_name_parts) + f"_loop{iteration}_{date_str}_1000"
+        new_dir = data_repos / new_name
+
+        if new_dir.exists():
+            _sh.rmtree(new_dir)
+        _sh.copytree(current_source, new_dir)
+        this_run_folders.add(new_dir.name)
+        _stage4_clean_copy(new_dir)
+        _stage4_apply_action(new_dir, "1", action_text, model)
+
+        rc = _stage4_run_dv8(new_dir)
+        if rc != 0:
+            print(f"[loop] DV8 failed on iteration {iteration}. Stopping.")
+            return rc
+
+        new_mscore = _stage4_read_mscore(new_dir)
+        if new_mscore is not None:
+            delta = new_mscore - prev_mscore if prev_mscore is not None else 0.0
+            sign = "+" if delta >= 0 else ""
+            print(f"[loop] M-score iteration {iteration}: {new_mscore:.2f}% ({sign}{delta:.2f}%)")
+            if prev_mscore is not None and new_mscore <= prev_mscore + 0.1:
+                stall_count += 1
+                print(f"[loop] No significant improvement ({prev_mscore:.2f}% → {new_mscore:.2f}%). "
+                      f"Stall {stall_count}/{STALL_LIMIT}.")
+                if stall_count >= STALL_LIMIT:
+                    print(f"[loop] {STALL_LIMIT} consecutive stalls — stopping early.")
+                    iteration_dirs.append((str(iteration), new_dir, action_date, new_mscore))
+                    break
+            else:
+                stall_count = 0   # reset on any real improvement
+            prev_mscore = new_mscore
+        else:
+            print(f"[loop] Could not read M-score for iteration {iteration}.")
+
+        iteration_dirs.append((str(iteration), new_dir, action_date, new_mscore))
+        # Next iteration builds on this iteration's output
+        current_source = new_dir
+
+    # Inject synthetic revisions into timeseries.json
+    import json as _js2
+    ts_path = next(
+        (p for p in [temporal_root / "INPUT_INTERPRETATION" / "timeseries.json",
+                     temporal_root / "timeseries.json"] if p.exists()),
+        temporal_root / "INPUT_INTERPRETATION" / "timeseries.json"
+    )
+    if ts_path.exists() and iteration_dirs:
+        ts = _js2.loads(ts_path.read_text())
+        ts["revisions"] = [r for r in ts.get("revisions", [])
+                           if not r.get("commit_hash", "").startswith("ai-")]
+        for it_num, _, adate, it_mscore in reversed(iteration_dirs):
+            synthetic = {
+                "revision_number": 0,
+                "commit_hash": f"ai-loop{it_num}",
+                "commit_date": f"{adate.strftime('%Y-%m-%d')} 10:00:00 +0000",
+                "commit_author": "qwen3.6 (AI loop)",
+                "commit_message": f"AI Loop Refactor: Iteration {it_num}",
+                "metrics": {"m-score": it_mscore} if it_mscore is not None else {},
+            }
+            ts.setdefault("revisions", []).insert(0, synthetic)
+        ts["revision_count"] = len(ts.get("revisions", []))
+        ts_path.write_text(_js2.dumps(ts, indent=2))
+        print(f"[loop] Updated timeseries.json → {ts['revision_count']} revisions.")
+
+    # Regenerate + re-plot
+    import subprocess as _sp_end
+    _sp_end.call([sys.executable, BACKFILL_TEMPORAL, str(temporal_root)])
+    plot_ts = ts_path if ts_path.exists() else temporal_root / "INPUT_INTERPRETATION" / "timeseries.json"
+    plot_out = temporal_root / "INPUT_INTERPRETATION" / "plots"
+    _sp_end.call([sys.executable, PLOTTER, "--json", str(plot_ts), "--output", str(plot_out)])
+
+    print(f"\n{sep}\n  Loop mode complete — {len(iteration_dirs)} iteration(s).\n{sep}\n")
+
+    # Generate manager report
+    _report_script = pathlib.Path(__file__).resolve().parent.parent / "04_stage_refactor" / "generate_refactor_report.py"
+    if _report_script.exists():
+        _sp_end.call([sys.executable, str(_report_script), "--temporal-root", str(temporal_root)])
+
+    return 0
+
+
+def _run_refactor_stage(temporal_root: pathlib.Path, conversation: list[str],
+                        model: str = "qwen3-coder-30b-refactor", loop_count: int = 0) -> int:
+    """Stage 4: Iterative LLM-refactor — one folder + DV8 run per Q2 action.
+
+    If loop_count > 0: loop mode — re-run Q1+Q2 each iteration, apply only the top action.
+    Otherwise: sequential mode — apply all 3 Q2 actions in order with M-score guard.
+
+    For N actions the timeline becomes:
+      02_Jan2024 → 01_Jun2024 → 00N_action1 → 00(N-1)_action2 → 001_actionN
+    producing an N+2 point M-score time series.
+    """
+    # ── LOOP MODE ──────────────────────────────────────────────────────────────
+    if loop_count > 0:
+        return _run_refactor_loop(temporal_root, model=model, max_iterations=loop_count)
+    # ── SEQUENTIAL MODE (default) ──────────────────────────────────────────────
+    import shutil, re as _re
+    sep = "=" * 70
+    print(f"\n{sep}\n  STAGE 4: Iterative LLM Refactor + Re-analysis\n{sep}")
+
+    # --- Step 1: Find source revision (lowest existing prefix = most recent) ---
+    data_repos = temporal_root / "data_repositories"
+    if not data_repos.is_dir():
+        print("[stage4] No data_repositories/ folder found.")
+        return 1
+
+    # Auto-delete stale action folders (NNN_*action*) so each run produces fresh metrics
+    import re as _re2
+    for _stale in list(data_repos.iterdir()):
+        if _stale.is_dir() and _re2.match(r'^\d{3}_', _stale.name) and "action" in _stale.name:
+            print(f"[stage4] Removing stale action folder: {_stale.name}")
+            shutil.rmtree(_stale)
+
+    # Only consider 2-digit prefix folders (01_, 02_, ...) — not 001_, 002_, ... action folders
+    rev_dirs = sorted(
+        [p for p in data_repos.iterdir()
+         if p.is_dir() and len(p.name) > 2 and p.name[:2].isdigit() and p.name[2] == "_"],
+        key=lambda p: p.name
+    )
+    if not rev_dirs:
+        print("[stage4] No original revision folders found in data_repositories/.")
+        return 1
+    source_rev = rev_dirs[0]  # lowest NN_ prefix = most recent hand-written revision
+    print(f"[stage4] Source revision: {source_rev.name}")
+
+    # --- Step 2: Load Q2 refactoring plan ---
+    q2_plan = ""
+    for entry in reversed(conversation):
+        if "### action 1" in entry.lower() or "refactoring priority" in entry.lower():
+            q2_plan = entry
+            break
+    if not q2_plan:
+        interp_dir = temporal_root / "OUTPUT_INTERPRETATION"
+        answer_files = sorted(interp_dir.glob("*/USER_ANSWERS*.md"),
+                              key=lambda p: p.stat().st_mtime, reverse=True)
+        if answer_files:
+            full_text = answer_files[0].read_text(encoding="utf-8")
+            # Extract only the LAST Q2 answer block (contains "### Action 1").
+            # USER_ANSWERS.md accumulates all Q&A turns — split on "---" separators
+            # and take only the last block that contains action headings.
+            import re as _re_q2
+            turns = _re_q2.split(r'\n---\n', full_text)
+            q2_turns = [t for t in turns if _re_q2.search(r'###\s+Action\s+1', t)]
+            q2_plan = q2_turns[-1] if q2_turns else full_text
+            print(f"[stage4] Loaded Q2 plan from: {answer_files[0].name} "
+                  f"(extracted last of {len(q2_turns)} action block(s))")
+    if not q2_plan:
+        print("[stage4] No Q2 plan found — run Q2 first ('how would you refactor this?').")
+        return 1
+
+    # --- Step 3: Parse individual actions from Q2 plan ---
+    # Matches "### Action N — ..." blocks
+    action_blocks = _re.findall(
+        r"### Action (\d+)[^\n]*\n(.*?)(?=\n### Action \d+|\n## |\Z)",
+        q2_plan, _re.DOTALL
+    )
+    if not action_blocks:
+        print("[stage4] No '### Action N —' blocks found in Q2 plan — using single-folder fallback.")
+        action_blocks = [("1", q2_plan[:3000])]
+
+    n = len(action_blocks)
+    # Hard cap at 3 — guard against LLM returning extra non-code actions (e.g. "code reviews")
+    if n > 3:
+        print(f"[stage4] Capping {n} actions to 3 (LLM returned too many).")
+        action_blocks = action_blocks[:3]
+        n = 3
+    print(f"[stage4] Found {n} action(s) to apply iteratively.")
+    refactor_model = model or "qwen3-coder-30b-refactor"
+    print(f"[stage4] Using model: {refactor_model}")
+
+    # --- Step 4: Iterative copy → refactor → DV8 per action ---
+    # Remove any stale 3-digit-prefix action folders from previous runs (they may have
+    # different dates in their names). Original 2-digit folders (01_, 02_) are kept.
+    for _old in list(data_repos.iterdir()):
+        if _old.is_dir():
+            prefix_part = _old.name.split("_")[0]
+            if prefix_part.isdigit() and len(prefix_part) >= 3:
+                print(f"[stage4] Removing stale action folder: {_old.name}")
+                shutil.rmtree(_old)
+
+    # Base name parts from source_rev (strip leading NN_ prefix and trailing date+time)
+    src_parts = source_rev.name.split("_")
+    base_parts = src_parts[1:-2]  # e.g. ["ARCH", "ANALYSIS", "TRAINTICKET", ...]
+
+    # Compute real action dates: work backward from today, 1 week per action.
+    # Action 1 = n weeks ago, Action 2 = n-1 weeks ago, ..., last action = 1 week ago.
+    # This keeps all AI commits in the past (never in the future) and spaced visibly apart.
+    import datetime as _dt
+    _today = _dt.date.today()
+    _action_dates: dict[int, _dt.date] = {}
+    for _i in range(n):
+        _weeks_back = n - _i  # action index 0 → n weeks back, last action → 1 week back
+        _action_dates[_i] = _today - _dt.timedelta(weeks=_weeks_back)
+
+    prev_dir = source_rev
+    all_new_files: list[str] = []
+    action_dirs: list[tuple[str, pathlib.Path, _dt.date]] = []  # (action_num, new_dir, date)
+
+    # Read baseline M-score from source revision so we can guard against regressions
+    prev_mscore = _stage4_read_mscore(source_rev)
+    if prev_mscore is not None:
+        print(f"[stage4] Baseline M-score: {prev_mscore:.2f}%")
+
+    for i, (action_num, action_text) in enumerate(action_blocks):
+        # Prefix: first action gets highest 3-digit number (e.g. 003), last gets 001
+        prefix = str(n - i).zfill(3)
+        action_date = _action_dates[i]
+        date_str = action_date.strftime("%d%m%Y")  # DDMMYYYY
+        time_str = str(1000 + i * 200)             # 1000, 1200, 1400, ...
+        slug = f"action{action_num}"
+        new_name = prefix + "_" + "_".join(base_parts) + f"_{slug}_{date_str}_{time_str}"
+        new_dir = data_repos / new_name
+
+        print(f"\n{sep}")
+        print(f"  Action {action_num}/{n}: {new_dir.name}")
+        print(sep)
+
+        if new_dir.exists():
+            print(f"[stage4] Removing existing folder to rebuild from scratch ...")
+            shutil.rmtree(new_dir)
+        print(f"[stage4] Copying {prev_dir.name} → {new_name} ...")
+        shutil.copytree(prev_dir, new_dir)
+        _stage4_clean_copy(new_dir)
+        new_files = _stage4_apply_action(new_dir, action_num, action_text.strip(), refactor_model)
+        all_new_files.extend(new_files)
+
+        rc = _stage4_run_dv8(new_dir)
+        if rc != 0:
+            print(f"[stage4] Stopping after failed DV8 run for action {action_num}.")
+            return rc
+
+        # M-score guard: stop if this action degraded architecture
+        new_mscore = _stage4_read_mscore(new_dir)
+        if new_mscore is not None:
+            delta = new_mscore - prev_mscore if prev_mscore is not None else 0.0
+            sign = "+" if delta >= 0 else ""
+            print(f"[stage4] M-score after action {action_num}: {new_mscore:.2f}% ({sign}{delta:.2f}%)")
+            if prev_mscore is not None and new_mscore < prev_mscore - 0.5:
+                print(f"[stage4] WARNING: Action {action_num} degraded M-score "
+                      f"({prev_mscore:.2f}% → {new_mscore:.2f}%). Stopping pipeline.")
+                print(f"[stage4] Folder kept for inspection: {new_dir.name}")
+                action_dirs.append((action_num, new_dir, action_date))
+                break  # don't apply further actions on degraded code
+            prev_mscore = new_mscore
+
+        action_dirs.append((action_num, new_dir, action_date))
+        prev_dir = new_dir  # next action builds on this result
+
+    # --- Step 5: Inject synthetic revisions into timeseries.json ---
+    # backfill reads revisions_meta[idx] for each folder. AI action folders won't have
+    # matching entries, so we inject synthetic ones (newest first = prepended).
+    # Remove any stale ai-actionN entries first (folder names changed with new dates).
+    import json as _js
+    ts_path = next(
+        (p for p in [temporal_root / "INPUT_INTERPRETATION" / "timeseries.json",
+                     temporal_root / "timeseries.json"] if p.exists()),
+        temporal_root / "INPUT_INTERPRETATION" / "timeseries.json"
+    )
+    repo_name = ""
+    ts = {}
+    if ts_path.exists():
+        try:
+            ts = _js.loads(ts_path.read_text())
+            repo_name = ts.get("repo", "")
+        except Exception:
+            pass
+    if ts and action_dirs:
+        # Remove stale ai-action entries (always rebuild them with fresh dates)
+        ts["revisions"] = [r for r in ts.get("revisions", [])
+                           if not r.get("commit_hash", "").startswith("ai-action")]
+        # Prepend in reverse order so newest action (last applied) is first
+        for action_num, _, adate in reversed(action_dirs):
+            hash_key = f"ai-action{action_num}"
+            time_hhmm = str(1000 + (int(action_num) - 1) * 200)
+            synthetic = {
+                "revision_number": 0,  # position-assigned by backfill
+                "commit_hash": hash_key,
+                "commit_date": f"{adate.strftime('%Y-%m-%d')} {time_hhmm[:2]}:{time_hhmm[2:]}:00 +0000",
+                "commit_author": "qwen3.6 (AI)",
+                "commit_message": f"AI Refactor: Action {action_num}",
+                "metrics": {}
+            }
+            ts.setdefault("revisions", []).insert(0, synthetic)
+        ts["revision_count"] = len(ts.get("revisions", []))
+        ts_path.parent.mkdir(parents=True, exist_ok=True)
+        ts_path.write_text(_js.dumps(ts, indent=2))
+        print(f"[stage4] Updated timeseries.json → {ts['revision_count']} revisions total.")
+
+    # --- Step 6: Regenerate INPUT_INTERPRETATION for all revisions ---
+    print(f"\n[stage4] Regenerating INPUT_INTERPRETATION ...")
+    bf_cmd = [sys.executable, BACKFILL_TEMPORAL, str(temporal_root)]
+    if repo_name:
+        bf_cmd += ["--meta-repo", repo_name]
+    subprocess.call(bf_cmd)
+
+    # --- Step 7: Re-plot time series ---
+    print(f"\n[stage4] Re-plotting time series ...")
+    plot_ts = ts_path if ts_path.exists() else temporal_root / "INPUT_INTERPRETATION" / "timeseries.json"
+    plot_out = temporal_root / "INPUT_INTERPRETATION" / "plots"
+    subprocess.call([sys.executable, PLOTTER, "--json", str(plot_ts), "--output", str(plot_out)])
+
+    # Also update the time_evolution_modularity_metrics/ subfolder so backfill/interpreters see 5-pt plots
+    subdir = plot_out / "time_evolution_modularity_metrics"
+    subdir.mkdir(parents=True, exist_ok=True)
+    import shutil as _shutil
+    for _p in plot_out.iterdir():
+        if _p.is_file() and _p.suffix == ".png":
+            _shutil.copy2(_p, subdir / _p.name)
+
+    print(f"\n{sep}")
+    print(f"  Stage 4 complete — {n} action(s) applied iteratively.")
+    print(f"  Last folder: {prev_dir.name}")
+    print(f"  New files created: {all_new_files or 'none'}")
+    print(f"  Re-run Q1/Q2 to see the {n + 2}-revision M-score time series.")
+    print(f"{sep}\n")
+    return 0
+
+
+def tool_analyze_and_refactor_single(plan: dict) -> int:
+    """Single-revision mode: clone repo, checkout a specific commit, run DV8, then auto Q1 -> Q2 -> Stage 4.
+
+    Accepts --repo <git_url|local_path> and --commit <hash> (optional; HEAD if absent).
+    """
+    import shutil as _shutil, datetime as _dt_mod, json as _js
+
+    repo = plan.get("repo") or ""
+    commit_hash = plan.get("commit") or None
+    language = plan.get("language") or "python"
+    model = plan.get("model") or "deepseek-r1:32b"
+    refactor_model = plan.get("refactor_model") or "qwen3-coder-30b-refactor"
+
+    if not repo:
+        repo = _prompt_for_repo()
+
+    test_auto_dir = pathlib.Path(THIS_DIR).parent
+    repos_analyzed = test_auto_dir / "REPOS_ANALYZED"
+    repos_analyzed.mkdir(parents=True, exist_ok=True)
+
+    # ── Step 1: Get local repo path ──────────────────────────────────────────
+    if re.match(r"^https?://", repo):
+        from urllib.parse import urlparse as _urlparse
+        repo_name = pathlib.Path(_urlparse(repo).path).stem.replace(".git", "")
+        repo_path = repos_analyzed / repo_name
+        if (repo_path / ".git").exists():
+            print(f"[single-rev] Repo already cloned: {repo_path}")
+        else:
+            print(f"[single-rev] Cloning {repo} -> {repo_path}")
+            subprocess.run(["git", "clone", repo, str(repo_path)], check=True)
+    else:
+        repo_path = pathlib.Path(repo).expanduser().resolve()
+        repo_name = repo_path.name
+
+    if not repo_path.exists():
+        print(f"[single-rev] Repo path not found: {repo_path}")
+        return 1
+
+    print(f"[single-rev] Repo: {repo_path}  language: {language}")
+
+    # ── Step 2: Resolve commit hash and date ─────────────────────────────────
+    if commit_hash:
+        try:
+            result = subprocess.run(
+                ["git", "log", "-1", "--format=%ci", commit_hash],
+                cwd=repo_path, capture_output=True, text=True, check=True,
+            )
+            commit_date = result.stdout.strip() or _dt_mod.datetime.now().strftime("%Y-%m-%d %H:%M:%S +0000")
+        except Exception:
+            commit_date = _dt_mod.datetime.now().strftime("%Y-%m-%d %H:%M:%S +0000")
+    else:
+        commit_date = _dt_mod.datetime.now().strftime("%Y-%m-%d %H:%M:%S +0000")
+        commit_hash = "HEAD"
+
+    # ── Step 3: Build temporal folder ────────────────────────────────────────
+    now_str = _dt_mod.datetime.now().strftime("%y%m%d_%H%M%S")
+    temporal_dir = repos_analyzed / f"{repo_name.upper()}_{language}" / f"single_revision_{now_str}"
+    data_repos_dir = temporal_dir / "data_repositories"
+    data_repos_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Step 4: Checkout commit into data_repositories/ ──────────────────────
+    try:
+        date_obj = _dt_mod.datetime.strptime(commit_date[:19], "%Y-%m-%d %H:%M:%S")
+        formatted_dt = date_obj.strftime("%d%m%Y_%H%M")
+    except Exception:
+        formatted_dt = commit_hash[:8]
+
+    rev_folder_name = f"01_{repo_name.upper()}_{formatted_dt}"
+    rev_dest = data_repos_dir / rev_folder_name
+
+    if commit_hash != "HEAD":
+        print(f"[single-rev] Creating worktree {rev_dest.name} @ {commit_hash[:8]}")
+        subprocess.run(
+            ["git", "worktree", "add", "--detach", str(rev_dest), commit_hash],
+            cwd=repo_path, check=True,
+        )
+    else:
+        print(f"[single-rev] Copying HEAD snapshot to {rev_dest.name}")
+        _shutil.copytree(repo_path, rev_dest, dirs_exist_ok=True)
+
+    # ── Step 5: Write timeseries.json ─────────────────────────────────────────
+    interp_dir = temporal_dir / "INPUT_INTERPRETATION"
+    interp_dir.mkdir(parents=True, exist_ok=True)
+    ts_data = {
+        "repository": repo_name.upper(),
+        "revisions": [{
+            "revision_number": 1,
+            "commit_hash": commit_hash,
+            "commit_date": commit_date,
+            "commit_author": "single-revision-mode",
+            "commit_message": f"Single snapshot: {repo_name} @ {commit_hash[:8]}",
+            "metrics": {},
+        }]
+    }
+    (interp_dir / "timeseries.json").write_text(_js.dumps(ts_data, indent=2))
+
+    print(f"[single-rev] Temporal folder: {temporal_dir}")
+    print(f"[single-rev] Triggering auto Q1 -> Q2 -> Stage 4 ...")
+
+    return tool_interpret_temporal({
+        "repo": str(temporal_dir),
+        "model": model,
+        "user_request": plan.get("user_request") or "",
+        "auto_refactor": True,
+        "refactor_model": refactor_model,
+    })
+
 
 def tool_analyze_repo(plan: dict) -> tuple[int, str]:
     """Run dv8_agent.py for analysis"""
@@ -1183,11 +2005,12 @@ def tool_temporal_analysis(plan: dict) -> int:
         "multilang toy": "ARCH_ANALYSIS_TRAINTICKET_TOY_EXAMPLES_MULTILANG",
         "arch analysis trainticket": "ARCH_ANALYSIS_TRAINTICKET_TOY_EXAMPLES_MULTILANG",
     }
-    repo_lower = repo.lower()
-    for alias, canonical in _REPO_ALIASES.items():
-        if alias in repo_lower:
-            repo = canonical
-            break
+    if "://" not in repo:  # only apply aliases to short names, not full URLs
+        repo_lower = repo.lower()
+        for alias, canonical in _REPO_ALIASES.items():
+            if alias in repo_lower:
+                repo = canonical
+                break
 
     # If the repo is a short name (not a URL or absolute path), resolve it to
     # an existing local clone in TEST_AUTO/REPOS/ before passing to dv8_agent.
@@ -1198,7 +2021,7 @@ def tool_temporal_analysis(plan: dict) -> int:
             repo = str(candidate)
         else:
             # Could not find the repo locally — ask the user before dv8_agent crashes
-            print(f"\nCould not find repository '{repo}' in {test_auto_dir / 'REPOS'}/")
+            print(f"\nCould not find repository '{repo}' in {test_auto_dir / 'REPOS_ANALYZED'}/")
             print("Please provide one of:")
             print("  - A local folder path  (e.g. /Users/you/projects/myrepo)")
             print("  - A Git URL            (e.g. https://github.com/owner/repo)")
@@ -1232,6 +2055,10 @@ def tool_temporal_analysis(plan: dict) -> int:
     force_depends = plan.get("force_depends", False)
     workspace = plan.get("workspace")
     java_depends = plan.get("java_depends", True)  # Default True: use Depends for Java (NeoDepends still testing)
+    understand_und = plan.get("understand_und")
+    understand_upython = plan.get("understand_upython")
+    understand_language = plan.get("understand_language")
+    understand_granularity = plan.get("understand_granularity", "entity")
     mv_cochange = plan.get("mv_cochange")  # Modularity Violation co-change threshold (DV8 -mvCochange)
     if mv_cochange is not None:
         try:
@@ -1250,8 +2077,8 @@ def tool_temporal_analysis(plan: dict) -> int:
                    re.search(r"branch[=:\s]+([A-Za-z0-9._\-/]+)", ur, re.I)
         if m_branch:
             branch = m_branch.group(1).strip()
-        # Count: "last 5 revisions" or "over 5 revisions"
-        m_cnt = re.search(r"(?:last|over|for)\s+(\d+)\s+revisions?", ur)
+        # Count: "last 5 revisions", "over 5 revisions", "temporal 3 revisions", or bare "3 revisions"
+        m_cnt = re.search(r"(?:last|over|for|temporal)?\s*(\d+)\s+revisions?", ur)
         if m_cnt:
             try:
                 count = int(m_cnt.group(1))
@@ -1262,6 +2089,14 @@ def tool_temporal_analysis(plan: dict) -> int:
         if m_mon and ("between" in ur or "in between" in ur or "apart" in ur or "spacing" in ur or "every" in ur):
             try:
                 min_months_apart = int(m_mon.group(1))
+                min_commits_apart = 0
+            except ValueError:
+                pass
+        # Year spacing: "1 year apart", "2 years apart"
+        m_yr_apart = re.search(r"(\d+)\s+years?\s+apart", ur)
+        if m_yr_apart and min_months_apart == 0:
+            try:
+                min_months_apart = int(m_yr_apart.group(1)) * 12
                 min_commits_apart = 0
             except ValueError:
                 pass
@@ -1353,9 +2188,26 @@ def tool_temporal_analysis(plan: dict) -> int:
                 if m_ws:
                     workspace = m_ws.group(1).strip()
         if not depends_runner:
-            m_dr = re.search(r"depends[_-]?runner\s*=\s*(auto|dv8|jar)", plan.get("user_request") or "", re.I)
+            m_dr = re.search(r"depends[_-]?runner\s*=\s*(auto|dv8|jar|understand)", plan.get("user_request") or "", re.I)
             if m_dr:
                 depends_runner = m_dr.group(1).strip()
+        # Keyword detection: "with understand", "use understand" → Understand runner
+        if not depends_runner:
+            ur_lower = (plan.get("user_request") or "").lower()
+            if "understand" in ur_lower:
+                depends_runner = "understand"
+                print(f"[plan] Understand runner detected from prompt keyword.")
+        # Language keyword detection for C#/TypeScript → auto-select Understand
+        if not lang_hint:
+            ur_lower = (plan.get("user_request") or "").lower()
+            if any(k in ur_lower for k in ("c#", "csharp", "dotnet", ".net", "asp.net")):
+                lang_hint = "csharp"
+                if not depends_runner:
+                    depends_runner = "understand"
+            elif "typescript" in ur_lower and "java" not in ur_lower:
+                lang_hint = "typescript"
+                if not depends_runner:
+                    depends_runner = "understand"
         if not java_depends:
             m_jd = re.search(r"java[_-]?depends\s*=\s*(true|false)", plan.get("user_request") or "", re.I)
             if m_jd:
@@ -1379,14 +2231,10 @@ def tool_temporal_analysis(plan: dict) -> int:
         if "java" in ur and "python" not in ur:
             lang_hint = "java"
 
-        # Auto-pull NeoDepends production branch when Python analysis is requested
-        # and no explicit neodepends_bin was provided.
-        # Triggered by: "python" or "neodepends" in the prompt.
-        if not neodepends_bin and any(kw in ur for kw in ("python", "neodepends")):
-            pulled_bin = _ensure_neodepends()
-            if pulled_bin:
-                neodepends_bin = pulled_bin
-                print(f"[neodepends] Auto-configured: {neodepends_bin}")
+        # Keep local NeoDepends clone fresh when Python analysis is requested.
+        # dv8_agent.py handles full discovery (local → GitHub clone → release download).
+        if any(kw in ur for kw in ("python", "neodepends")):
+            _update_neodepends_if_local()
 
         # Scope hints
         if any(k in ur for k in ["both scopes", "scope both", "full and prod", "prod and full"]):
@@ -1446,6 +2294,14 @@ def tool_temporal_analysis(plan: dict) -> int:
             cmd += ["--neodepends-resolver", str(neodepends_resolver)]
         if depends_runner:
             cmd += ["--depends-runner", str(depends_runner)]
+        if understand_und:
+            cmd += ["--understand-und", str(understand_und)]
+        if understand_upython:
+            cmd += ["--understand-upython", str(understand_upython)]
+        if understand_language:
+            cmd += ["--understand-language", understand_language]
+        if understand_granularity and understand_granularity != "entity":
+            cmd += ["--understand-granularity", understand_granularity]
         if java_depends:
             cmd += ["--java-depends"]
         if force_depends:
@@ -1618,6 +2474,7 @@ def tool_temporal_analysis(plan: dict) -> int:
             auto_interpret = (not analyze_only) and (
                 plan_question  # always interpret when a question was explicitly provided
                 or (ur and any(k in ur.lower() for k in [' interpret', 'then interpret', 'and interpret', ' explain why']))
+                or plan.get("auto_refactor", False)  # refactoring requires interpretation first
             )
 
             if auto_interpret:
@@ -1663,6 +2520,9 @@ def tool_temporal_analysis(plan: dict) -> int:
                     "model": interpret_model,
                     # Pass the (possibly question-injected) user_request so the Q&A step fires
                     "user_request": ur or plan.get("user_request") or "",
+                    "auto_refactor": plan.get("auto_refactor", False),
+                    "refactor_model": plan.get("refactor_model") or "qwen3-coder-30b-refactor",
+                    "refactor_loop_count": plan.get("refactor_loop_count", 0),
                 })
             else:
                 print("No further action.")
@@ -2090,6 +2950,10 @@ def run_tool(plan: dict, user_request: str) -> int:
         p['user_request'] = user_request
         return tool_temporal_analysis(p)
 
+    elif tool == "analyze_and_refactor_single":
+        print("Tool: Single-Revision Analyze + Auto-Refactor\n")
+        return tool_analyze_and_refactor_single(plan)
+
     elif tool == "interpret_metrics":
         print("Tool: Interpret Metric Changes\n")
         # Attach original request so model inference can detect desired LLM
@@ -2132,7 +2996,13 @@ def main():
     temporal_root_override = None
     model_override = None
 
-    # Extract --temporal-root and --model flags
+    # Extract --temporal-root, --model, --stage4-only, --auto, --refactor-model, --repo, --commit flags
+    stage4_only_path = None
+    auto_refactor = False
+    refactor_model_override = None
+    repo_override = None
+    commit_override = None
+    force_reinterpret = False
     filtered_args = []
     i = 0
     while i < len(args):
@@ -2142,16 +3012,47 @@ def main():
         elif args[i] == "--model" and i + 1 < len(args):
             model_override = args[i + 1]
             i += 2
+        elif args[i] == "--stage4-only" and i + 1 < len(args):
+            stage4_only_path = args[i + 1]
+            i += 2
+        elif args[i] == "--auto":
+            auto_refactor = True
+            i += 1
+        elif args[i] == "--refactor-model" and i + 1 < len(args):
+            refactor_model_override = args[i + 1]
+            i += 2
+        elif args[i] == "--repo" and i + 1 < len(args):
+            repo_override = args[i + 1]
+            i += 2
+        elif args[i] == "--commit" and i + 1 < len(args):
+            commit_override = args[i + 1]
+            i += 2
+        elif args[i] == "--reinterpret":
+            force_reinterpret = True
+            i += 1
         else:
             filtered_args.append(args[i])
             i += 1
+
+    # Standalone Stage 4 test: skip full pipeline, just refactor + re-analyse
+    if stage4_only_path:
+        tr = pathlib.Path(stage4_only_path).expanduser().resolve()
+        if not tr.is_dir():
+            print(f"[stage4-only] Path not found: {tr}")
+            sys.exit(1)
+        sys.exit(_run_refactor_stage(tr, conversation=[], model=refactor_model_override or "qwen3-coder-30b-refactor"))
 
     if len(filtered_args) < 1 and not temporal_root_override:
         print('Usage: python LLM_frontend_upgraded.py "your request"')
         print('')
         print('Options:')
         print('  --temporal-root <path>  Explicit temporal analysis folder (skips glob discovery)')
-        print('  --model <model>         LLM model for interpretation (default: deepseek-r1:32b)')
+        print('  --model <model>         LLM model for Q1/Q2 interpretation (default: deepseek-r1:32b)')
+        print('  --refactor-model <m>    LLM model for Stage 4 refactoring (default: qwen3.6:latest)')
+        print('  --stage4-only <path>    Run Stage 4 (qwen3 refactor + re-analysis) on existing temporal folder')
+        print('  --auto                  Full pipeline: Q1 -> Q2 -> Stage 4 without human input')
+        print('  --repo <url|path>       Repository URL or local path (for single-revision mode)')
+        print('  --commit <hash>         Specific commit hash to analyze (default: HEAD/latest)')
         print('')
         print('Examples:')
         print('  "Analyze pdfbox and explain the results"')
@@ -2169,6 +3070,28 @@ def main():
     # If --temporal-root provided without a request, default to "interpret"
     user_req = filtered_args[0] if filtered_args else "interpret"
 
+    # Detect "automated refactoring" intent from the request text
+    _AUTO_KEYWORDS = ["automated refactoring", "auto refactor", "full pipeline",
+                      "end to end", "end-to-end", "fully automated", "no human input"]
+    if not auto_refactor and any(k in user_req.lower() for k in _AUTO_KEYWORDS):
+        auto_refactor = True
+
+    # Detect loop mode: "loop refactoring N", "loop N", "action loop N", "loop most important action N"
+    # Default: "automated refactoring" without explicit N → 3 loop iterations
+    import re as _re_loop
+    _loop_match = _re_loop.search(
+        r'(?:loop\s+(?:refactoring|refactor|most\s+important\s+action\s*|action\s+)?|action\s+loop\s+)(\d+)',
+        user_req.lower()
+    )
+    refactor_loop_count = int(_loop_match.group(1)) if _loop_match else 0
+    if refactor_loop_count > 0:
+        auto_refactor = True
+        print(f"[main] Loop refactoring mode: {refactor_loop_count} iterations (re-analyze + 1 action each loop)")
+    elif auto_refactor and refactor_loop_count == 0:
+        # Default: automated refactoring always uses loop mode with 3 iterations
+        refactor_loop_count = 3
+        print(f"[main] Auto-refactor mode: defaulting to loop mode ({refactor_loop_count} iterations)")
+
     # Handle direct interpretation with --temporal-root
     if temporal_root_override:
         print(f"\nDirect interpretation mode")
@@ -2177,11 +3100,53 @@ def main():
         rc = tool_interpret_temporal({
             "repo": temporal_root_override,
             "model": model_override or "deepseek-r1:32b",
-            "user_request": user_req
+            "user_request": user_req,
+            "auto_refactor": auto_refactor,
+            "refactor_model": refactor_model_override or "qwen3-coder-30b-refactor",
+            "refactor_loop_count": refactor_loop_count,
+            "force_reinterpret": force_reinterpret,
         })
         sys.exit(rc)
 
     print(f"\nYou asked: {user_req}\n")
+
+    # ── Fast-path: single-revision auto-refactor (godclass only / single revision) ──
+    # Triggers on keywords OR an explicit --repo flag.
+    # Also triggers when the request contains a git URL + commit hash inline.
+    import re as _re_single
+    # Extract GitHub URL from request text (strip /tree/branch suffix to get bare repo URL)
+    _url_match = _re_single.search(r'(https?://github\.com/[^\s/]+/[^\s/]+)(?:/tree/[^\s]*)?', user_req)
+    _extracted_url = _url_match.group(1) if _url_match else None
+    # Extract 40-char hex commit hash from request text
+    _hash_match = _re_single.search(r'\b([0-9a-f]{40})\b', user_req)
+    _extracted_hash = _hash_match.group(1) if _hash_match else None
+
+    _SINGLE_REV_KEYWORDS = ["godclass only", "single revision", "single commit",
+                             "first commit", "first revision", "single commit in the repo",
+                             "commit hash"]
+    _single_rev_trigger = (
+        any(k in user_req.lower() for k in _SINGLE_REV_KEYWORDS)
+        or repo_override
+        or (_extracted_url and _extracted_hash)
+    )
+    if auto_refactor and _single_rev_trigger:
+        # Detect language (no regex — avoid capturing stop-words like "and")
+        _lang = "java" if "java" in user_req.lower() else "python"
+        # Auto-resolve known toy snapshots as last fallback
+        _snapshot_key = (_lang, "godclass") if any(k in user_req.lower() for k in ["godclass", "first commit", "first revision"]) else None
+        _toy_repo, _toy_commit = _TOY_SNAPSHOTS.get(_snapshot_key, (None, None)) if _snapshot_key else (None, None)
+        _fast_plan = {
+            "tool": "analyze_and_refactor_single",
+            "repo": repo_override or _extracted_url or _toy_repo or "",
+            "commit": commit_override or _extracted_hash or _toy_commit,
+            "language": _lang,
+            "model": model_override or "deepseek-r1:32b",
+            "refactor_model": refactor_model_override or "qwen3-coder-30b-refactor",
+            "user_request": user_req,
+        }
+        print(f"Plan (single-revision auto-refactor): {json.dumps(_fast_plan, indent=2)}\n")
+        rc = run_tool(_fast_plan, user_req)
+        sys.exit(rc)
 
     # ── Fast-path: bypass Ollama planner for "query <repo>[model]: question" ──
     # Interactive: "query commons-io[32b]" with no colon/question → REPL session
@@ -2236,6 +3201,9 @@ def main():
             "branch": "trunk" if _repo_name.lower() == "pdfbox" else "main",
             "min_months_apart": _months,
             "model": _model_raw or model_override or "deepseek-r1:32b",
+            "auto_refactor": auto_refactor,
+            "refactor_model": refactor_model_override or "qwen3-coder-30b-refactor",
+            "refactor_loop_count": refactor_loop_count,
         }
         print(f"Plan (fast-path): {json.dumps(_fast_plan, indent=2)}\n")
         rc = run_tool(_fast_plan, user_req)
@@ -2274,6 +3242,9 @@ def main():
             "min_months_apart": _months,
             "model": _model_raw or model_override or "deepseek-r1:32b",
             "user_request": user_req,
+            "auto_refactor": auto_refactor,
+            "refactor_model": refactor_model_override or "qwen3-coder-30b-refactor",
+            "refactor_loop_count": refactor_loop_count,
         }
         if _mv is not None:
             _fast_plan["mv_cochange"] = _mv
@@ -2290,6 +3261,16 @@ def main():
         # model_override (--model flag) is a fallback: only apply if prompt/plan didn't specify one
         if model_override and not plan.get("model"):
             plan["model"] = model_override
+
+        # Always inject auto_refactor/refactor_model/refactor_loop_count so LLM-generated plans also get full automation
+        if auto_refactor and not plan.get("auto_refactor"):
+            plan["auto_refactor"] = True
+        if refactor_loop_count and not plan.get("refactor_loop_count"):
+            plan["refactor_loop_count"] = refactor_loop_count
+        if refactor_model_override and not plan.get("refactor_model"):
+            plan["refactor_model"] = refactor_model_override
+        elif not plan.get("refactor_model"):
+            plan["refactor_model"] = "qwen3-coder-30b-refactor"
 
         print(f"Plan: {json.dumps(plan, indent=2)}\n")
 
@@ -2340,6 +3321,9 @@ def main():
             if repo_guess:
                 p["repo"] = repo_guess
             p["user_request"] = user_req
+            p["auto_refactor"] = auto_refactor
+            p["refactor_model"] = refactor_model_override or "qwen3-coder-30b-refactor"
+            p["refactor_loop_count"] = refactor_loop_count
             rc = run_tool(p, user_req)
             sys.exit(rc)
 

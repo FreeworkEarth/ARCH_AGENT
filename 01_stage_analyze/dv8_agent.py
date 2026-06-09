@@ -140,11 +140,25 @@ def detect_language(source_root: Path, override: Optional[str] = None) -> str:
     if override:
         return override.lower()
     counts = {}
-    for ext in (".py", ".java"):
+    for ext in (".py", ".java", ".cs", ".ts"):
         counts[ext] = len(list(source_root.rglob(f"*{ext}")))
-    if counts[".py"] == 0 and counts[".java"] == 0:
+    py = counts[".py"]
+    java = counts[".java"]
+    cs = counts[".cs"]
+    ts = counts[".ts"]
+    if py == 0 and java == 0 and cs == 0 and ts == 0:
         return "unknown"
-    if counts[".py"] >= counts[".java"]:
+    # Mixed C# + TypeScript → route to Understand
+    if cs > 0 and ts > 0 and cs + ts > py and cs + ts > java:
+        return "mixed-cs-ts"
+    # Pure TypeScript
+    if ts > 0 and ts > py and ts > java and cs == 0:
+        return "typescript"
+    # Pure C#
+    if cs > 0 and cs > py and cs > java and ts == 0:
+        return "csharp"
+    # Python vs Java (existing logic)
+    if py >= java:
         return "python"
     return "java"
 
@@ -664,42 +678,89 @@ def _extract_archive(archive_path: Path, out_dir: Path) -> None:
 
 
 def _download_latest_neodepends_release(dest_root: Path) -> Optional[Path]:
+    """Download the latest NeoDepends release if it is newer than what is installed.
+
+    Always checks GitHub for the latest tag. Downloads and extracts only when
+    the remote version is newer than all locally cached bundles. Falls back to
+    the newest local bundle if the network check fails.
+    """
+    # --- Check GitHub for the latest release ---
     try:
-        data = _http_json(NEODEPENDS_RELEASE_API)
+        req = urllib.request.Request(NEODEPENDS_RELEASE_API, headers={"User-Agent": "dv8-agent/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
     except Exception as e:
         print(f"NeoDepends release lookup failed: {e}")
-        return None
-    assets = data.get("assets") or []
-    if not assets:
-        return None
-    tag = _neodepends_platform_tag()
+        data = None
+
+    remote_version: Tuple[int, ...] = (0,)
     chosen = None
-    for a in assets:
-        name = (a.get("name") or "")
-        if tag and tag in name:
-            chosen = a
-            break
+    if data:
+        assets = data.get("assets") or []
+        tag_name = data.get("tag_name") or ""
+        remote_version = _parse_neodepends_version(tag_name)
+        platform_tag = _neodepends_platform_tag()
+        for a in assets:
+            aname = a.get("name") or ""
+            if platform_tag and platform_tag in aname:
+                chosen = a
+                break
+        if not chosen and assets:
+            chosen = assets[0]
+
+    # --- Find the newest locally installed bundle ---
+    local_bundles: list[Path] = []
+    if dest_root.exists():
+        for entry in dest_root.iterdir():
+            if entry.is_dir() and entry.name.strip().startswith("neodepends-v"):
+                local_bundles.append(entry)
+    if local_bundles:
+        local_bundles.sort(key=lambda p: _parse_neodepends_version(p.name), reverse=True)
+        newest_local = local_bundles[0]
+        local_version = _parse_neodepends_version(newest_local.name)
+    else:
+        newest_local = None
+        local_version = (0,)
+
+    # --- Skip download if already up-to-date ---
+    if newest_local and remote_version <= local_version:
+        return newest_local
+
+    # --- Download and extract ---
     if not chosen:
-        chosen = assets[0]
+        # No network data and no local bundle
+        return newest_local
     url = chosen.get("browser_download_url")
-    name = chosen.get("name") or "neodepends_release"
+    archive_name = chosen.get("name") or "neodepends_release"
     if not url:
-        return None
+        return newest_local
     downloads = CONFIG_HOME / "downloads"
-    archive_path = downloads / name
+    archive_path = downloads / archive_name
     if not archive_path.exists():
-        print(f"Downloading NeoDepends release: {url}")
-        _download_file(url, archive_path)
-    extract_dir = dest_root / f"{archive_path.stem}"
+        print(f"[neodepends] Downloading latest release ({data.get('tag_name', '')}): {url}")
+        try:
+            _download_file(url, archive_path)
+        except Exception as e:
+            print(f"[neodepends] Download failed: {e}")
+            return newest_local
+    # Strip double extension for .tar.gz (pathlib .stem only strips the last one)
+    stem = archive_path.stem
+    if stem.endswith(".tar"):
+        stem = stem[:-4]
+    extract_dir = dest_root / stem
     if not extract_dir.exists():
-        _extract_archive(archive_path, dest_root)
-    # If archive extracted into a nested folder, try to locate it
+        try:
+            _extract_archive(archive_path, dest_root)
+        except Exception as e:
+            print(f"[neodepends] Extraction failed: {e}")
+            return newest_local
     if extract_dir.exists():
+        print(f"[neodepends] Using release {data.get('tag_name', '')} at {extract_dir}")
         return extract_dir
-    # fallback: pick newest directory
+    # Fallback: return newest dir after extraction
     dirs = [p for p in dest_root.iterdir() if p.is_dir()]
     if not dirs:
-        return None
+        return newest_local
     dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return dirs[0]
 
@@ -728,13 +789,28 @@ def resolve_neodepends_root(explicit: Optional[str], source_pref: str = "auto") 
         if p.exists():
             return p
 
-    base = Path(__file__).resolve().parent.parent / "00_CORE" / "NEODEPENDS_DEICIDE" / "00_NEODEPENDS"
-    if base.exists():
-        # Prefer local source repo for the Python tools (binary can come from a release bundle).
+    # Always check GitHub for a newer release binary and download it to ~/.dv8_agent/neodepends/.
+    # This runs unconditionally so the newest binary is always available for resolve_neodepends_bin,
+    # even when a local source repo is found below (source repo provides tools/, release provides binary).
+    source_pref = (os.environ.get("NEODEPENDS_SOURCE") or source_pref or "auto").lower()
+    dest_root = CONFIG_HOME / "neodepends"
+    dest_root.mkdir(parents=True, exist_ok=True)
+    if source_pref in {"release", "auto"}:
+        _download_latest_neodepends_release(dest_root)  # side-effect: updates ~/.dv8_agent/neodepends/
+
+    repo_root = Path(__file__).resolve().parents[2]
+    base_candidates = [
+        Path(__file__).resolve().parent.parent / "00_CORE" / "NEODEPENDS_DEICIDE" / "00_NEODEPENDS",
+        repo_root / "TEST_AUTO" / "00_CORE" / "NEODEPENDS_DEICIDE" / "00_NEODEPENDS",
+    ]
+    for base in base_candidates:
+        if not base.exists():
+            continue
+        # Prefer local source repo for the Python tools (binary comes from release bundle via resolve_neodepends_bin).
         src = base / "neodepends"
         if src.exists() and (src / "tools" / "neodepends_python_export.py").is_file():
             return src
-        # prefer newest local release bundle
+        # Fall back to newest local release bundle in this base
         candidates = []
         for entry in base.iterdir():
             if not entry.is_dir():
@@ -746,23 +822,28 @@ def resolve_neodepends_root(explicit: Optional[str], source_pref: str = "auto") 
             candidates.sort(key=lambda p: _parse_neodepends_version(p.name), reverse=True)
             return candidates[0]
 
-    # Fallback: fetch or clone (requires network)
-    source_pref = (os.environ.get("NEODEPENDS_SOURCE") or source_pref or "auto").lower()
-    dest_root = CONFIG_HOME / "neodepends"
-    dest_root.mkdir(parents=True, exist_ok=True)
+    # Fallback: clone repo for tools/ (binary already downloaded above)
     if source_pref in {"repo", "auto"}:
         repo_dir = _clone_neodepends_repo(dest_root)
-        if repo_dir and resolve_neodepends_bin(repo_dir, None).is_file():
+        if repo_dir and (repo_dir / "tools" / "neodepends_python_export.py").is_file():
             return repo_dir
-    if source_pref in {"release", "auto"}:
-        rel_dir = _download_latest_neodepends_release(dest_root)
-        if rel_dir:
-            return rel_dir
+    # Last resort: return the downloaded release dir (has binary but no tools/)
+    dirs = [p for p in dest_root.iterdir() if p.is_dir() and p.name.startswith("neodepends-v")]
+    if dirs:
+        dirs.sort(key=lambda p: _parse_neodepends_version(p.name), reverse=True)
+        return dirs[0]
     return None
 
 
 def resolve_neodepends_bin(neodepends_root: Path, explicit_bin: Optional[str]) -> Path:
-    """Resolve the NeoDepends executable path."""
+    """Resolve the NeoDepends executable path.
+
+    Priority order:
+    1. Explicit path or NEODEPENDS_BIN env var
+    2. neodepends_root itself is a release bundle (has bin/neodepends-core)
+    3. Global release bundle scan (newest version across all known locations) — BEFORE source build
+    4. Source build in neodepends_root (last resort — may be old/incompatible)
+    """
     if explicit_bin:
         p = Path(explicit_bin).expanduser().resolve()
         if p.exists():
@@ -774,39 +855,45 @@ def resolve_neodepends_bin(neodepends_root: Path, explicit_bin: Optional[str]) -
             return p
 
     platform_tag = _neodepends_platform_tag()
-    candidates: list[Path] = [
-        # Older release layout (binary at repo/bundle root)
+
+    # Check if neodepends_root itself is a release bundle
+    for cand in [
         neodepends_root / "neodepends",
-        # Newer release layout (bin/neodepends-core)
         neodepends_root / "bin" / "neodepends-core",
         neodepends_root / "bin" / "neodepends",
-        # Source build layouts
-        neodepends_root / "target" / "release" / "neodepends",
-        neodepends_root / "target" / platform_tag / "release" / "neodepends",
-    ]
-    for cand in candidates:
+    ]:
         if cand.is_file():
             return cand
 
-    # If we're pointing at the source repo but no binary is built, try a local release bundle.
-    base = Path(__file__).resolve().parent.parent / "00_CORE" / "NEODEPENDS_DEICIDE" / "00_NEODEPENDS"
-    if base.exists():
-        releases: list[Path] = []
+    # Scan all known release bundle locations and pick the globally newest version.
+    # This runs BEFORE source build so the latest downloaded release always beats
+    # an old compiled binary (e.g. target/release/neodepends v0.0.13).
+    release_bases = [
+        CONFIG_HOME / "neodepends",  # ~/.dv8_agent/neodepends/ — downloaded releases
+        Path(__file__).resolve().parents[2] / "TEST_AUTO" / "00_CORE" / "NEODEPENDS_DEICIDE" / "00_NEODEPENDS",
+        Path(__file__).resolve().parent.parent / "00_CORE" / "NEODEPENDS_DEICIDE" / "00_NEODEPENDS",
+    ]
+    all_releases: list[Path] = []
+    for base in release_bases:
+        if not base.exists():
+            continue
         for entry in base.iterdir():
-            if not entry.is_dir():
-                continue
-            if entry.name.strip().startswith("neodepends-v"):
-                releases.append(entry)
-        if releases:
-            releases.sort(key=lambda p: _parse_neodepends_version(p.name), reverse=True)
-            rel_root = releases[0]
-            for cand in [
-                rel_root / "neodepends",
-                rel_root / "bin" / "neodepends-core",
-                rel_root / "bin" / "neodepends",
-            ]:
+            if entry.is_dir() and entry.name.strip().startswith("neodepends-v"):
+                all_releases.append(entry)
+    if all_releases:
+        all_releases.sort(key=lambda p: _parse_neodepends_version(p.name), reverse=True)
+        for rel_root in all_releases:
+            for cand in [rel_root / "neodepends", rel_root / "bin" / "neodepends-core", rel_root / "bin" / "neodepends"]:
                 if cand.is_file():
                     return cand
+
+    # Last resort: source build (may be old / incompatible with current tools/)
+    for cand in [
+        neodepends_root / "target" / "release" / "neodepends",
+        neodepends_root / "target" / platform_tag / "release" / "neodepends",
+    ]:
+        if cand.is_file():
+            return cand
 
     # Return the most likely path for better error messages upstream.
     return neodepends_root / "bin" / "neodepends-core"
@@ -882,29 +969,38 @@ def run_neodepends_python_export(
     if res.returncode != 0:
         raise SystemExit(f"NeoDepends export failed ({res.returncode})")
     dep_path = output_dir / "dependencies.full.dv8-dependency.json"
+    def copy_candidate(candidate: Path) -> Path:
+        try:
+            shutil.copyfile(candidate, dep_path)
+            return dep_path
+        except OSError:
+            return candidate
+
+    def looks_like_dv8_dependency_json(candidate: Path) -> bool:
+        try:
+            data = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        return isinstance(data.get("variables"), list) and isinstance(data.get("cells"), list)
+
     # Prefer a file-level DSM (more comparable to Java file-based Depends),
     # even if a previous run already created dependencies.full.*.
     if file_level:
-        file_level_candidates = sorted((output_dir / "details").glob("dependencies.*.file.dv8-dsm-v3.json"))
-        if file_level_candidates:
-            try:
-                shutil.copyfile(file_level_candidates[0], dep_path)
-                return dep_path
-            except OSError:
-                return file_level_candidates[0]
+        for base in (output_dir / "details", output_dir / "data", output_dir):
+            for pattern in ("dependencies.*.file.dv8-dsm-v3.json", "dependencies.*.raw_filtered_file.dv8-dsm-v3.json"):
+                file_level_candidates = sorted(base.glob(pattern))
+                if file_level_candidates:
+                    return copy_candidate(file_level_candidates[0])
     if dep_path.is_file():
         return dep_path
     # Next: filtered DSM file that NeoDepends produces for Python.
-    filtered = sorted(output_dir.glob("dependencies.*.filtered.dv8-dsm-v3.json"))
-    if filtered:
-        try:
-            shutil.copyfile(filtered[0], dep_path)
-            return dep_path
-        except OSError:
-            return filtered[0]
+    for base in (output_dir, output_dir / "data", output_dir / "details"):
+        filtered = sorted(base.glob("dependencies.*.filtered.dv8-dsm-v3.json"))
+        if filtered:
+            return copy_candidate(filtered[0])
     # Broader fallback: NeoDepends may emit other DV8 JSONs.
     fallback = None
-    for base in (output_dir, output_dir / "details"):
+    for base in (output_dir, output_dir / "data", output_dir / "details"):
         for pattern in ("dependencies.*.dv8-dependency.json", "dependencies.*.dv8-dsm-v3.json"):
             matches = sorted(base.glob(pattern))
             if matches:
@@ -913,11 +1009,10 @@ def run_neodepends_python_export(
         if fallback:
             break
     if fallback:
-        try:
-            shutil.copyfile(fallback, dep_path)
-            return dep_path
-        except OSError:
-            return fallback
+        return copy_candidate(fallback)
+    analysis_result = output_dir / "analysis-result.json"
+    if analysis_result.is_file() and looks_like_dv8_dependency_json(analysis_result):
+        return copy_candidate(analysis_result)
     raise SystemExit(f"NeoDepends export did not produce: {dep_path}")
 
 def mask_token(token: str) -> str:
@@ -1032,6 +1127,175 @@ def resolve_depends_jar(explicit: Optional[str]) -> Path:
     # give up and ask user to point us to the jar
     raise SystemExit("Unable to locate depends.jar after extraction. Provide --depends-jar explicitly.")
 
+
+def resolve_understand_tools(
+    und_explicit: Optional[str] = None,
+    upython_explicit: Optional[str] = None,
+) -> tuple[Path, Path]:
+    """Resolve SciTools Understand command-line tools.
+
+    We assume licensing is already configured in the local Understand install.
+    The pipeline never prompts for, stores, or manages Understand license data.
+    """
+    und_candidates: list[Path] = []
+    upython_candidates: list[Path] = []
+
+    if und_explicit:
+        und_candidates.append(Path(und_explicit).expanduser())
+    if os.environ.get("UNDERSTAND_UND"):
+        und_candidates.append(Path(os.environ["UNDERSTAND_UND"]).expanduser())
+    if os.environ.get("UNDERSTAND_HOME"):
+        home = Path(os.environ["UNDERSTAND_HOME"]).expanduser()
+        und_candidates.extend([home / "und", home / "bin" / "und"])
+    und_candidates.append(Path("/Applications/Understand.app/Contents/MacOS/und"))
+
+    und_bin = None
+    for cand in und_candidates:
+        cand = cand.resolve()
+        if cand.is_file() and os.access(cand, os.X_OK):
+            und_bin = cand
+            break
+    if und_bin is None:
+        raise SystemExit(
+            "SciTools Understand 'und' not found. Set --understand-und or UNDERSTAND_UND. "
+            "On macOS the usual path is /Applications/Understand.app/Contents/MacOS/und."
+        )
+
+    if upython_explicit:
+        upython_candidates.append(Path(upython_explicit).expanduser())
+    if os.environ.get("UNDERSTAND_UPYTHON"):
+        upython_candidates.append(Path(os.environ["UNDERSTAND_UPYTHON"]).expanduser())
+    upython_candidates.append(und_bin.parent / "upython")
+    upython_candidates.append(Path("/Applications/Understand.app/Contents/MacOS/upython"))
+
+    upython_bin = None
+    for cand in upython_candidates:
+        cand = cand.resolve()
+        if cand.is_file() and os.access(cand, os.X_OK):
+            upython_bin = cand
+            break
+    if upython_bin is None:
+        raise SystemExit(
+            "SciTools Understand 'upython' not found. Set --understand-upython or UNDERSTAND_UPYTHON."
+        )
+
+    return und_bin, upython_bin
+
+
+def understand_language_name(detected_language: str, override: Optional[str] = None) -> str:
+    """Map our language labels to Understand's command-line language names."""
+    if override:
+        return override
+    mapping = {
+        "java": "Java",
+        "python": "Python",
+        "javascript": "Web",
+        "typescript": "Web",
+        "c": "C",
+        "cpp": "C++",
+        "c++": "C++",
+        "csharp": "C#",
+        "c#": "C#",
+        "mixed-cs-ts": "C# Web",  # Understand groups JS+TS under "Web"
+    }
+    return mapping.get((detected_language or "").lower(), "Java")
+
+
+def run_understand_export(
+    source_root: Path,
+    output_dir: Path,
+    project_name: str,
+    language: str,
+    *,
+    und_bin: Optional[str] = None,
+    upython_bin: Optional[str] = None,
+    granularity: str = "entity",
+    force: bool = False,
+    logs: list | None = None,
+) -> Path:
+    """Run Understand and export dependencies as DV8-style JSON."""
+    ensure_dirs(output_dir)
+    json_dep = output_dir / "dependencies.full.dv8-dependency.json"
+    if json_dep.is_file() and not force:
+        print("Reusing existing Understand dependency output (use --force-depends to regenerate).")
+        return json_dep
+
+    und, upython = resolve_understand_tools(und_bin, upython_bin)
+
+    # Understand's upython crashes (SIGABRT / stack overflow) when the .und path is too long.
+    # Use a short temp directory for the .und database regardless of where output_dir lives.
+    import tempfile as _tempfile
+    _und_tmp = _tempfile.mkdtemp(prefix="und_")
+    und_db = Path(_und_tmp) / f"{re.sub(r'[^A-Za-z0-9._-]+', '_', project_name[:20]).strip('_') or 'repo'}.und"
+
+    # upython crashes (SIGABRT) when ANY argument path exceeds ~300 chars.
+    # Symlink the source root to a short path if needed.
+    import os as _os
+    _src_str = str(source_root)
+    if len(_src_str) > 200:
+        _src_link = Path(_und_tmp) / "src"
+        _os.symlink(_src_str, str(_src_link))
+        _short_source_root = _src_link
+    else:
+        _short_source_root = source_root
+
+    try:
+        steps = [
+            # Support multi-language: "C# Web" → ["-languages", "C#", "-languages", "Web"]
+            ("understand:create", [und, "create", "-db", str(und_db)]
+             + [arg for lang in language.split() for arg in ("-languages", lang)]),
+            ("understand:add", [und, "add", str(_short_source_root), str(und_db)]),
+            ("understand:analyze", [und, "analyze", str(und_db)]),
+        ]
+        for step, cmd in steps:
+            res = run(cmd, check=False)
+            if logs is not None:
+                logs.append({
+                    "step": step,
+                    "cmd": ' '.join(str(x) for x in cmd),
+                    "rc": res.returncode,
+                    "stdout": res.stdout,
+                    "stderr": res.stderr,
+                })
+            if res.returncode != 0:
+                raise SystemExit(
+                    f"{step} failed ({res.returncode}). Confirm Understand is installed and licensed."
+                )
+
+        exporter = Path(__file__).resolve().parent / "understand_dependency_export.py"
+        # project_name may contain spaces — sanitize so argparse receives it as one token
+        safe_project_name = re.sub(r'[^A-Za-z0-9._-]+', '_', project_name).strip('_') or 'repo'
+        # Write JSON to the short temp dir first, then copy to the final destination.
+        tmp_json = Path(_und_tmp) / "deps.json"
+        cmd = [
+            upython,
+            exporter,
+            "--und-db", und_db,
+            "--source-root", _short_source_root,
+            "--output", tmp_json,
+            "--project-name", safe_project_name,
+            "--granularity", granularity,
+        ]
+        clean_env = {k: v for k, v in _os.environ.items()
+                     if k not in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV", "PYTHONEXECUTABLE")}
+        res = run(cmd, check=False, env=clean_env)
+        if logs is not None:
+            logs.append({
+                "step": "understand:export-dependencies",
+                "cmd": ' '.join(str(x) for x in cmd),
+                "rc": res.returncode,
+                "stdout": res.stdout,
+                "stderr": res.stderr,
+            })
+        if res.returncode != 0 or not tmp_json.is_file():
+            raise SystemExit(f"Understand dependency export failed ({res.returncode})")
+        ensure_dirs(output_dir)
+        shutil.copy2(tmp_json, json_dep)
+        return json_dep
+    finally:
+        shutil.rmtree(_und_tmp, ignore_errors=True)
+
+
 def extract_zip_archive(archive_path: Path, dest_root: Path) -> Path:
     # unzip an archive and guess the extracted root folder
     ensure_dirs(dest_root)
@@ -1088,11 +1352,11 @@ def obtain_zip_repo(repo_reference: str, workspace: Path) -> Path:
 def query_dv8_license_status(dv8_console: Path, env: dict[str, str]) -> Optional[dict]:
     # ask dv8-console about license status; parse JSON if returned
     result = run([dv8_console, "license:status"], env=env, check=False)
-    if result.returncode != 0:
-        return None
     try:
         return json.loads(result.stdout.strip())
     except json.JSONDecodeError:
+        if result.returncode != 0:
+            return None
         return None
 
 def ensure_dv8_license(
@@ -1236,6 +1500,22 @@ def clone_or_copy(repo: str, workspace: Path, branch: Optional[str]) -> Path:
         # explicit message; caller may switch to interactive prompt
         raise SystemExit(f"Repository path not found: {path}")
     return path
+
+def analysis_root_for_single_run(repo_root: Path, workspace: Path) -> Path:
+    """Keep generated single-run artifacts out of local source datasets."""
+    try:
+        repo_root.relative_to(workspace)
+        return repo_root
+    except ValueError:
+        parts = []
+        parent_names = {p.name.lower() for p in repo_root.parents}
+        if "000_toy_examples" in parent_names or "arch_analysis_trainticket_toy_examples_multilang" in parent_names:
+            parts.append("toy")
+        if repo_root.parent.name.lower() in {"java", "python"}:
+            parts.append(repo_root.parent.name.lower())
+        parts.append(repo_root.name)
+        analysis_name = "_".join(parts)
+        return workspace / analysis_name / "single_analysis"
 
 # alias for Optional to keep annotations concise below
 from typing import Optional as _Optional
@@ -2268,6 +2548,11 @@ def analyze_single_revision(
     neodepends_bin: Optional[str] = None,
     neodepends_resolver: str = "stackgraphs",
     java_depends: bool = False,
+    depends_runner: str = "dv8",
+    understand_und: Optional[str] = None,
+    understand_upython: Optional[str] = None,
+    understand_language: Optional[str] = None,
+    understand_granularity: str = "entity",
     mv_cochange: int | None = None,
 ) -> Dict[str, Any]:
     """Run complete DV8 analysis pipeline on a single revision. Returns metrics dict."""
@@ -2321,39 +2606,64 @@ def analyze_single_revision(
             source_root = scoped
         json_dep: Path
         mapping: _Optional[Path] = None
-        use_neodepends = lang in {"python", "java"} and not (lang == "java" and java_depends)
-        if use_neodepends:
-            nd_root = resolve_neodepends_root(neodepends_root)
-            if nd_root:
-                if lang == "java":
-                    print("  Java source detected. Using NeoDepends for dependency extraction.")
+        # Auto-select Understand for C#/TypeScript languages (no other extractor supports them)
+        if depends_runner != "understand" and lang in ("csharp", "typescript", "mixed-cs-ts"):
+            depends_runner = "understand"
+            print(f"  [deps] Auto-selecting Understand for {lang} source.")
+        if depends_runner == "understand":
+            understand_output = input_data / "UnderstandOutput"
+            print(
+                "  Using SciTools Understand for dependency extraction "
+                f"({understand_language_name(lang, understand_language)})."
+            )
+            json_dep = run_understand_export(
+                source_root=source_root,
+                output_dir=understand_output,
+                project_name=project_name,
+                language=understand_language_name(lang, understand_language),
+                und_bin=understand_und,
+                upython_bin=understand_upython,
+                granularity=understand_granularity,
+                logs=step_logs,
+            )
+            mapping = None
+        else:
+            use_neodepends = lang in {"python", "java"} and not (lang == "java" and java_depends)
+            if use_neodepends:
+                nd_root = resolve_neodepends_root(neodepends_root)
+                if nd_root:
+                    if lang == "java":
+                        print("  Java source detected. Using NeoDepends for dependency extraction.")
+                    else:
+                        print("  Python source detected. Using NeoDepends for dependency extraction.")
+                    json_dep = run_neodepends_python_export(
+                        source_root=source_root,
+                        output_dir=neodepends_output,
+                        neodepends_root=nd_root,
+                        neodepends_bin=neodepends_bin,
+                        resolver=neodepends_resolver,
+                        config="default",
+                        langs=lang,
+                        logs=step_logs,
+                    )
+                elif lang == "java":
+                    print("  NeoDepends not available for Java. Falling back to DV8 Depends.")
+                    json_dep, mapping = run_depends_via_dv8(
+                        dv8_console, source_root, depends_output, basename, env, logs=step_logs
+                    )
                 else:
-                    print("  Python source detected. Using NeoDepends for dependency extraction.")
-                json_dep = run_neodepends_python_export(
-                    source_root=source_root,
-                    output_dir=neodepends_output,
-                    neodepends_root=nd_root,
-                    neodepends_bin=neodepends_bin,
-                    resolver=neodepends_resolver,
-                    config="default",
-                    langs=lang,
-                    logs=step_logs,
-                )
-            elif lang == "java":
-                print("  NeoDepends not available for Java. Falling back to DV8 Depends.")
+                    raise SystemExit("NeoDepends root not found. Set --neodepends-root or NEODEPENDS_ROOT.")
+            else:
                 json_dep, mapping = run_depends_via_dv8(
                     dv8_console, source_root, depends_output, basename, env, logs=step_logs
                 )
-            else:
-                raise SystemExit("NeoDepends root not found. Set --neodepends-root or NEODEPENDS_ROOT.")
-        else:
-            json_dep, mapping = run_depends_via_dv8(
-                dv8_console, source_root, depends_output, basename, env, logs=step_logs
-            )
 
         # Step 2: Convert to DSM
         dsm_path = output_data / "repo.dv8-dsm"
         convert_to_dsm(dv8_console, json_dep, mapping, dsm_path, env, logs=step_logs)
+        if not dsm_path.is_file():
+            raise SystemExit(f"core:convert-matrix exited 0 but did not produce {dsm_path}. "
+                             "Try --understand-granularity file if using Understand.")
 
         # Step 2b: Build history DSM from git log and merge it with the structural DSM
         history_log_path = history_output / "git-history.txt"
@@ -2627,6 +2937,11 @@ def run_temporal_analysis(
     neodepends_bin: Optional[str] = None,
     neodepends_resolver: str = "stackgraphs",
     java_depends: bool = False,
+    depends_runner: str = "dv8",
+    understand_und: Optional[str] = None,
+    understand_upython: Optional[str] = None,
+    understand_language: Optional[str] = None,
+    understand_granularity: str = "entity",
     analysis_tag: Optional[str] = None,
     intelligent: bool = False,
     min_months_apart: int = 0,
@@ -2784,6 +3099,11 @@ def run_temporal_analysis(
             neodepends_bin=neodepends_bin,
             neodepends_resolver=neodepends_resolver,
             java_depends=java_depends,
+            depends_runner=depends_runner,
+            understand_und=understand_und,
+            understand_upython=understand_upython,
+            understand_language=understand_language,
+            understand_granularity=understand_granularity,
             mv_cochange=mv_cochange,
         )
 
@@ -2885,11 +3205,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force-depends", action="store_true", help="Regenerate Depends output even if cached files exist.")
     parser.add_argument(
         "--depends-runner",
-        choices=["dv8", "jar", "auto"],
+        choices=["dv8", "jar", "understand", "auto"],
         default="dv8",
-        help="How to run dependency extraction: dv8 (built-in), jar (external depends.jar), or auto (try dv8 then jar).",
+        help="How to run dependency extraction: dv8 (built-in), jar (external depends.jar), understand (SciTools), or auto (try dv8 then jar).",
     )
-    parser.add_argument("--language", choices=["java", "python"], help="Override language detection (default: auto).")
+    parser.add_argument("--language", help="Override language detection: java, python, csharp, typescript, mixed-cs-ts (default: auto).")
+    parser.add_argument("--understand-und", help="Path to SciTools Understand und executable.")
+    parser.add_argument("--understand-upython", help="Path to SciTools Understand upython executable.")
+    parser.add_argument(
+        "--understand-language",
+        help="Understand language name, e.g. Java, Python, C++, JavaScript, TypeScript, C#.",
+    )
+    parser.add_argument(
+        "--understand-granularity",
+        choices=["entity", "file"],
+        default="entity",
+        help="Understand export granularity. Use entity for Depends-like full dependencies; file for file-only DSMs.",
+    )
     parser.add_argument("--neodepends-root", help="Path to NeoDepends root (release or repo; contains neodepends + tools/).")
     parser.add_argument("--neodepends-bin", help="Path to NeoDepends binary (optional).")
     parser.add_argument(
@@ -3003,7 +3335,7 @@ def main() -> None:
     # Only set JAVA_TOOL_OPTIONS if the tmp path has no spaces.
     if " " not in str(dv8_tmp):
         jvm_opts = env.get("JAVA_TOOL_OPTIONS", "")
-        extra_opts = f"-Djava.io.tmpdir={dv8_tmp} -Djna.tmpdir={dv8_tmp}"
+        extra_opts = f"-Xmx4g -Djava.io.tmpdir={dv8_tmp} -Djna.tmpdir={dv8_tmp}"
         env["JAVA_TOOL_OPTIONS"] = f"{jvm_opts} {extra_opts}".strip()
 
     # make sure DV8 license is active (prompts if needed)
@@ -3061,6 +3393,12 @@ def main() -> None:
                 neodepends_root=args.neodepends_root,
                 neodepends_bin=args.neodepends_bin,
                 neodepends_resolver=args.neodepends_resolver,
+                java_depends=args.java_depends,
+                depends_runner=args.depends_runner,
+                understand_und=args.understand_und,
+                understand_upython=args.understand_upython,
+                understand_language=args.understand_language,
+                understand_granularity=args.understand_granularity,
                 mv_cochange=args.mv_cochange if hasattr(args, "mv_cochange") else None,
             )
 
@@ -3088,6 +3426,11 @@ def main() -> None:
                 neodepends_bin=args.neodepends_bin,
                 neodepends_resolver=args.neodepends_resolver,
                 java_depends=args.java_depends,
+                depends_runner=args.depends_runner,
+                understand_und=args.understand_und,
+                understand_upython=args.understand_upython,
+                understand_language=args.understand_language,
+                understand_granularity=args.understand_granularity,
                 analysis_tag=args.analysis_tag,
                 intelligent=args.intelligent_selection,
                 min_months_apart=args.min_months_apart,
@@ -3144,11 +3487,15 @@ def main() -> None:
         source_root = repo_root  # last resort: entire repo
     print(f"Using source root: {source_root}")
 
-    # ensure DV8’s expected folder structure inside the repo
-    input_data = repo_root / "InputData"
+    analysis_root = analysis_root_for_single_run(repo_root, workspace).resolve()
+    if analysis_root != repo_root:
+        print(f"Writing analysis artifacts to: {analysis_root}")
+
+    # ensure DV8’s expected folder structure inside the analysis root
+    input_data = analysis_root / "InputData"
     depends_output = input_data / "DependsOutput" / "json"
     neodepends_output = input_data / "NeoDependsOutput"
-    output_data = repo_root / "OutputData"
+    output_data = analysis_root / "OutputData"
     ensure_dirs(input_data, depends_output, output_data, neodepends_output)
 
     # prepare file names for depends outputs
@@ -3165,12 +3512,27 @@ def main() -> None:
         if adjusted != source_root:
             print(f"Auto-adjusted Python source root: {adjusted}")
             source_root = adjusted
-    use_neodepends = detected_language in {"python", "java"} and not (detected_language == "java" and args.java_depends)
+    # Auto-select Understand for C#/TypeScript (no other extractor supports them)
+    effective_depends_runner = args.depends_runner
+    if effective_depends_runner != "understand" and detected_language in ("csharp", "typescript", "mixed-cs-ts"):
+        effective_depends_runner = "understand"
+        print(f"[deps] Auto-selecting Understand for {detected_language} source.")
+    use_understand = effective_depends_runner == "understand"
+    use_neodepends = (
+        detected_language in {"python", "java"}
+        and not use_understand
+        and not (detected_language == "java" and args.java_depends)
+    )
+    if use_understand:
+        print(
+            "Using SciTools Understand for dependency extraction "
+            f"({understand_language_name(detected_language, args.understand_language)})."
+        )
     if use_neodepends:
         print(f"Detected {detected_language} source. Using NeoDepends for dependency extraction.")
 
     # check for existing analysis and branch
-    existing_report = find_existing_report_root(repo_root)
+    existing_report = find_existing_report_root(analysis_root)
     if existing_report and not args.force_depends and not args.skip_arch_report:
         print(f"Found existing DV8 analysis: {existing_report}")
         ans = input("Re-run full analysis? [y/N]: ").strip().lower()
@@ -3201,7 +3563,20 @@ def main() -> None:
 
     # reuse cached outputs unless user forced regeneration
     needs_depends_fallback = False
-    if use_neodepends:
+    if use_understand:
+        understand_output = input_data / "UnderstandOutput"
+        json_dep = run_understand_export(
+            source_root=source_root,
+            output_dir=understand_output,
+            project_name=project_name,
+            language=understand_language_name(detected_language, args.understand_language),
+            und_bin=args.understand_und,
+            upython_bin=args.understand_upython,
+            granularity=args.understand_granularity,
+            force=args.force_depends,
+        )
+        mapping = None
+    elif use_neodepends:
         neodep_json = neodepends_output / "dependencies.full.dv8-dependency.json"
         if neodep_json.is_file() and not args.force_depends:
             print("Reusing existing NeoDepends output (use --force-depends to regenerate).")
@@ -3260,7 +3635,7 @@ def main() -> None:
     # write an arch-report properties file inside InputData
     params_path = input_data / "archreport.properties"
     output_dir = Path("OutputData/Architecture-analysis-result")  # relative path used by DV8
-    write_params(params_path, project_name, dsm_path.relative_to(repo_root), output_dir)
+    write_params(params_path, project_name, dsm_path.relative_to(analysis_root), output_dir)
 
     # If the user wants all metrics, compute them directly from the DSM first (independent of report)
     ask_key = (args.ask or "").strip().lower()
@@ -3272,7 +3647,7 @@ def main() -> None:
     # run the full architecture analysis if not skipped
     if not args.skip_arch_report:
         try:
-            run_arch_report(dv8_console, params_path.relative_to(repo_root), repo_root, env)
+            run_arch_report(dv8_console, params_path.relative_to(analysis_root), analysis_root, env)
         except SystemExit as e:
             print(f"Arch report failed: {e}")
             # If user only asked for a metric, try computing it directly from the DSM
@@ -3297,7 +3672,7 @@ def main() -> None:
             # already printed combined metrics above
             pass
         else:
-            answer = fetch_metric(repo_root / output_dir, args.ask)
+            answer = fetch_metric(analysis_root / output_dir, args.ask)
             if answer is None:
                 # Try direct metric even if report ran but didn't emit expected files
                 try:
