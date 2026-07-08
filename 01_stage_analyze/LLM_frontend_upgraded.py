@@ -766,6 +766,8 @@ def tool_interpret_temporal(plan: dict) -> int:
     force_reinterpret = bool(plan.get("force_reinterpret", False))
     refactor_model = plan.get("refactor_model") or "qwen3-coder-30b-refactor"
     refactor_loop_count = int(plan.get("refactor_loop_count") or 0)
+    refactor_models = plan.get("refactor_models", [])  # multi-model comparison
+    use_feedback_loop = bool(plan.get("use_feedback_loop", False))
 
     # Extract model from prompt if not set (e.g. "with deepseek-r1:32b" or "32b")
     raw_model = plan.get("model") or ""
@@ -976,7 +978,7 @@ def tool_interpret_temporal(plan: dict) -> int:
                           "Action 1 must be the single most impactful change right now.")
                 # Stage 4 — loop mode: applies Action 1 only, re-runs Q1+Q2 fresh each iteration
                 print(f"\n[AUTO] Triggering Stage 4 (loop refactor: Action 1 per iteration, re-analyze between each)...")
-                _run_refactor_stage(tr, conversation, model=refactor_model, loop_count=refactor_loop_count)
+                _run_refactor_stage(tr, conversation, model=refactor_model, loop_count=refactor_loop_count, refactor_models=refactor_models, qa_model=model, use_feedback_loop=use_feedback_loop)
                 return 0
 
             # ------------------------------------------------------------------
@@ -1038,9 +1040,13 @@ def tool_interpret_temporal(plan: dict) -> int:
                         break
                     if not any(c.isalpha() or c.isdigit() for c in next_q):
                         break
-                    # Stage 4 trigger: refactor + re-analyse
+                    # Stage 4 trigger: refactor + re-analyse (supports targeted: "refactor module 1,0")
                     if _is_refactor_trigger(next_q):
-                        _run_refactor_stage(tr, conversation, model=refactor_model, loop_count=refactor_loop_count)
+                        _manual_target = _extract_refactor_target(next_q)
+                        if _manual_target:
+                            print(f"[Q&A] Manual refactoring target detected: {_manual_target}")
+                            conversation.append(f"USER_REFACTOR_TARGET: {_manual_target}")
+                        _run_refactor_stage(tr, conversation, model=refactor_model, loop_count=refactor_loop_count, refactor_models=refactor_models, qa_model=model, use_feedback_loop=use_feedback_loop)
                         break
                     current_question = next_q
             return 0
@@ -1116,18 +1122,49 @@ def tool_interpret_temporal(plan: dict) -> int:
                                "Do NOT include process actions like 'code reviews' or 'documentation'. Only structural code changes. "
                                "Action 1 must be the single most impactful change right now.")
                 print(f"\n[AUTO] Triggering Stage 4 (loop refactor: Action 1 per iteration, re-analyze between each)...")
-                _run_refactor_stage(tr, conversation, model=refactor_model, loop_count=refactor_loop_count)
+                _run_refactor_stage(tr, conversation, model=refactor_model, loop_count=refactor_loop_count, refactor_models=refactor_models, qa_model=model, use_feedback_loop=use_feedback_loop)
             else:
                 print("[AUTO] No interpretation report found — cannot run Q&A.")
     return rc
 
 def _is_refactor_trigger(question: str) -> bool:
-    """Return True if the user wants to trigger Stage 4 (refactor + re-analyse)."""
+    """Return True if the user wants to trigger Stage 4 (refactor + re-analyse).
+    Also matches targeted refactoring like 'refactor module 1,0' or 'refactor clique'."""
     q = question.lower()
-    return (
-        "refactor" in q
-        and ("run" in q or "rerun" in q or "re-run" in q or "analysis" in q or "dv8" in q or "analyze" in q)
-    )
+    # General refactor trigger
+    if "refactor" in q and ("run" in q or "rerun" in q or "re-run" in q or "analysis" in q or "dv8" in q or "analyze" in q):
+        return True
+    # Targeted refactor: "refactor module X,Y" or "refactor clique" or "refactor _models.py"
+    if "refactor" in q and (
+        "module" in q or "clique" in q or "inheritance" in q or "modularity" in q
+        or "anti-pattern" in q or "antipattern" in q or ".py" in q or ".java" in q
+    ):
+        return True
+    return False
+
+
+def _extract_refactor_target(question: str) -> str:
+    """Extract a manual refactoring target from the user's Q&A question.
+    Returns a target hint string to inject into the Q2 prompt, or '' if none found.
+    Examples: 'refactor module 1,0', 'refactor clique', 'fix _models.py coupling'."""
+    import re as _re_target
+    q = question.lower()
+    # Module target: "module 1,0" or "module 0,0"
+    m = _re_target.search(r'module\s+(\d+[,]\d+)', q)
+    if m:
+        return f"TARGET: Focus on DV8 Module {m.group(1)}. Split files in this module to reduce its penalty."
+    # Anti-pattern target
+    if "clique" in q:
+        return "TARGET: Focus on CLIQUE anti-patterns. Break circular dependencies between the files in the clique."
+    if "inheritance" in q:
+        return "TARGET: Focus on UNHEALTHY INHERITANCE anti-patterns. Flatten hierarchy, use composition, extract interfaces."
+    if "modularity" in q or "modularity-violation" in q:
+        return "TARGET: Focus on MODULARITY VIOLATION anti-patterns. Decouple files that co-change without structural dependency."
+    # File target: "refactor _models.py" or "fix _client.py"
+    m = _re_target.search(r'(?:refactor|fix|split)\s+(\S+\.(?:py|java))', q)
+    if m:
+        return f"TARGET: Focus on splitting/refactoring the file '{m.group(1)}' to reduce its fan-in/fan-out and coupling."
+    return ""
 
 
 def _stage4_clean_copy(folder: pathlib.Path) -> None:
@@ -1147,7 +1184,235 @@ def _stage4_clean_copy(folder: pathlib.Path) -> None:
 
 def _stage4_apply_action(folder: pathlib.Path, action_num: str, action_text: str,
                           model: str) -> list:
-    """Ask qwen3 to apply a single refactoring action to the relevant files in folder.
+    """Apply a single refactoring action to the relevant files in folder.
+    Dispatches to Claude Code CLI when model starts with 'claude', otherwise uses Ollama.
+    Returns list of new relative file paths created."""
+    if model.startswith("claude"):
+        return _stage4_apply_action_claude(folder, action_num, action_text, model)
+    return _stage4_apply_action_ollama(folder, action_num, action_text, model)
+
+
+def _stage4_apply_action_claude(folder: pathlib.Path, action_num: str, action_text: str,
+                                 model: str) -> list:
+    """Use Claude Code CLI (claude -p) to apply a refactoring action.
+    Uses the user's Claude subscription — no API key needed."""
+    import subprocess as _sp_claude, shutil as _sh_claude
+
+    claude_bin = _sh_claude.which("claude")
+    if not claude_bin:
+        print("[stage4]   ERROR: 'claude' CLI not found in PATH. Install Claude Code first.")
+        print("[stage4]   Falling back to Ollama...")
+        return _stage4_apply_action_ollama(folder, action_num, action_text, "qwen3-coder-30b-refactor")
+
+    # Map model string to Claude model flag
+    # "claude" or "claude-sonnet" → sonnet, "claude-opus" → opus
+    if "opus" in model:
+        claude_model = "opus"
+    elif "haiku" in model:
+        claude_model = "haiku"
+    else:
+        claude_model = "sonnet"  # default: best speed/quality ratio for refactoring
+
+    print(f"[stage4]   Using Claude Code CLI (model: {claude_model}) for refactoring")
+
+    prompt = (
+        f"You are applying a specific refactoring action to this codebase. "
+        f"The source code is in: {folder}\n\n"
+        f"REFACTORING ACTION {action_num}:\n{action_text}\n\n"
+        f"RULES:\n"
+        f"1. Apply ONLY the action above. Do not add other changes, comments, docstrings, or formatting.\n"
+        f"2. Read each file mentioned in the action, apply the change, and write it back.\n"
+        f"3. If new files need to be created (e.g. extracting an interface), create them.\n"
+        f"4. If a file needs to be split, create the new files and update the original.\n"
+        f"5. Do NOT modify test files, __pycache__, InputData, OutputData, or .git directories.\n"
+        f"6. After making all changes, output a brief summary of what you changed (1-2 lines per file).\n"
+        f"7. Do NOT run any tests, builds, or git commands.\n"
+        f"8. CRITICAL — NO CIRCULAR IMPORTS & NO RE-EXPORTS: When extracting code into new files, ensure ONE-WAY dependencies only. "
+        f"The new file imports from its dependencies, but the original file must NOT import back from the new file. "
+        f"NEVER add re-exports (e.g. 'from new_file import X' in the old file) — re-exports keep the same dependency edges and defeat the purpose. "
+        f"Instead, UPDATE ALL CALLERS to import directly from the new location. Use Grep to find every 'from old_file import X' and change them. "
+        f"Example: if you move TypeA from types.py to type_defs.py, grep for 'from.*types import.*TypeA' and update each file to 'from type_defs import TypeA'. "
+        f"Do NOT leave 'from type_defs import TypeA' in types.py — that creates the same coupling.\n"
+        f"9. MINIMIZE NEW FILES: Prefer restructuring imports between existing files over creating new ones. "
+        f"Each new file adds nodes to the dependency graph. Only create a new file if the action explicitly requires it "
+        f"AND you update all dependents to import from the new file directly (no re-exports from the old file).\n"
+        f"10. DO NOT use TYPE_CHECKING blocks to hide imports — DV8 analyzes the AST statically and still counts them.\n"
+        f"11. NO NEW PACKAGE CYCLES: Before moving code between packages/directories, check that the move "
+        f"does not create a circular dependency between packages. If package A depends on package B, "
+        f"do NOT add an import from B to A. Keep package dependencies ONE-WAY.\n"
+        f"12. CLEAN UP EMPTY FILES: When moving ALL code from file A to file B, DELETE file A entirely "
+        f"(remove the file) and remove its import from __init__.py and all other files that imported it. "
+        f"An empty file that still exists creates an isolated node in the dependency graph that artificially "
+        f"inflates metrics. Either keep meaningful content in the file or delete it completely.\n"
+    )
+
+    try:
+        result = _sp_claude.run(
+            [claude_bin, "-p",
+             "--model", claude_model,
+             "--allowedTools", "Read,Edit,Write,Glob,Grep",
+             "--add-dir", str(folder)],
+            input=prompt,
+            capture_output=True, text=True, timeout=600, cwd=str(folder)
+        )
+        if result.returncode != 0:
+            print(f"[stage4]   Claude Code failed (rc={result.returncode})")
+            if result.stderr:
+                print(f"[stage4]   stderr: {result.stderr[:500]}")
+            return []
+
+        output = result.stdout.strip()
+        if output:
+            print(f"[stage4]   Claude output:\n{output[:800]}")
+        return []  # Claude edits files directly, no NEW_FILE parsing needed
+
+    except _sp_claude.TimeoutExpired:
+        print(f"[stage4]   Claude Code timed out (600s)")
+        return []
+    except Exception as e:
+        print(f"[stage4]   Claude Code error: {e}")
+        return []
+
+
+def _stage4_review_refactoring(folder: pathlib.Path, action_text: str,
+                                model: str, package_name: str = "",
+                                prev_failures: list[str] | None = None) -> tuple[bool, str]:
+    """Use a SECOND Claude CLI instance to review refactoring for correctness.
+
+    Returns (passed: bool, reason: str).
+    - passed=True: refactoring looks correct, proceed to DV8
+    - passed=False: issues found — reason describes what's wrong (fed to next iteration)
+
+    The reviewer gets READ-ONLY access + Bash for smoke tests.
+    It checks: imports resolve, no circular imports, code completeness, smoke tests pass.
+    """
+    import subprocess as _sp_rev, shutil as _sh_rev
+
+    claude_bin = _sh_rev.which("claude")
+    if not claude_bin:
+        print("[review] Claude CLI not found — skipping review (PASS by default).")
+        return True, "review skipped — no claude CLI"
+
+    if "opus" in model:
+        claude_model = "opus"
+    elif "haiku" in model:
+        claude_model = "haiku"
+    else:
+        claude_model = "sonnet"
+
+    # Detect language and package from source files
+    _skip = ("__pycache__", "InputData", "OutputData", ".git")
+    if not package_name:
+        _py_files = [p for p in folder.rglob("*.py")
+                     if not any(s in p.parts for s in _skip) and "test" not in str(p).lower()]
+        _java_files = [p for p in folder.rglob("*.java")
+                       if not any(s in p.parts for s in _skip) and "test" not in str(p).lower()]
+        if _py_files:
+            # Guess package name from top-level __init__.py
+            for _pf in sorted(_py_files, key=lambda p: len(p.parts)):
+                if _pf.name == "__init__.py" and _pf.parent != folder:
+                    package_name = _pf.parent.name
+                    break
+        elif _java_files:
+            package_name = "java_project"
+
+    lang = "Python" if any(folder.rglob("*.py")) else "Java"
+    _import_cmd = f'python -c "import {package_name}"' if package_name and lang == "Python" else ""
+
+    # Build context about previous review failures (so reviewer knows what to look for)
+    _prev_ctx = ""
+    if prev_failures:
+        _prev_list = "\n".join(f"  - {f}" for f in prev_failures[-3:])  # last 3 failures
+        _prev_ctx = (
+            f"\n\nPREVIOUS REVIEW FAILURES (from earlier iterations — check if these are still present):\n"
+            f"{_prev_list}\n"
+        )
+
+    prompt = (
+        f"You are a CODE REVIEWER checking a refactoring for correctness. "
+        f"The codebase is in: {folder}\n"
+        f"Language: {lang}\n\n"
+        f"THE REFACTORING THAT WAS APPLIED:\n{action_text}\n\n"
+        f"YOUR TASK — check ALL of the following:\n"
+        f"1. IMPORT RESOLUTION: Read the modified files. Check that every import statement "
+        f"references a module/file that actually exists. Use Glob to verify target files exist.\n"
+        f"2. NO CIRCULAR IMPORTS: If code was moved from file A to file B, verify that B does NOT "
+        f"import from A for the same symbols (creating a cycle).\n"
+        f"3. CODE COMPLETENESS: If code was moved, verify the destination file has the COMPLETE "
+        f"code (classes, functions, methods) — not just stubs or empty placeholders.\n"
+        f"4. CALLERS UPDATED: If a symbol moved from file A to file B, check that callers import "
+        f"from B (not still from A). Use Grep to find old import patterns.\n"
+    )
+
+    if _import_cmd:
+        prompt += (
+            f"5. SMOKE TEST: Run this command to verify the package still imports:\n"
+            f"   {_import_cmd}\n"
+            f"   If it fails, report the exact error.\n"
+        )
+
+    prompt += (
+        f"\nAfter checking, output your verdict on the FIRST LINE in exactly this format:\n"
+        f"VERDICT: PASS\n"
+        f"or\n"
+        f"VERDICT: FAIL — <one-line reason>\n\n"
+        f"Then provide a brief explanation (2-5 lines) of what you checked."
+        f"{_prev_ctx}"
+    )
+
+    print(f"[review] Running reviewer (Claude {claude_model})...")
+    try:
+        # Reviewer gets Read, Glob, Grep for inspection + Bash for smoke tests
+        # NO Edit/Write — reviewer must NOT modify code
+        result = _sp_rev.run(
+            [claude_bin, "-p",
+             "--model", claude_model,
+             "--allowedTools", "Read,Glob,Grep,Bash",
+             "--add-dir", str(folder)],
+            input=prompt,
+            capture_output=True, text=True, timeout=300, cwd=str(folder)
+        )
+        if result.returncode != 0:
+            print(f"[review] Claude reviewer failed (rc={result.returncode}) — PASS by default.")
+            if result.stderr:
+                print(f"[review] stderr: {result.stderr[:300]}")
+            return True, "review process failed — pass by default"
+
+        output = result.stdout.strip()
+        print(f"[review] Reviewer output:\n{output[:600]}")
+
+        # Parse verdict
+        import re as _re_rev
+        _verdict_match = _re_rev.search(r'VERDICT:\s*(PASS|FAIL)(?:\s*[—–-]\s*(.+))?', output, _re_rev.IGNORECASE)
+        if _verdict_match:
+            _verdict = _verdict_match.group(1).upper()
+            _reason = (_verdict_match.group(2) or "").strip()
+            if _verdict == "PASS":
+                print(f"[review] PASSED")
+                return True, "review passed"
+            else:
+                print(f"[review] FAILED: {_reason}")
+                return False, _reason or "reviewer found issues (no specific reason given)"
+        else:
+            # Could not parse verdict — check for keywords
+            _lower = output.lower()
+            if "fail" in _lower and "pass" not in _lower:
+                print(f"[review] FAILED (inferred from output)")
+                return False, output[:200]
+            print(f"[review] Could not parse verdict — PASS by default.")
+            return True, "verdict unclear — pass by default"
+
+    except _sp_rev.TimeoutExpired:
+        print(f"[review] Reviewer timed out (300s) — PASS by default.")
+        return True, "review timed out — pass by default"
+    except Exception as e:
+        print(f"[review] Reviewer error: {e} — PASS by default.")
+        return True, f"review error: {e}"
+
+
+def _stage4_apply_action_ollama(folder: pathlib.Path, action_num: str, action_text: str,
+                                 model: str) -> list:
+    """Use local Ollama model to apply a refactoring action.
     Returns list of new relative file paths created."""
     import re as _re, json as _json, urllib.request as _ur
 
@@ -1220,7 +1485,7 @@ def _stage4_apply_action(folder: pathlib.Path, action_num: str, action_text: str
             with _ur.urlopen(req, timeout=300) as resp:
                 raw_output = _json.loads(resp.read().decode()).get("response", "")
         except Exception as e:
-            print(f"[stage4]   qwen3 failed for {rel}: {e}")
+            print(f"[stage4]   Ollama failed for {rel}: {e}")
             continue
 
         # Parse NEW_FILE blocks (supports # and // comment markers)
@@ -1258,7 +1523,50 @@ def _stage4_read_mscore(folder: pathlib.Path) -> float | None:
         return None
 
 
-def _stage4_run_dv8(folder: pathlib.Path) -> int:
+def _stage4_read_all_metrics(folder: pathlib.Path) -> dict[str, float]:
+    """Read ALL DV8 metrics from OutputData. Returns dict with keys:
+    m-score, propagation-cost, decoupling-level, independence-level,
+    and *-excl-isolated variants + isolated-items count."""
+    import json as _j
+    metrics_path = folder / "OutputData" / "metrics" / "all-metrics.json"
+    if not metrics_path.exists():
+        return {}
+    try:
+        raw = _j.loads(metrics_path.read_text())
+        result = {}
+        for key, subkey in [
+            ("m-score", "mScore"),
+            ("propagation-cost", "propagationCost"),
+            ("decoupling-level", "decouplingLevel"),
+            ("independence-level", "independenceLevel"),
+        ]:
+            val = raw.get(key, {}).get(subkey)
+            if val is not None:
+                result[key] = float(str(val).strip().rstrip("%"))
+        # Also read exclude-isolated variants and isolated item count
+        # These are more honest metrics when refactoring empties files
+        for key, subkey in [
+            ("propagation-cost-excl", "propagationCostExcludeIsolatedItems"),
+            ("decoupling-level-excl", "decouplingLevelExcludeIsolatedItems"),
+        ]:
+            section = key.rsplit("-excl", 1)[0]  # e.g. "propagation-cost"
+            val = raw.get(section, {}).get(subkey)
+            if val is not None:
+                result[key] = float(str(val).strip().rstrip("%"))
+        # Count total isolated items (sum across all metric sections)
+        _iso_total = 0
+        for section_data in raw.values():
+            if isinstance(section_data, dict):
+                iso = section_data.get("numberOfIsolatedItems")
+                if iso is not None:
+                    _iso_total = max(_iso_total, int(iso))
+        result["isolated-items"] = float(_iso_total)
+        return result
+    except Exception:
+        return {}
+
+
+def _stage4_run_dv8(folder: pathlib.Path, skip_arch_report: bool = False) -> int:
     """Run DV8 on a single folder. Returns subprocess return code."""
     print(f"\n[stage4] Running DV8 on {folder.name} ...")
     nd_cmd = [
@@ -1266,6 +1574,8 @@ def _stage4_run_dv8(folder: pathlib.Path) -> int:
         "--repo", str(folder),
         "--ask", "all",
     ]
+    if skip_arch_report:
+        nd_cmd.append("--skip-arch-report")
     # Java repos: force Depends (not NeoDepends) to match the tool used for original temporal commits.
     # Without --java-depends, dv8_agent.py defaults to NeoDepends for Java, which produces
     # far fewer dependency cells (11 vs 49) and an artificially inflated M-score.
@@ -1279,15 +1589,986 @@ def _stage4_run_dv8(folder: pathlib.Path) -> int:
     return rc
 
 
-def _run_refactor_loop(temporal_root: pathlib.Path, model: str = "qwen3-coder-30b-refactor",
-                       max_iterations: int = 5) -> int:
-    """Loop mode Stage 4: each iteration re-runs Q1+Q2 on current state, applies ONE action, checks M-score.
+def _build_antipattern_context(temporal_root: pathlib.Path) -> str:
+    """Read DV8 anti-pattern data + DSM dependency edges from the most recent revision.
+    Returns a structured prompt with:
+    - Each anti-pattern instance with exact file lists (from .dv8-clsx binaries)
+    - Bidirectional dependency edges (from DSM JSON) that form cycles
+    - Dependency weights so the LLM knows which edges are weakest to break
+    This gives the refactoring LLM concrete, surgical targets."""
+    import json as _jp, csv as _csv, re as _re_ap
+    data_repos = temporal_root / "data_repositories"
+    if not data_repos.is_dir():
+        return ""
 
-    Stops when: max_iterations reached, M-score stops improving, or DV8 fails.
+    # Find the most recent revision with arch-issue data
+    candidates = []
+    for p in sorted(data_repos.iterdir(), key=lambda p: p.name):
+        if not p.is_dir():
+            continue
+        pfx = p.name.split("_")[0]
+        if pfx.isdigit() and len(pfx) <= 3:
+            ai_dir = p / "OutputData" / "arch-issue"
+            if ai_dir.is_dir():
+                candidates.append(p)
+
+    if not candidates:
+        return ""
+
+    # Prefer hand-written (2-digit) over loop (3-digit)
+    rev_dir = None
+    for c in candidates:
+        pfx = c.name.split("_")[0]
+        if len(pfx) <= 2:
+            rev_dir = c
+            break
+    if rev_dir is None:
+        rev_dir = candidates[0]
+
+    ai_base = rev_dir / "OutputData" / "arch-issue"
+
+    # --- Helper: extract file paths from binary .dv8-clsx/.dv8-dsm/.dv8-issue files ---
+    _SOURCE_EXTS = {"py", "java", "kt", "scala", "cs", "js", "ts", "tsx", "jsx", "go", "rs", "cpp", "c", "h", "hpp"}
+    def _extract_files_from_binary(path):
+        """Extract file paths by decompressing gzip data in DV8 binary files
+        and regex-matching readable strings."""
+        import gzip as _gz_ap
+        try:
+            raw = path.read_bytes()
+            gz_start = raw.find(b"\x1f\x8b")
+            if gz_start >= 0:
+                body = _gz_ap.decompress(raw[gz_start:])
+            else:
+                body = raw
+            strings = _re_ap.findall(rb'[\x20-\x7e]{3,}', body)
+            files = []
+            for s in strings:
+                decoded = s.decode("utf-8", errors="replace").strip().lstrip("%(*!")
+                # Format 1: "path/self (File)" — structural APs
+                if "/self (File)" in decoded:
+                    fpath = decoded.replace("/self (File)", "")
+                    files.append(fpath)
+                # Format 2: plain path — modularity violations (co-change data)
+                elif "/" in decoded and "." in decoded.split("/")[-1]:
+                    ext = decoded.rsplit(".", 1)[-1].lower()
+                    if ext in _SOURCE_EXTS:
+                        files.append(decoded)
+            return sorted(set(files))
+        except Exception:
+            return []
+
+    # --- Load DSM dependency edges for edge-weight context ---
+    dep_json_path = rev_dir / "InputData" / "NeoDependsOutput" / "dependencies.full.dv8-dependency.json"
+    dep_edges = {}  # (src, dest) → {type: weight}
+    dep_files = []
+    if dep_json_path.exists():
+        try:
+            dep_data = _jp.loads(dep_json_path.read_text(encoding="utf-8"))
+            raw_files = dep_data.get("variables", [])
+            dep_files = [f.replace("/self (File)", "") for f in raw_files]
+            for cell in dep_data.get("cells", []):
+                src = dep_files[cell["src"]]
+                dest = dep_files[cell["dest"]]
+                dep_edges[(src, dest)] = cell.get("values", {})
+        except Exception:
+            pass
+
+    # --- Find bidirectional dependencies (cycle edges) ---
+    bidirectional = []  # [(fileA, fileB, weightA→B, weightB→A)]
+    seen_pairs = set()
+    for (src, dest), vals in dep_edges.items():
+        if (dest, src) in dep_edges and (dest, src) not in seen_pairs:
+            w_fwd = sum(v for v in vals.values())
+            w_rev = sum(v for v in dep_edges[(dest, src)].values())
+            bidirectional.append((src, dest, w_fwd, w_rev))
+            seen_pairs.add((src, dest))
+
+    # --- Read anti-pattern summary ---
+    summary_csv = ai_base / "anti-pattern-summary.csv"
+    if not summary_csv.exists():
+        return ""
+
+    ap_types = {}
+    with open(summary_csv, newline="", encoding="utf-8") as f:
+        for row in _csv.DictReader(f):
+            t = row.get("Type", "").strip()
+            if t and t != "Total":
+                ap_types[t] = {
+                    "count": int(row.get("InstanceCount", 0)),
+                    "file_count": int(row.get("DistinctFileCount", 0))
+                }
+
+    if not ap_types:
+        return ""
+
+    type_folder_map = {
+        "Clique": "clique",
+        "UnhealthyInheritance": "unhealthy-inheritance",
+        "PackageCycle": "package-cycle",
+        "ModularityViolation": "modularity-violation",
+        "UnstableInterface": "unstable-interface",
+        "Crossing": "crossing",
+    }
+
+    lines = [
+        "DV8 ANTI-PATTERN ANALYSIS — SURGICAL TARGETS WITH DEPENDENCY EDGES",
+        "Each anti-pattern instance lists EXACT files and the dependency edges between them.",
+        "To fix: break the specific edges listed. Move code to eliminate imports, don't add layers.",
+        "",
+    ]
+
+    total_instances = 0
+
+    for ap_type, info in sorted(ap_types.items(), key=lambda kv: -kv[1]["file_count"]):
+        folder_name = type_folder_map.get(ap_type, ap_type.lower())
+        ap_dir = ai_base / folder_name
+
+        display_map = {
+            "UnhealthyInheritance": "UNHEALTHY INHERITANCE",
+            "PackageCycle": "PACKAGE CYCLE",
+            "ModularityViolation": "MODULARITY VIOLATION",
+            "UnstableInterface": "UNSTABLE INTERFACE",
+            "Crossing": "CROSSING",
+            "Clique": "CLIQUE",
+        }
+        display_name = display_map.get(ap_type, ap_type)
+
+        lines.append(f"{'='*60}")
+        lines.append(f"ANTI-PATTERN: {display_name} — {info['count']} instance(s), {info['file_count']} files")
+        lines.append(f"{'='*60}")
+
+        if not ap_dir.is_dir():
+            lines.append(f"  (no detail folder found)")
+            lines.append("")
+            continue
+
+        # Enumerate instance directories (numbered folders)
+        inst_dirs = sorted(
+            [d for d in ap_dir.iterdir() if d.is_dir() and d.name.isdigit()],
+            key=lambda d: int(d.name)
+        )
+
+        shown = 0
+        for inst_dir in inst_dirs[:5]:  # top 5 instances
+            inst_id = inst_dir.name
+            # Extract file list from the -clsx file (clustering) or -sdsm (structure DSM)
+            files = []
+            for suffix in ["-clsx.dv8-clsx", "-sdsm.dv8-dsm", "-merge.dv8-dsm"]:
+                candidate = inst_dir / f"{inst_id}{suffix}"
+                if candidate.exists():
+                    files = _extract_files_from_binary(candidate)
+                    if files:
+                        break
+
+            if not files:
+                continue
+
+            # Filter out test files for display (but note them)
+            src_files = [f for f in files if not f.startswith("tests/")]
+            test_files = [f for f in files if f.startswith("tests/")]
+
+            lines.append(f"\n  Instance #{inst_id} ({len(files)} files):")
+            lines.append(f"    Source files:")
+            for fp in src_files[:15]:
+                # Add fan_in/fan_out if available from DSM
+                fan_in = sum(1 for (s, d) in dep_edges if d == fp)
+                fan_out = sum(1 for (s, d) in dep_edges if s == fp)
+                fan_info = f"  [fan_in={fan_in}, fan_out={fan_out}]" if fan_in + fan_out > 5 else ""
+                lines.append(f"      - {fp}{fan_info}")
+
+            if test_files:
+                lines.append(f"    Test files ({len(test_files)}): {', '.join(t.split('/')[-1] for t in test_files[:5])}")
+
+            # Show DEPENDENCY EDGES between files in this instance
+            inst_edges = []
+            for (src, dest), vals in dep_edges.items():
+                if src in files and dest in files:
+                    w = sum(v for v in vals.values())
+                    types_str = ", ".join(f"{k}:{int(v)}" for k, v in vals.items())
+                    inst_edges.append((src, dest, w, types_str))
+
+            if inst_edges:
+                inst_edges.sort(key=lambda x: -x[2])
+                lines.append(f"    Dependency edges (strongest first):")
+                for src, dest, w, types_str in inst_edges[:10]:
+                    short_src = src.split("/")[-1]
+                    short_dest = dest.split("/")[-1]
+                    lines.append(f"      {short_src} → {short_dest} (weight={w}, {types_str})")
+
+                # Highlight bidirectional edges — these are the CYCLE edges to break
+                bidir_in_inst = [(a, b, wf, wr) for a, b, wf, wr in bidirectional
+                                 if a in files and b in files]
+                if bidir_in_inst:
+                    lines.append(f"    CIRCULAR DEPENDENCIES (bidirectional — break these!):")
+                    for a, b, wf, wr in bidir_in_inst:
+                        short_a = a.split("/")[-1]
+                        short_b = b.split("/")[-1]
+                        weaker = f"{short_a}→{short_b}" if wf <= wr else f"{short_b}→{short_a}"
+                        weaker_w = min(wf, wr)
+                        lines.append(f"      {short_a} ↔ {short_b} (→: weight={wf}, ←: weight={wr})")
+                        lines.append(f"        WEAKEST EDGE to break: {weaker} (weight={weaker_w})")
+
+            total_instances += 1
+            shown += 1
+
+        if shown == 0:
+            lines.append(f"  (no instance details available)")
+        lines.append("")
+
+    # --- Add all bidirectional deps even if not in a specific AP instance ---
+    if bidirectional:
+        lines.append(f"{'='*60}")
+        lines.append(f"ALL BIDIRECTIONAL DEPENDENCIES (circular imports to break)")
+        lines.append(f"{'='*60}")
+        for a, b, wf, wr in sorted(bidirectional, key=lambda x: min(x[2], x[3])):
+            short_a = a.split("/")[-1]
+            short_b = b.split("/")[-1]
+            weaker = f"{short_a}→{short_b}" if wf <= wr else f"{short_b}→{short_a}"
+            lines.append(f"  {short_a} ↔ {short_b} (→:{wf}, ←:{wr}) — break: {weaker}")
+        lines.append("")
+
+    # --- Fix instructions per type ---
+    lines.append("HOW TO FIX EACH ANTI-PATTERN TYPE:")
+    lines.append("-" * 40)
+    lines.append("CLIQUE: Files form a circular dependency cycle (A→B→C→A).")
+    lines.append("  FIX: Identify the WEAKEST edge (lowest weight) in the cycle.")
+    lines.append("  MOVE the imported symbols to the importing file (inline them),")
+    lines.append("  or MOVE them to a file that both already depend on.")
+    lines.append("  Do NOT create new files. Do NOT add re-exports.")
+    lines.append("  Example: if _types.py imports URL from _urls.py (weight=2) but _urls.py")
+    lines.append("  imports PrimitiveData from _types.py (weight=5), break _types.py→_urls.py")
+    lines.append("  by moving/inlining URL usage in _types.py.")
+    lines.append("")
+    lines.append("UNHEALTHY INHERITANCE: Parent class depends on child, or clients use both parent+child.")
+    lines.append("  FIX: Make the parent class self-contained. Move child-specific logic OUT of the parent.")
+    lines.append("  Ensure clients import ONLY the parent class (or only the child they need).")
+    lines.append("  Replace isinstance checks with method dispatch or Protocol-based duck typing.")
+    lines.append("")
+    lines.append("MODULARITY VIOLATION: Files co-change frequently but have no structural dependency.")
+    lines.append("  FIX: These files are implicitly coupled through shared concepts.")
+    lines.append("  Either: (a) ADD an explicit dependency — extract the shared concept into one file")
+    lines.append("  and have both import it, or (b) MERGE the files if they're small enough.")
+    lines.append("  The goal is to make the implicit coupling EXPLICIT so future changes are localized.")
+    lines.append("")
+
+    if total_instances == 0:
+        return ""
+
+    return "\n".join(lines)
+
+
+def _generate_antipattern_network_graph(rev_dir: pathlib.Path, output_path: pathlib.Path,
+                                         title: str = "Dependency Network") -> bool:
+    """Generate a layered network graph using DRH layers for vertical positioning.
+    - Nodes laid out in horizontal DRH layers (L0=bottom/core, L1=middle, L2=top/tests)
+    - Anti-pattern nodes: LARGER, diamond/square marker, colored by AP type, bold black border
+    - Normal nodes: small grey circles
+    - Bidirectional edges (cycles) in red dashed
+    - Edge weight = line thickness
+    - File labels shown on anti-pattern nodes and high-degree nodes
+    Returns True if graph was generated successfully."""
+    try:
+        import json as _jn
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+        import networkx as nx
+        import re as _re_ng
+    except ImportError:
+        return False
+
+    dep_json = rev_dir / "InputData" / "NeoDependsOutput" / "dependencies.full.dv8-dependency.json"
+    if not dep_json.exists():
+        return False
+
+    dep_data = _jn.loads(dep_json.read_text(encoding="utf-8"))
+    raw_files = dep_data.get("variables", [])
+    files = [f.replace("/self (File)", "") for f in raw_files]
+    cells = dep_data.get("cells", [])
+
+    if not files or not cells:
+        return False
+
+    # Build graph (skip test files)
+    G = nx.DiGraph()
+    for f in files:
+        short = f.split("/")[-1] if "/" in f else f
+        if f.startswith("tests/"):
+            continue
+        G.add_node(f, label=short)
+
+    for cell in cells:
+        src, dest = files[cell["src"]], files[cell["dest"]]
+        if src.startswith("tests/") or dest.startswith("tests/"):
+            continue
+        weight = sum(v for v in cell.get("values", {}).values())
+        if G.has_node(src) and G.has_node(dest):
+            G.add_edge(src, dest, weight=weight)
+
+    if len(G.nodes) == 0:
+        return False
+
+    # --- Read DRH layers for layout ---
+    drh_json = rev_dir / "OutputData" / "dv8-analysis-result" / "dsm" / "drh-clustering.json"
+    file_layer = {}  # file_path → layer_number (0=bottom/core, higher=top)
+    if drh_json.exists():
+        try:
+            drh = _jn.loads(drh_json.read_text(encoding="utf-8"))
+            for layer_group in drh.get("structure", []):
+                layer_name = layer_group.get("name", "")  # e.g. "L0", "L1"
+                try:
+                    layer_num = int(layer_name.replace("L", ""))
+                except ValueError:
+                    continue
+                for module in layer_group.get("nested", []):
+                    for item in module.get("nested", []):
+                        if item.get("@type") == "item":
+                            fname = item["name"].replace("/self (File)", "")
+                            file_layer[fname] = layer_num
+        except Exception:
+            pass
+
+    # --- Identify anti-pattern file memberships ---
+    _SOURCE_EXTS_NG = {"py", "java", "ts", "js", "go", "rs", "cpp", "c", "h", "cs"}
+    ap_colors = {
+        "clique": "#e74c3c",                  # red
+        "unhealthy-inheritance": "#e67e22",    # orange
+        "modularity-violation": "#9b59b6",     # purple
+        "package-cycle": "#f39c12",            # yellow
+        "unstable-interface": "#3498db",       # blue
+        "crossing": "#1abc9c",                 # teal
+    }
+    file_ap_type = {}  # file → ap_type (first match wins for color)
+    file_ap_count = {}  # file → count of AP instances it appears in
+    ai_base = rev_dir / "OutputData" / "arch-issue"
+    if ai_base.is_dir():
+        import gzip as _gz_ng
+        for ap_dir in sorted(ai_base.iterdir()):
+            if not ap_dir.is_dir() or ap_dir.name.endswith(".csv"):
+                continue
+            ap_type = ap_dir.name
+            for inst_dir in ap_dir.iterdir():
+                if not inst_dir.is_dir():
+                    continue
+                for binfile in inst_dir.iterdir():
+                    if binfile.suffix in (".dv8-clsx", ".dv8-dsm"):
+                        try:
+                            raw = binfile.read_bytes()
+                            gz_start = raw.find(b"\x1f\x8b")
+                            if gz_start >= 0:
+                                body = _gz_ng.decompress(raw[gz_start:])
+                            else:
+                                body = raw
+                            strings = _re_ng.findall(rb'[\x20-\x7e]{5,}', body)
+                            for s in strings:
+                                decoded = s.decode("utf-8", errors="replace").strip().lstrip("%(*!")
+                                fpath = None
+                                if "/self (File)" in decoded:
+                                    fpath = decoded.replace("/self (File)", "")
+                                elif "/" in decoded and "." in decoded.split("/")[-1]:
+                                    ext = decoded.rsplit(".", 1)[-1].lower()
+                                    if ext in _SOURCE_EXTS_NG:
+                                        fpath = decoded
+                                if fpath and fpath in G.nodes:
+                                    if fpath not in file_ap_type:
+                                        file_ap_type[fpath] = ap_type
+                                    file_ap_count[fpath] = file_ap_count.get(fpath, 0) + 1
+                        except Exception:
+                            pass
+
+    # --- Find bidirectional edges ---
+    bidir_edges = set()
+    for u, v in G.edges():
+        if G.has_edge(v, u):
+            bidir_edges.add((min(u, v), max(u, v)))
+
+    # --- Layered layout ---
+    # Assign y position by DRH layer, x position spread within layer
+    max_layer = max(file_layer.values()) if file_layer else 0
+    pos = {}
+    layer_nodes = {}  # layer → list of nodes
+    unlayered = []
+    for n in G.nodes():
+        layer = file_layer.get(n)
+        if layer is not None:
+            layer_nodes.setdefault(layer, []).append(n)
+        else:
+            unlayered.append(n)
+    # Put unlayered nodes in the middle layer
+    mid_layer = max_layer // 2 if max_layer > 0 else 0
+    if unlayered:
+        layer_nodes.setdefault(mid_layer, []).extend(unlayered)
+
+    # Position: y = layer (0=bottom), x = spread evenly
+    y_spacing = 2.5
+    for layer, nodes in layer_nodes.items():
+        # Sort: AP nodes first (for visual prominence), then by degree
+        nodes.sort(key=lambda n: (0 if n in file_ap_type else 1,
+                                  -(G.in_degree(n) + G.out_degree(n))))
+        n_nodes = len(nodes)
+        x_spacing = 2.0  # space between nodes
+        for i, n in enumerate(nodes):
+            x = (i - n_nodes / 2) * x_spacing
+            # Invert: L0=bottom (y=0), higher layers go up
+            y = (max_layer - layer) * y_spacing
+            pos[n] = (x, y)
+
+    # Ensure all nodes have positions
+    for n in G.nodes():
+        if n not in pos:
+            pos[n] = (0, 0)
+
+    # --- Draw ---
+    fig, ax = plt.subplots(1, 1, figsize=(18, 10))
+    fig.patch.set_facecolor("white")
+
+    # Draw layer bands (horizontal stripes)
+    for layer in range(max_layer + 1):
+        y = (max_layer - layer) * y_spacing
+        ax.axhspan(y - y_spacing * 0.45, y + y_spacing * 0.45,
+                    alpha=0.06, color="#3498db" if layer == 0 else ("#2ecc71" if layer == 1 else "#ecf0f1"))
+        ax.text(-max(len(G.nodes) * 0.7, 8), y, f"Layer {layer}",
+                fontsize=9, fontweight="bold", color="#7f8c8d", va="center", ha="right")
+
+    # Draw normal edges (thin, grey)
+    normal_edges = [(u, v) for u, v in G.edges() if (min(u, v), max(u, v)) not in bidir_edges]
+    edge_weights = [G[u][v].get("weight", 1) for u, v in normal_edges]
+    max_w = max(edge_weights) if edge_weights else 1
+    edge_widths = [max(0.3, min(3, w / max_w * 3)) for w in edge_weights]
+    if normal_edges:
+        nx.draw_networkx_edges(G, pos, edgelist=normal_edges, width=edge_widths,
+                               alpha=0.15, edge_color="#bdc3c7", arrows=True,
+                               arrowsize=6, ax=ax, connectionstyle="arc3,rad=0.05")
+
+    # Draw bidirectional edges (cycles) in bold red
+    bidir_edge_list = []
+    for u, v in bidir_edges:
+        if G.has_edge(u, v):
+            bidir_edge_list.append((u, v))
+    if bidir_edge_list:
+        nx.draw_networkx_edges(G, pos, edgelist=bidir_edge_list, width=2.5,
+                               alpha=0.7, edge_color="#e74c3c", style="dashed",
+                               arrows=True, arrowsize=10, ax=ax,
+                               connectionstyle="arc3,rad=0.1")
+
+    # Draw nodes — normal (small grey) and anti-pattern (large colored diamond)
+    normal_nodes = [n for n in G.nodes() if n not in file_ap_type]
+    ap_nodes = [n for n in G.nodes() if n in file_ap_type]
+
+    if normal_nodes:
+        normal_sizes = [max(80, min(400, (G.in_degree(n) + G.out_degree(n)) * 30)) for n in normal_nodes]
+        nx.draw_networkx_nodes(G, pos, nodelist=normal_nodes, node_size=normal_sizes,
+                               node_color="#d5dbe0", edgecolors="#95a5a6", linewidths=0.8,
+                               alpha=0.7, ax=ax)
+
+    if ap_nodes:
+        ap_sizes = [max(500, min(4000, (G.in_degree(n) + G.out_degree(n)) * 120
+                        + file_ap_count.get(n, 1) * 200)) for n in ap_nodes]
+        ap_node_colors = [ap_colors.get(file_ap_type[n], "#95a5a6") for n in ap_nodes]
+        nx.draw_networkx_nodes(G, pos, nodelist=ap_nodes, node_size=ap_sizes,
+                               node_color=ap_node_colors, edgecolors="black", linewidths=2.5,
+                               alpha=0.95, node_shape="D", ax=ax)
+
+    # Labels: always show AP nodes + top degree nodes
+    top_degree = sorted(G.nodes(), key=lambda n: G.in_degree(n) + G.out_degree(n), reverse=True)
+    label_nodes = set(ap_nodes) | set(top_degree[:10])
+    labels = {n: G.nodes[n].get("label", n.split("/")[-1]) for n in label_nodes}
+    nx.draw_networkx_labels(G, pos, labels, font_size=7, font_weight="bold", ax=ax)
+
+    # Legend
+    legend_handles = [mpatches.Patch(color="#d5dbe0", label="Normal file")]
+    for ap_name, ap_color in ap_colors.items():
+        if any(file_ap_type.get(n) == ap_name for n in G.nodes()):
+            display = ap_name.replace("-", " ").title()
+            legend_handles.append(mpatches.Patch(color=ap_color, label=display))
+    if bidir_edge_list:
+        legend_handles.append(plt.Line2D([0], [0], color="#e74c3c", linestyle="dashed",
+                                         linewidth=2, label="Circular dep"))
+    # Show AP count in title
+    ap_count = len(ap_nodes)
+    full_title = f"{title}\n{ap_count} files in anti-patterns | {len(bidir_edge_list)} circular deps"
+    ax.legend(handles=legend_handles, loc="upper left", fontsize=8, framealpha=0.9,
+              edgecolor="#bdc3c7")
+    ax.set_title(full_title, fontsize=13, fontweight="bold")
+    ax.axis("off")
+    plt.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def _build_module_penalty_context(temporal_root: pathlib.Path) -> str:
+    """Read DV8 M-score module data from the most recent revision's interpretation_payload.json
+    and build a structured analysis showing which modules drag M-score down and which files to target.
+    This gives the refactoring LLM concrete, data-driven targets instead of vague anti-pattern descriptions."""
+    import json as _jp
+    data_repos = temporal_root / "data_repositories"
+    if not data_repos.is_dir():
+        return ""
+
+    # Find the most recent hand-written revision (lowest 2-digit prefix)
+    rev_dirs = sorted(
+        [p for p in data_repos.iterdir()
+         if p.is_dir() and len(p.name) > 2 and p.name[:2].isdigit() and p.name[2] == "_"],
+        key=lambda p: p.name
+    )
+    if not rev_dirs:
+        return ""
+
+    # Try the most recent revision first, fall back to loop iteration folders
+    payload_path = None
+    for rd in rev_dirs:
+        candidate = rd / "OutputData" / "interpretation_payload.json"
+        if candidate.exists():
+            payload_path = candidate
+            break
+    # Also check loop iteration folders (3-digit prefix)
+    if payload_path is None:
+        loop_dirs = sorted(
+            [p for p in data_repos.iterdir()
+             if p.is_dir() and len(p.name) > 3 and p.name[:3].isdigit() and p.name[3] == "_"],
+            key=lambda p: p.name
+        )
+        for ld in loop_dirs:
+            candidate = ld / "OutputData" / "interpretation_payload.json"
+            if candidate.exists():
+                payload_path = candidate
+                break
+
+    if not payload_path:
+        return ""
+
+    try:
+        payload = _jp.loads(payload_path.read_text(encoding="utf-8"))
+        modules = payload.get("metrics", {}).get("m_score_modules", [])
+        hotspots = payload.get("structural_hotspots", {}).get("rows", [])
+        anti_patterns = payload.get("anti_pattern_rows", [])
+        m_score_data = payload.get("metrics", {}).get("m_score", {})
+        current_mscore = float(m_score_data.get("mScore", "0").replace("%", ""))
+    except Exception:
+        return ""
+
+    if not modules:
+        return ""
+
+    # Compute per-module loss
+    for m in modules:
+        sf = m["size_factor"]
+        sp = m["size_penalty"]
+        m["_loss"] = sf * (1 - sp)
+
+    modules.sort(key=lambda m: -m["_loss"])
+
+    lines = [
+        f"DV8 M-SCORE MODULE PENALTY ANALYSIS (current M-score: {current_mscore:.1f}%)",
+        f"Only modules with penalties are shown. Fix these to improve M-score.",
+        "",
+    ]
+
+    penalized = [m for m in modules if m["_loss"] > 0.005]
+    if not penalized:
+        return ""
+
+    total_contrib = sum(m["contribution"] for m in modules)
+
+    for m in penalized:
+        key = m["module_key"]
+        size = m["module_size"]
+        files = [f.replace("/self (File)", "") for f in m["files"]]
+        loss_pct = m["_loss"] * 100
+        lines.append(f"MODULE {key} (Layer {m['layer']}, {size} files) — M-SCORE LOSS: {loss_pct:.1f}%")
+        lines.append(f"  cross_penalty={m['cross_penalty']:.3f} (cross-layer deps violating design rules)")
+        lines.append(f"  internal_penalty={m['internal_penalty']:.3f} (files too tightly coupled WITHIN this module)")
+
+        if m["cross_penalty"] > 0.05:
+            lines.append(f"  → REDUCE cross-layer deps: some files import from wrong layer")
+        if m["internal_penalty"] > 0.1:
+            lines.append(f"  → REDUCE internal coupling: split large files or extract interfaces")
+
+        lines.append(f"  Files in this module:")
+        for f in files:
+            # Add hotspot info if available
+            hs_info = ""
+            for h in hotspots:
+                if f in h.get("Filename", ""):
+                    fi = int(h.get("FanIn", 0))
+                    fo = int(h.get("FanOut", 0))
+                    if fi > 50 or fo > 50:
+                        hs_info = f"  [fan_in={fi}, fan_out={fo}]"
+                    break
+            lines.append(f"    - {f}{hs_info}")
+        lines.append("")
+
+    # Add improvement forecast
+    lines.append("IMPROVEMENT FORECAST:")
+    cumulative = total_contrib
+    for m in penalized:
+        cumulative += m["_loss"]
+        lines.append(f"  Fix Module {m['module_key']}: M-score → {cumulative*100:.1f}% (+{m['_loss']*100:.1f}%)")
+
+    total_gain = sum(m["_loss"] for m in penalized)
+    lines.append(f"  Fix ALL: {total_contrib*100:.1f}% → {(total_contrib+total_gain)*100:.1f}% (+{total_gain*100:.1f}%)")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def _print_architecture_diff(temporal_root: pathlib.Path, baseline_dir,
+                              iteration_dirs: list, data_repos: pathlib.Path) -> None:
+    """Print before/after comparison: which modules improved, which anti-patterns were solved."""
+    import json as _jd
+    if not baseline_dir or not iteration_dirs:
+        return
+
+    # Find best iteration folder
+    best_it = max(iteration_dirs, key=lambda x: x[3] if x[3] is not None else 0)
+    best_dir = best_it[1]
+
+    # Load baseline payload
+    base_payload_path = baseline_dir / "OutputData" / "interpretation_payload.json"
+    best_payload_path = best_dir / "OutputData" / "interpretation_payload.json"
+
+    if not base_payload_path.exists() or not best_payload_path.exists():
+        return
+
+    try:
+        base_p = _jd.loads(base_payload_path.read_text(encoding="utf-8"))
+        best_p = _jd.loads(best_payload_path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+
+    print(f"\n{'─'*60}")
+    print(f"  ARCHITECTURE DIFF: Baseline → Best Iteration ({best_it[0]})")
+    print(f"{'─'*60}")
+
+    # --- Metrics comparison ---
+    base_m = base_p.get("metrics", {})
+    best_m = best_p.get("metrics", {})
+    for key in ["propagation-cost", "decoupling-level", "independence-level"]:
+        bv = base_m.get(key)
+        ev = best_m.get(key)
+        if bv is not None and ev is not None:
+            d = float(ev) - float(bv)
+            sign = "+" if d >= 0 else ""
+            better = "improved" if (d < 0 and key == "propagation-cost") or (d > 0 and key != "propagation-cost") else "worsened" if d != 0 else "unchanged"
+            print(f"  {key}: {float(bv):.2f}% → {float(ev):.2f}% ({sign}{d:.2f}%) [{better}]")
+
+    # --- Anti-pattern count comparison ---
+    # History-based APs (modularity-violation, unstable-interface, crossing) require git history
+    # which loop folders don't have — only compare structural APs reliably
+    _HISTORY_AP = {"modularity-violation", "unstable-interface", "crossing", "total"}
+    base_ap = base_p.get("anti_pattern_counts", {})
+    best_ap = best_p.get("anti_pattern_counts", {})
+    all_ap_types = sorted(set(list(base_ap.keys()) + list(best_ap.keys())))
+    if all_ap_types:
+        print(f"\n  Anti-pattern changes (structural only — history-based need git history):")
+        for ap_type in all_ap_types:
+            bc = base_ap.get(ap_type, 0)
+            ec = best_ap.get(ap_type, 0)
+            if ap_type in _HISTORY_AP:
+                if bc > 0 and ec == 0:
+                    print(f"    {ap_type}: {bc} → N/A (no git history in loop folder)")
+                    continue
+            d = ec - bc
+            if d != 0:
+                sign = "+" if d > 0 else ""
+                status = "SOLVED" if ec == 0 else ("reduced" if d < 0 else "increased")
+                print(f"    {ap_type}: {bc} → {ec} ({sign}{d}) [{status}]")
+            else:
+                print(f"    {ap_type}: {bc} (unchanged)")
+
+    # --- Module penalty comparison ---
+    base_mods = base_p.get("metrics", {}).get("m_score_modules", [])
+    best_mods = best_p.get("metrics", {}).get("m_score_modules", [])
+    if base_mods and best_mods:
+        # Build lookup by module key
+        def _mod_key(m):
+            return m.get("module_key", m.get("layer", "?"))
+        base_by_key = {_mod_key(m): m for m in base_mods}
+        best_by_key = {_mod_key(m): m for m in best_mods}
+        improved_mods = []
+        for mk, bm in base_by_key.items():
+            em = best_by_key.get(mk)
+            if em:
+                b_loss = bm["size_factor"] * (1 - bm["size_penalty"])
+                e_loss = em["size_factor"] * (1 - em["size_penalty"])
+                if e_loss < b_loss - 0.001:
+                    improved_mods.append((mk, b_loss, e_loss))
+        if improved_mods:
+            print(f"\n  Modules with REDUCED M-score penalty:")
+            for mk, bl, el in sorted(improved_mods, key=lambda x: x[1]-x[2], reverse=True):
+                print(f"    Module {mk}: loss {bl*100:.2f}% → {el*100:.2f}% (saved {(bl-el)*100:.2f}%)")
+
+    print(f"{'─'*60}")
+
+
+def _offer_manual_targeting(temporal_root: pathlib.Path, model: str,
+                             iteration_dirs: list, base_name_parts: list,
+                             data_repos: pathlib.Path, today, max_iterations: int,
+                             this_run_folders: set,
+                             qa_model: str = "qwen3-coder-30b-refactor") -> None:
+    """After automated loop, offer single-shot manual targeting iterations.
+    Q&A (analysis) uses qa_model (local Ollama). Code application uses model (Claude/Qwen)."""
+    import shutil as _sh_m, datetime as _dt_m, re as _re_m
+    sep = "=" * 70
+    print(f"\n{sep}")
+    print(f"  MANUAL TARGETING (optional)")
+    print(f"  You can now run single targeted iterations on specific modules or anti-patterns.")
+    print(f"  Examples:")
+    print(f"    refactor module 1,0    — target a specific DV8 module")
+    print(f"    refactor clique        — target clique anti-patterns")
+    print(f"    refactor _models.py    — target a specific file")
+    print(f"    refactor package-cycle — target package cycle anti-patterns")
+    print(f"    q / quit               — finish and generate final report")
+    print(f"{sep}")
+
+    manual_iteration = len(iteration_dirs)
+    current_source = iteration_dirs[-1][1] if iteration_dirs else None
+    if current_source is None:
+        return
+
+    while True:
+        try:
+            cmd = input("\n  Manual target (or q to finish): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not cmd or cmd.lower() in ("q", "quit", "exit"):
+            break
+        # Extract target from input
+        target = cmd
+        if cmd.lower().startswith("refactor"):
+            target = cmd[len("refactor"):].strip()
+        if not target:
+            print("  No target specified. Try: refactor module 1,0")
+            continue
+
+        manual_iteration += 1
+        print(f"\n[manual] Running targeted iteration {manual_iteration}: {target}")
+
+        # Run single iteration with manual target — reuse loop infrastructure
+        import importlib.util as _ilu_m
+        _spec_m = _ilu_m.spec_from_file_location("itb", pathlib.Path(INTERPRET_TEMPORAL))
+        _mod_m = _ilu_m.module_from_spec(_spec_m)
+        _spec_m.loader.exec_module(_mod_m)
+
+        # Load context
+        interp_dir = temporal_root / "OUTPUT_INTERPRETATION"
+        candidates = sorted(
+            [d for d in interp_dir.iterdir() if d.is_dir()] if interp_dir.exists() else [],
+            key=lambda d: d.stat().st_mtime, reverse=True
+        )
+        report_text = ""
+        if candidates:
+            for rp in ["INTERPRETATION_REPORT.md", "report.md", "interpretation.md"]:
+                rpath = candidates[0] / rp
+                if rpath.exists():
+                    report_text = rpath.read_text(encoding="utf-8", errors="replace")
+                    break
+
+        _risk_ctx, _commit_ctx, _ = _load_rich_qa_context(temporal_root)
+        _mscore_bd = _mod_m.load_mscore_worst_modules(temporal_root)
+        _ap_ctx = _build_antipattern_context(temporal_root)
+        conversation_m: list[str] = []
+
+        def _man_ask(question: str) -> str:
+            prior = "\n\n".join(conversation_m)
+            ctx = (prior + "\n\n" + report_text) if prior else report_text
+            raw = _mod_m.answer_user_question(qa_model, question, ctx,
+                                               mscore_breakdown=_mscore_bd,
+                                               timeout_s=900,
+                                               risk_score_context=_risk_ctx,
+                                               commit_context=_commit_ctx)
+            answer = _mod_m.strip_thinking_and_fences(raw)
+            conversation_m.append(f"Q: {question}\nA: {answer}")
+            return answer
+
+        # Q1 quick analysis
+        _man_ask("Which parts got worse over time — show anti-pattern groups, "
+                 "files with most dependency growth, and worst files overall.")
+
+        # Q2 targeted
+        _manual_hint = f"\n\nUSER-SPECIFIED TARGET: {target}\n"
+        if _ap_ctx:
+            _manual_hint += f"Anti-pattern context:\n\n{_ap_ctx}\n"
+        _man_ask(
+            f"The user wants to refactor: {target}. "
+            "Give EXACTLY 3 concrete code-level refactoring actions using ### Action 1 / ### Action 2 / ### Action 3 headings. "
+            "Each action MUST target the specified area with exact dependency-breaking changes "
+            "(remove import, move function, break cycle, etc). "
+            "Do NOT create protocol/interface files unless explicitly needed — "
+            "prefer MOVING code to REMOVE import edges over ADDING abstraction layers. "
+            "Only structural code changes — no process actions."
+            + _manual_hint
+        )
+
+        # Parse and apply Action 1
+        _q2 = conversation_m[-1]
+        _actions = _re_m.findall(
+            r"### Action (\d+)[^\n]*\n(.*?)(?=\n### Action \d+|\n## |\Z)",
+            _q2, _re_m.DOTALL
+        )
+        if not _actions:
+            print("[manual] Could not parse actions from Q2. Skipping.")
+            continue
+
+        action_text = _actions[0][1].strip()
+        action_date = today - _dt_m.timedelta(days=manual_iteration)
+        date_str = action_date.strftime("%d%m%Y")
+        prefix = "000"
+        new_name = f"{prefix}_manual{manual_iteration}_{date_str}_1000"
+        new_dir = data_repos / new_name
+
+        if new_dir.exists():
+            _sh_m.rmtree(new_dir)
+        _sh_m.copytree(current_source, new_dir)
+        _stage4_clean_copy(new_dir)
+        _stage4_apply_action(new_dir, "1", action_text, model)
+
+        rc = _stage4_run_dv8(new_dir, skip_arch_report=True)
+        if rc != 0:
+            print(f"[manual] DV8 failed. Folder kept for inspection: {new_dir.name}")
+            continue
+
+        new_mscore = _stage4_read_mscore(new_dir)
+        if new_mscore is not None:
+            prev = _stage4_read_mscore(current_source)
+            delta = new_mscore - prev if prev else 0
+            sign = "+" if delta >= 0 else ""
+            print(f"[manual] M-score: {new_mscore:.2f}% ({sign}{delta:.2f}%)")
+        else:
+            print(f"[manual] Could not read M-score.")
+
+        _manual_am = _stage4_read_all_metrics(new_dir)
+        iteration_dirs.append((str(manual_iteration), new_dir, action_date, new_mscore, _manual_am))
+        current_source = new_dir
+        print(f"[manual] Iteration {manual_iteration} complete: {new_dir.name}")
+
+
+def _run_multi_model_loop(temporal_root: pathlib.Path, models: list[str],
+                           max_iterations: int = 4,
+                           qa_model: str = "qwen3-coder-30b-refactor") -> int:
+    """Run refactoring loop for each model independently from the SAME baseline,
+    then plot all curves together for comparison.
+
+    Each model gets its own track with separate iteration folders (e.g. loop1_claude_sonnet, loop1_qwen).
+    All tracks start from the same original baseline — no model builds on another's work.
+    Default 4 iterations = 2 full cycles (module→AP→module→AP) per model.
+    Q&A (Stage 3) always uses qa_model (local Ollama). Code application uses each model.
+    """
+    import json as _jmm, shutil as _sh_mm
+    all_tracks: dict[str, list[tuple[str, float | None]]] = {}  # label → [(iter, mscore)]
+
+    # Find the original baseline ONCE — all models start from here
+    data_repos = temporal_root / "data_repositories"
+    if not data_repos.is_dir():
+        print("[multi] No data_repositories/ folder found.")
+        return 1
+    orig_revs = sorted(
+        [p for p in data_repos.iterdir()
+         if p.is_dir() and len(p.name) > 2 and p.name[:2].isdigit() and p.name[2] == "_"],
+        key=lambda p: p.name
+    )
+    if not orig_revs:
+        print("[multi] No source revision found.")
+        return 1
+    baseline_dir = orig_revs[0]
+    baseline_ms = _stage4_read_mscore(baseline_dir)
+    print(f"\n{'#'*70}")
+    print(f"  MULTI-MODEL COMPARISON: {', '.join(models)}")
+    print(f"  Baseline: {baseline_dir.name} (M-score: {baseline_ms:.2f}%)" if baseline_ms else f"  Baseline: {baseline_dir.name}")
+    print(f"  Iterations per model: {max_iterations} (2 full cycles: module→AP→module→AP)")
+    print(f"  Q&A model: {qa_model}")
+    print(f"{'#'*70}")
+
+    for model in models:
+        _label = model.replace("qwen3-coder-30b-refactor", "qwen").replace("claude-", "claude_")
+        print(f"\n{'#'*70}")
+        print(f"  MODEL TRACK: {model} (label: {_label})")
+        print(f"{'#'*70}")
+
+        # Clean up any previous loop folders for THIS track before starting
+        for _old in list(data_repos.iterdir()):
+            if _old.is_dir() and f"_{_label}_" in _old.name:
+                _pfx = _old.name.split("_")[0]
+                if _pfx.isdigit() and len(_pfx) >= 3:
+                    _sh_mm.rmtree(_old)
+
+        rc = _run_refactor_loop(temporal_root, model=model, max_iterations=max_iterations,
+                                 track_label=_label, qa_model=qa_model)
+
+        # Collect results from timeseries for this track
+        ts_path = temporal_root / "INPUT_INTERPRETATION" / "timeseries.json"
+        if ts_path.exists():
+            ts = _jmm.loads(ts_path.read_text())
+            track_data = []
+            _tag = f"-{_label}"
+            for rev in ts.get("revisions", []):
+                ch = rev.get("commit_hash", "")
+                if f"ai{_tag}-" in ch:
+                    it_num = ch.split("-")[-1]
+                    ms = rev.get("metrics", {}).get("m-score")
+                    track_data.append((it_num, ms))
+            all_tracks[_label] = track_data
+
+    # Print comparison table
+    if len(all_tracks) > 1:
+        print(f"\n{'='*70}")
+        print(f"  MODEL COMPARISON")
+        print(f"{'='*70}")
+        if baseline_ms is not None:
+            print(f"  {'baseline':20s}: M-score = {baseline_ms:.2f}%")
+        for label, data in all_tracks.items():
+            scores = [ms for _, ms in data if ms is not None]
+            best = max(scores) if scores else 0
+            delta = best - baseline_ms if baseline_ms else 0
+            sign = "+" if delta >= 0 else ""
+            print(f"  {label:20s}: best M-score = {best:.2f}% ({sign}{delta:.2f}%) in {len(data)} iterations")
+        # Declare winner
+        if all_tracks:
+            winner = max(all_tracks.items(), key=lambda kv: max((ms for _, ms in kv[1] if ms is not None), default=0))
+            winner_best = max((ms for _, ms in winner[1] if ms is not None), default=0)
+            print(f"\n  WINNER: {winner[0]} with M-score {winner_best:.2f}%")
+        print(f"{'='*70}")
+
+    return 0
+
+
+def _run_refactor_loop(temporal_root: pathlib.Path, model: str = "qwen3-coder-30b-refactor",
+                       max_iterations: int = 5, track_label: str = "",
+                       qa_model: str = "qwen3-coder-30b-refactor",
+                       use_feedback_loop: bool = False) -> int:
+    """Loop mode Stage 4: full pipeline per iteration.
+
+    Stage 3 (Q&A analysis) always uses qa_model (local Ollama — fast, reliable).
+    Stage 4 (code application) uses model (Claude CLI / Qwen / Codex).
+
+    Each iteration: Q1 (analysis) → Q2 (anti-pattern targeting) → apply ONE action via LLM →
+    full DV8 re-analysis (DSM, metrics, anti-patterns, M-score) → compare.
+
+    Strategy: ALL iterations target specific DV8 anti-patterns (clique, unhealthy inheritance,
+    package cycle, etc.) with exact file lists from arch-issue data. This is more effective
+    than targeting vague module penalties because anti-patterns are concrete and actionable.
+
+    Guards: file integrity (rejects if LLM destroys files), baseline M-score guard,
+    anti-pattern count verification after each iteration.
+
+    Stops when: max_iterations reached, M-score stalls 3x, or DV8 fails.
+    After automated loop: offers manual targeting for single follow-up iterations.
     """
     import shutil as _sh, datetime as _dt, json as _js, importlib.util as _ilu, re as _re_l
     sep = "=" * 70
-    print(f"\n{sep}\n  STAGE 4 (LOOP MODE): max {max_iterations} iterations\n{sep}")
+    _model_label = track_label or model
+    # Q&A (Q1/Q2 analysis) must use a local Ollama model — Claude models don't route through Ollama
+    if qa_model.startswith("claude-"):
+        print(f"[loop] qa_model '{qa_model}' is a Claude model — falling back to local Ollama for Q&A.")
+        qa_model = "qwen3-coder-30b-refactor"
+    print(f"\n{sep}\n  STAGE 4 (LOOP MODE): max {max_iterations} iterations")
+    print(f"  Q&A model (Stage 3):      {qa_model}")
+    print(f"  Refactor model (Stage 4): {model}")
+    if use_feedback_loop:
+        print(f"  Feedback loop:            ENABLED (reviewer checks each iteration)")
+    print(f"{sep}")
 
     data_repos = temporal_root / "data_repositories"
     if not data_repos.is_dir():
@@ -1308,12 +2589,23 @@ def _run_refactor_loop(temporal_root: pathlib.Path, model: str = "qwen3-coder-30
     _spec.loader.exec_module(_mod)
 
     prev_mscore: float | None = None
+    baseline_mscore: float | None = None  # original pre-refactoring M-score (never changes)
     iteration_dirs: list[tuple[str, pathlib.Path, _dt.date, float | None]] = []
     stall_count: int = 0          # consecutive iterations with no significant improvement
     STALL_LIMIT: int = 3          # stop after this many consecutive stalls
     today = _dt.date.today()
     # Track folders created by THIS run so we don't delete them on the next iteration
     this_run_folders: set[str] = set()
+    # Track tried actions so we can tell the LLM to pick different anti-patterns on stall
+    tried_actions: list[str] = []
+    # Track file sets targeted by each action — used for deduplication (more reliable than text matching)
+    tried_file_sets: list[frozenset[str]] = []
+    # Track reviewer failures from feedback loop — fed as context to next iteration
+    review_failures: list[str] = []
+
+    def _extract_action_files(text: str) -> frozenset[str]:
+        """Extract file paths mentioned in an action for deduplication."""
+        return frozenset(_re_l.findall(r'[\w/._-]+\.(?:py|java|ts|js|go|rs|cpp|c|h)', text))
 
     # Find the baseline source revision (most recent hand-written commit = lowest 2-digit prefix)
     rev_dirs = _get_source_revs()
@@ -1321,16 +2613,31 @@ def _run_refactor_loop(temporal_root: pathlib.Path, model: str = "qwen3-coder-30
         print("[loop] No source revision found.")
         return 1
     current_source = rev_dirs[0]
+    baseline_mscore = _stage4_read_mscore(current_source)
+    _baseline_all_metrics = _stage4_read_all_metrics(current_source)
+    if baseline_mscore is not None:
+        print(f"[loop] Original baseline M-score: {baseline_mscore:.2f}% (guard: will revert if worse)")
+    if _baseline_all_metrics:
+        print(f"[loop] Baseline metrics: " + ", ".join(
+            f"{k}={v:.2f}%" for k, v in sorted(_baseline_all_metrics.items())))
     # Cache the repo name parts from the ORIGINAL source so folder names stay clean across iterations
     _orig_src_parts = current_source.name.split("_")
     _base_name_parts = _orig_src_parts[1:-2]  # e.g. ["ARCH_ANALYSIS_TRAINTICKET_TOY_EXAMPLES_MULTILANG"]
 
     # Delete any stale loop folders from previous runs before we start
+    # In multi-model mode, only delete folders for THIS track (keep other tracks)
+    _track_suffix_check = f"_{track_label}_" if track_label else None
     for _old in list(data_repos.iterdir()):
         if _old.is_dir():
             _pfx = _old.name.split("_")[0]
             if _pfx.isdigit() and len(_pfx) >= 3:
-                _sh.rmtree(_old)
+                if _track_suffix_check:
+                    # Multi-model: only delete folders for this specific track
+                    if _track_suffix_check in _old.name:
+                        _sh.rmtree(_old)
+                else:
+                    # Single-model: delete all loop folders
+                    _sh.rmtree(_old)
 
     for iteration in range(1, max_iterations + 1):
         print(f"\n{sep}\n  LOOP ITERATION {iteration}/{max_iterations}\n{sep}")
@@ -1367,41 +2674,116 @@ def _run_refactor_loop(temporal_root: pathlib.Path, model: str = "qwen3-coder-30
         def _loop_ask(question: str) -> str:
             prior = "\n\n".join(conversation)
             ctx = (prior + "\n\n" + report_text) if prior else report_text
-            raw = _mod.answer_user_question(model, question, ctx,
+            raw = _mod.answer_user_question(qa_model, question, ctx,
                                             mscore_breakdown=_mscore_bd,
                                             timeout_s=900,
                                             risk_score_context=_risk_ctx,
                                             commit_context=_commit_ctx)
             answer = _mod.strip_thinking_and_fences(raw)
-            print(f"\n[loop] Q: {question}\n[loop] A (trimmed): {answer[:300]}...")
+            print(f"\n[loop] Q ({qa_model}): {question}\n[loop] A (trimmed): {answer[:300]}...")
             conversation.append(f"Q: {question}\nA: {answer}")
             return answer
+
+        # Build DV8 anti-pattern context — specific instances with file lists for surgical targeting
+        _ap_ctx = _build_antipattern_context(temporal_root)
+        if _ap_ctx:
+            print(f"[loop] Loaded DV8 anti-pattern instances with file lists for targeted refactoring.")
+        else:
+            print(f"[loop] WARNING: No anti-pattern data found. Q2 will use generic prompt.")
 
         print(f"[loop] Running Q1 (anti-pattern analysis)...")
         _loop_ask("Which parts got worse over time — show anti-pattern groups, "
                   "files with most dependency growth, and worst files overall.")
-        print(f"[loop] Running Q2 (get 3 prioritized actions, will apply only Action 1)...")
-        _loop_ask("How would you refactor the worst anti-pattern? "
-                  "Give EXACTLY 3 concrete code-level refactoring actions using ### Action 1 / ### Action 2 / ### Action 3 headings. "
-                  "Each action must describe specific file changes (rename, split class, remove extends, extract interface, move method, etc). "
-                  "Do NOT include process actions like 'code reviews' or 'documentation'. Only structural code changes. "
-                  "Action 1 must be the single most impactful change right now.")
 
-        # Parse top action from Q2 answer
-        action_match = _re_l.search(
-            r"### Action 1[^\n]*\n(.*?)(?=\n### Action \d+|\n## |\Z)",
-            conversation[-1], _re_l.DOTALL
+        # ALL iterations target anti-patterns — the concrete file lists make this surgical
+        print(f"[loop] Running Q2 — strategy: ANTI-PATTERN (iteration {iteration})...")
+
+        # Build skip clause for previously tried actions
+        _skip_clause = ""
+        if tried_actions:
+            _tried_list = "\n".join(f"  - {a}" for a in tried_actions)
+            _skip_clause = (
+                f"\n\nIMPORTANT: The following actions were already tried in previous iterations "
+                f"and did NOT improve the architecture. Do NOT repeat them or target the same files/anti-patterns. "
+                f"Pick a DIFFERENT anti-pattern instance or a different structural change:\n{_tried_list}\n"
+            )
+        # Add review failure feedback so next iteration avoids the same mistakes
+        if review_failures:
+            _fail_list = "\n".join(f"  - {f}" for f in review_failures[-3:])
+            _skip_clause += (
+                f"\n\nCRITICAL — PREVIOUS ITERATIONS FAILED CODE REVIEW:\n{_fail_list}\n"
+                f"The refactoring MUST NOT introduce the same issues. Pay extra attention to:\n"
+                f"- All imports resolving correctly\n"
+                f"- No circular imports between files\n"
+                f"- Complete code moves (not stubs or placeholders)\n"
+                f"- All callers updated to import from new locations\n"
+            )
+
+        if _ap_ctx:
+            _loop_ask(
+                "Based on the DV8 anti-pattern analysis below, give EXACTLY 3 concrete code-level "
+                "refactoring actions using ### Action 1 / ### Action 2 / ### Action 3 headings. "
+                "Each action MUST target a SPECIFIC anti-pattern instance listed below and name the exact files involved. "
+                "Describe exact dependency-breaking changes: "
+                "which import to remove, which function/class to move, which file to split. "
+                "Do NOT include process actions ('code reviews', 'documentation'). Only structural code changes. "
+                "Do NOT create protocol/interface files unless the action specifically requires it — "
+                "prefer MOVING code to REMOVE import edges over ADDING abstraction layers. "
+                "Action 1 must target the anti-pattern instance with the MOST files (highest impact)."
+                f"\n\n{_ap_ctx}\n"
+                f"CRITICAL RULES FOR EFFECTIVE REFACTORING:\n"
+                f"- The goal is to REDUCE dependency edges, not add abstraction layers.\n"
+                f"- MOVE code from high-coupling files to low-coupling files.\n"
+                f"- When breaking a cycle A→B→C→A: identify the WEAKEST edge (fewest callers) and remove it "
+                f"by moving the imported symbols to where they're used.\n"
+                f"- NEVER create re-exports — if you move code, update ALL callers to import from the new location.\n"
+                f"- NEVER use TYPE_CHECKING blocks — DV8 counts them as real imports.\n"
+                f"- Prefer FEWER files with clear responsibilities over MANY small files.\n"
+                + _skip_clause
+            )
+        else:
+            # Fallback if no anti-pattern data available
+            _loop_ask(
+                "Give EXACTLY 3 concrete code-level refactoring actions using ### Action 1 / ### Action 2 / ### Action 3 headings. "
+                "Each action must target tight coupling or circular dependencies between specific files. "
+                "Describe exact changes: which import to remove, which function to move, which file to split. "
+                "Do NOT include process actions. Only structural code changes."
+                + _skip_clause
+            )
+
+        # Parse actions from Q2 answer — prefer Action 1, but on stall fall back to Action 2/3
+        _q2_answer = conversation[-1]
+        _all_actions = _re_l.findall(
+            r"### Action (\d+)[^\n]*\n(.*?)(?=\n### Action \d+|\n## |\Z)",
+            _q2_answer, _re_l.DOTALL
         )
-        if not action_match:
-            print(f"[loop] Could not parse ### Action 1 from Q2 answer. Stopping.")
+        if not _all_actions:
+            print(f"[loop] Could not parse any ### Action from Q2 answer. Stopping.")
             break
-        action_text = action_match.group(1).strip()
+        # Pick the first action that hasn't been tried yet (by comparing target file sets)
+        action_text = None
+        for _act_num, _act_body in _all_actions:
+            _act_clean = _act_body.strip()
+            _act_files = _extract_action_files(_act_clean)
+            if _act_files and any(_act_files == t for t in tried_file_sets):
+                print(f"[loop] Skipping Action {_act_num} — targets same files as a previous action.")
+                continue
+            action_text = _act_clean
+            print(f"[loop] Selected Action {_act_num} for this iteration.")
+            break
+        if not action_text:
+            # All actions target same files as before — use Action 1 anyway as last resort
+            action_text = _all_actions[0][1].strip()
+            print(f"[loop] All actions target previously tried files — using Action 1 anyway.")
+        tried_file_sets.append(_extract_action_files(action_text))
+        tried_actions.append(action_text[:200])
 
         # Build new folder for this iteration
         action_date = today - _dt.timedelta(weeks=max_iterations - iteration + 1)
         date_str = action_date.strftime("%d%m%Y")
         prefix = str(max_iterations - iteration + 1).zfill(3)
-        new_name = prefix + "_" + "_".join(_base_name_parts) + f"_loop{iteration}_{date_str}_1000"
+        _track_suffix = f"_{track_label}" if track_label else ""
+        new_name = prefix + "_" + "_".join(_base_name_parts) + f"_loop{iteration}{_track_suffix}_{date_str}_1000"
         new_dir = data_repos / new_name
 
         if new_dir.exists():
@@ -1409,25 +2791,191 @@ def _run_refactor_loop(temporal_root: pathlib.Path, model: str = "qwen3-coder-30
         _sh.copytree(current_source, new_dir)
         this_run_folders.add(new_dir.name)
         _stage4_clean_copy(new_dir)
+        print(f"[loop] Applying refactoring with: {model}")
         _stage4_apply_action(new_dir, "1", action_text, model)
 
-        rc = _stage4_run_dv8(new_dir)
+        # FILE INTEGRITY GUARD: detect file destruction vs legitimate code moves
+        # Old logic reverted valid refactoring where code was MOVED from one file to another.
+        # New logic: track shrunk files, grown files, and net line count across all source files.
+        _shrunk = []   # files that lost >80% of lines (went to <=3 lines)
+        _grown = []    # files that gained significant lines
+        _total_before = 0
+        _total_after = 0
+        _skip_pats = ["InputData", "OutputData", "__pycache__", "tests"]
+        for _sf in current_source.rglob("*.py"):
+            _rel = _sf.relative_to(current_source)
+            if any(p in str(_rel) for p in _skip_pats):
+                continue
+            _orig_lines = sum(1 for _ in open(_sf, encoding="utf-8", errors="replace"))
+            _total_before += _orig_lines
+            _new_f = new_dir / _rel
+            if _new_f.exists():
+                _new_lines = sum(1 for _ in open(_new_f, encoding="utf-8", errors="replace"))
+            else:
+                _new_lines = 0  # file was deleted
+            _total_after += _new_lines
+            if _orig_lines > 10 and _new_lines <= 3:
+                _shrunk.append((_rel, _orig_lines, _new_lines))
+            elif _new_lines > _orig_lines + 20:
+                _grown.append((_rel, _orig_lines, _new_lines))
+        # Also count NEW files created by refactoring
+        for _nf in new_dir.rglob("*.py"):
+            _nrel = _nf.relative_to(new_dir)
+            if any(p in str(_nrel) for p in _skip_pats):
+                continue
+            _orig_f = current_source / _nrel
+            if not _orig_f.exists():
+                _new_lines = sum(1 for _ in open(_nf, encoding="utf-8", errors="replace"))
+                _total_after += _new_lines
+                if _new_lines > 20:
+                    _grown.append((_nrel, 0, _new_lines))
+        # Decision: destruction = shrunk files WITHOUT corresponding growth
+        _net_loss = _total_before - _total_after
+        _net_loss_pct = (_net_loss / _total_before * 100) if _total_before > 0 else 0
+        _integrity_violated = False
+        if _shrunk and not _grown and _net_loss_pct > 20:
+            # Files shrunk, nothing grew — code was DELETED not MOVED
+            print(f"[loop] FILE INTEGRITY VIOLATION: {len(_shrunk)} file(s) destroyed, "
+                  f"net loss {_net_loss} lines ({_net_loss_pct:.0f}%)")
+            _integrity_violated = True
+        elif _shrunk and len(_shrunk) > 3:
+            # Too many files shrunk even if some grew — likely bulk destruction
+            print(f"[loop] FILE INTEGRITY VIOLATION: {len(_shrunk)} files shrunk to <=3 lines")
+            _integrity_violated = True
+        elif _shrunk:
+            # Some files shrunk but others grew — likely legitimate code MOVE
+            for _rel, _ol, _nl in _shrunk:
+                print(f"[loop] Note: {_rel} emptied ({_ol}->{_nl} lines) — code likely moved")
+        if _integrity_violated:
+            for _rel, _ol, _nl in _shrunk[:5]:
+                print(f"[loop]   {_rel}: {_ol}->{_nl} lines")
+            print(f"[loop] Reverting iteration {iteration} — LLM destroyed source files.")
+            _sh.rmtree(new_dir)
+            stall_count += 1
+            if stall_count >= STALL_LIMIT:
+                print(f"[loop] {STALL_LIMIT} consecutive stalls/reverts — stopping early.")
+                break
+            continue
+
+        # FEEDBACK LOOP REVIEW: second Claude instance checks refactoring correctness
+        if use_feedback_loop:
+            _review_passed, _review_reason = _stage4_review_refactoring(
+                new_dir, action_text, model, prev_failures=review_failures)
+            if not _review_passed:
+                print(f"[loop] REVIEW FAILED: {_review_reason}")
+                review_failures.append(f"Iteration {iteration}: {_review_reason}")
+                print(f"[loop] Reverting iteration {iteration} — reviewer found issues.")
+                _sh.rmtree(new_dir)
+                stall_count += 1
+                if stall_count >= STALL_LIMIT:
+                    print(f"[loop] {STALL_LIMIT} consecutive stalls/reverts — stopping early.")
+                    break
+                continue
+            else:
+                print(f"[loop] Review PASSED — proceeding to DV8 analysis.")
+
+        # PRE-COPY git history from baseline so DV8 can detect modularity violations.
+        # Loop folders have no .git, so dv8_agent can't generate git-history.txt.
+        # By copying the baseline's git-history.txt, dv8_agent will use it to build
+        # the history DSM and merge it with the new structural DSM for MV detection.
+        _baseline_history = rev_dirs[0] / "OutputData" / "history-dsm" / "git-history.txt"
+        if _baseline_history.exists():
+            _loop_history_dir = new_dir / "OutputData" / "history-dsm"
+            _loop_history_dir.mkdir(parents=True, exist_ok=True)
+            _sh.copy2(_baseline_history, _loop_history_dir / "git-history.txt")
+            print(f"[loop] Copied baseline git-history.txt for MV detection.")
+
+        rc = _stage4_run_dv8(new_dir, skip_arch_report=True)
         if rc != 0:
             print(f"[loop] DV8 failed on iteration {iteration}. Stopping.")
             return rc
 
         new_mscore = _stage4_read_mscore(new_dir)
+        all_metrics = _stage4_read_all_metrics(new_dir)
         if new_mscore is not None:
-            delta = new_mscore - prev_mscore if prev_mscore is not None else 0.0
-            sign = "+" if delta >= 0 else ""
-            print(f"[loop] M-score iteration {iteration}: {new_mscore:.2f}% ({sign}{delta:.2f}%)")
+            delta_baseline = new_mscore - baseline_mscore if baseline_mscore is not None else 0.0
+            delta_prev = new_mscore - prev_mscore if prev_mscore is not None else 0.0
+            sign_b = "+" if delta_baseline >= 0 else ""
+            sign_p = "+" if delta_prev >= 0 else ""
+            print(f"[loop] M-score iteration {iteration}: {new_mscore:.2f}% "
+                  f"(vs baseline: {sign_b}{delta_baseline:.2f}%, vs prev: {sign_p}{delta_prev:.2f}%)")
+            # Show ALL metrics for this iteration
+            if all_metrics:
+                # Check for isolated items inflation
+                _new_iso = int(all_metrics.get("isolated-items", 0))
+                _base_iso = int(_baseline_all_metrics.get("isolated-items", 0))
+                if _new_iso > _base_iso:
+                    print(f"[loop] WARNING: Isolated items {_base_iso}->{_new_iso} — "
+                          f"metrics may be inflated by empty/disconnected files!")
+                # Show primary metrics (skip internal keys)
+                _display_keys = ["m-score", "propagation-cost", "decoupling-level", "independence-level"]
+                print(f"[loop] All metrics iteration {iteration}:")
+                for mk in _display_keys:
+                    mv = all_metrics.get(mk)
+                    if mv is None:
+                        continue
+                    baseline_m = _baseline_all_metrics.get(mk)
+                    if baseline_m is not None:
+                        delta_m = mv - baseline_m
+                        if mk == "propagation-cost":
+                            improved = delta_m < 0
+                        else:
+                            improved = delta_m > 0
+                        sign_m = "+" if delta_m >= 0 else ""
+                        status = "improved" if improved else ("same" if abs(delta_m) < 0.1 else "WORSE")
+                        line = f"[loop]   {mk}: {mv:.2f}% ({sign_m}{delta_m:.2f}% vs baseline) [{status}]"
+                        # If isolated items increased, also show exclude-isolated value
+                        if _new_iso > _base_iso:
+                            excl_key = f"{mk}-excl"
+                            excl_val = all_metrics.get(excl_key)
+                            if excl_val is not None:
+                                line += f"  (excl-isolated: {excl_val:.2f}%)"
+                        print(line)
+                    else:
+                        print(f"[loop]   {mk}: {mv:.2f}%")
+
+            # BASELINE GUARD: if ANY key metric is worse than original, revert
+            # When isolated items increased, use exclude-isolated values for honest comparison
+            _revert_reason = None
+            if baseline_mscore is not None and new_mscore < baseline_mscore - 0.5:
+                _revert_reason = f"M-score {new_mscore:.2f}% is WORSE than baseline {baseline_mscore:.2f}%"
+            if not _revert_reason and all_metrics and _baseline_all_metrics:
+                # Use exclude-isolated values when isolated items increased
+                _use_excl = _new_iso > _base_iso
+                _prop_key = "propagation-cost-excl" if (_use_excl and "propagation-cost-excl" in all_metrics) else "propagation-cost"
+                _dec_key = "decoupling-level-excl" if (_use_excl and "decoupling-level-excl" in all_metrics) else "decoupling-level"
+                _prop_base_key = "propagation-cost-excl" if (_use_excl and "propagation-cost-excl" in _baseline_all_metrics) else "propagation-cost"
+                _dec_base_key = "decoupling-level-excl" if (_use_excl and "decoupling-level-excl" in _baseline_all_metrics) else "decoupling-level"
+                _prop_new = all_metrics.get(_prop_key)
+                _prop_base = _baseline_all_metrics.get(_prop_base_key)
+                if _prop_new is not None and _prop_base is not None and _prop_new > _prop_base + 2.0:
+                    _revert_reason = (f"Propagation cost {_prop_new:.2f}% is WORSE "
+                                      f"than baseline {_prop_base:.2f}%"
+                                      + (" (excl-isolated)" if _use_excl else ""))
+                _dec_new = all_metrics.get(_dec_key)
+                _dec_base = _baseline_all_metrics.get(_dec_base_key)
+                if _dec_new is not None and _dec_base is not None and _dec_new < _dec_base - 2.0:
+                    _revert_reason = (f"Decoupling level {_dec_new:.2f}% is WORSE "
+                                      f"than baseline {_dec_base:.2f}%"
+                                      + (" (excl-isolated)" if _use_excl else ""))
+            if _revert_reason:
+                print(f"[loop] WARNING: {_revert_reason}!")
+                print(f"[loop] Reverting iteration {iteration} — rebuilding from previous source.")
+                _sh.rmtree(new_dir)
+                # Don't update current_source — next iteration starts from same point
+                stall_count += 1
+                if stall_count >= STALL_LIMIT:
+                    print(f"[loop] {STALL_LIMIT} consecutive stalls/reverts — stopping early.")
+                    break
+                continue
+
             if prev_mscore is not None and new_mscore <= prev_mscore + 0.1:
                 stall_count += 1
                 print(f"[loop] No significant improvement ({prev_mscore:.2f}% → {new_mscore:.2f}%). "
                       f"Stall {stall_count}/{STALL_LIMIT}.")
                 if stall_count >= STALL_LIMIT:
                     print(f"[loop] {STALL_LIMIT} consecutive stalls — stopping early.")
-                    iteration_dirs.append((str(iteration), new_dir, action_date, new_mscore))
+                    iteration_dirs.append((str(iteration), new_dir, action_date, new_mscore, all_metrics))
                     break
             else:
                 stall_count = 0   # reset on any real improvement
@@ -1435,9 +2983,123 @@ def _run_refactor_loop(temporal_root: pathlib.Path, model: str = "qwen3-coder-30
         else:
             print(f"[loop] Could not read M-score for iteration {iteration}.")
 
-        iteration_dirs.append((str(iteration), new_dir, action_date, new_mscore))
+        # ANTI-PATTERN VERIFICATION: compare structural AP counts before/after
+        _new_ap_csv = new_dir / "OutputData" / "arch-issue" / "anti-pattern-summary.csv"
+        _prev_ap_csv = current_source / "OutputData" / "arch-issue" / "anti-pattern-summary.csv"
+        if _new_ap_csv.exists() and _prev_ap_csv.exists():
+            import csv as _csv_v
+            def _read_ap_counts(csvpath):
+                counts = {}
+                with open(csvpath, newline="", encoding="utf-8") as f:
+                    for row in _csv_v.DictReader(f):
+                        t = row.get("Type", "").strip()
+                        if t and t != "Total":
+                            counts[t] = int(row.get("InstanceCount", 0))
+                return counts
+            _prev_counts = _read_ap_counts(_prev_ap_csv)
+            _new_counts = _read_ap_counts(_new_ap_csv)
+            _all_types = sorted(set(list(_prev_counts.keys()) + list(_new_counts.keys())))
+            _ap_changes = []
+            for _apt in _all_types:
+                _pc = _prev_counts.get(_apt, 0)
+                _nc = _new_counts.get(_apt, 0)
+                if _pc != _nc:
+                    _delta = _nc - _pc
+                    _sign = "+" if _delta > 0 else ""
+                    _ap_changes.append(f"    {_apt}: {_pc}→{_nc} ({_sign}{_delta})")
+            if _ap_changes:
+                print(f"[loop] Anti-pattern changes:")
+                for _c in _ap_changes:
+                    print(_c)
+            else:
+                print(f"[loop] Anti-pattern counts unchanged.")
+            # PACKAGE CYCLE CHECK: warn if package-cycle count increased
+            _prev_pkg_cycles = _prev_counts.get("PackageCycle", 0)
+            _new_pkg_cycles = _new_counts.get("PackageCycle", 0)
+            if _new_pkg_cycles > _prev_pkg_cycles:
+                print(f"[loop] WARNING: Package cycles INCREASED {_prev_pkg_cycles}->{_new_pkg_cycles}! "
+                      f"Refactoring may have introduced cross-package circular dependency.")
+
+        # Generate network graph for this iteration
+        _plot_dir = temporal_root / "INPUT_INTERPRETATION" / "plots"
+        _plot_dir.mkdir(parents=True, exist_ok=True)
+        if iteration == 1:
+            # Also generate baseline network graph
+            _base_graph = _generate_antipattern_network_graph(
+                rev_dirs[0], _plot_dir / "network_baseline.png",
+                title="Baseline — Dependency Network with Anti-Patterns")
+            if _base_graph:
+                print(f"[loop] Saved baseline network graph: {_plot_dir / 'network_baseline.png'}")
+        _iter_graph = _generate_antipattern_network_graph(
+            new_dir, _plot_dir / f"network_iteration_{iteration}.png",
+            title=f"Iteration {iteration} — Dependency Network ({model})")
+        if _iter_graph:
+            print(f"[loop] Saved iteration {iteration} network graph: {_plot_dir / f'network_iteration_{iteration}.png'}")
+
+        iteration_dirs.append((str(iteration), new_dir, action_date, new_mscore, all_metrics))
         # Next iteration builds on this iteration's output
         current_source = new_dir
+
+    # --- Summary + optional cleanup ---
+    if len(iteration_dirs) > 1:
+        scored = [(it, d, dt, ms, am) for it, d, dt, ms, am in iteration_dirs if ms is not None]
+        if scored:
+            best_mscore = max(ms for _, _, _, ms, _ in scored)
+            print(f"\n{'='*60}")
+            print(f"  ITERATION SUMMARY (all metrics vs original baseline)")
+            print(f"{'='*60}")
+            _metric_names = ["m-score", "propagation-cost", "decoupling-level", "independence-level"]
+            # Header
+            print(f"  {'Iter':<6} {'M-score':<12} {'Prop.Cost':<12} {'Decouple':<12} {'Independ.':<12} {'Folder'}")
+            print(f"  {'-'*6} {'-'*12} {'-'*12} {'-'*12} {'-'*12} {'-'*20}")
+            # Baseline row
+            if _baseline_all_metrics:
+                print(f"  {'BASE':<6}", end="")
+                for mn in _metric_names:
+                    bv = _baseline_all_metrics.get(mn, 0)
+                    print(f" {bv:>6.2f}%     ", end="")
+                print(f" (original)")
+            for it_num, it_dir, it_date, it_ms, it_am in iteration_dirs:
+                marker = " ← BEST" if it_ms == best_mscore else ""
+                print(f"  {it_num:<6}", end="")
+                for mn in _metric_names:
+                    val = (it_am or {}).get(mn, 0)
+                    bv = _baseline_all_metrics.get(mn)
+                    if bv is not None:
+                        delta = val - bv
+                        sign = "+" if delta >= 0 else ""
+                        print(f" {val:>6.2f}%{sign}{delta:>+5.1f}", end="")
+                    else:
+                        print(f" {val:>6.2f}%     ", end="")
+                print(f" {it_dir.name[:30]}{marker}")
+            print(f"{'='*60}")
+
+            # --- Before/after architecture diff ---
+            _print_architecture_diff(temporal_root, _get_source_revs()[0] if _get_source_revs() else None,
+                                     iteration_dirs, data_repos)
+
+            # Ask user if they want to delete non-improving iterations
+            worse = [(it, d, dt, ms, am) for it, d, dt, ms, am in iteration_dirs if ms is not None and ms < best_mscore]
+            if worse:
+                print(f"\n  {len(worse)} iteration(s) scored below the best ({best_mscore:.2f}%).")
+                try:
+                    answer = input("  Delete non-improving iterations? [y/N]: ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    answer = "n"
+                if answer in ("y", "yes"):
+                    for it_num, it_dir, it_date, it_ms, _am in worse:
+                        print(f"  Deleting iteration {it_num} ({it_ms:.2f}%) — {it_dir.name}")
+                        _sh.rmtree(it_dir)
+                    iteration_dirs = [(it, d, dt, ms, am) for it, d, dt, ms, am in iteration_dirs
+                                      if not any(it == w[0] and d == w[1] for w in worse)]
+                    print(f"  Kept {len(iteration_dirs)} iteration(s).")
+                else:
+                    print(f"  Keeping all iterations for review.")
+
+    # --- Manual targeting prompt (post-loop) ---
+    _offer_manual_targeting(temporal_root, model, iteration_dirs, _base_name_parts,
+                            data_repos, today, max_iterations, this_run_folders,
+                            qa_model=qa_model)
 
     # Inject synthetic revisions into timeseries.json
     import json as _js2
@@ -1446,18 +3108,30 @@ def _run_refactor_loop(temporal_root: pathlib.Path, model: str = "qwen3-coder-30
                      temporal_root / "timeseries.json"] if p.exists()),
         temporal_root / "INPUT_INTERPRETATION" / "timeseries.json"
     )
+    _track_tag = f"-{track_label}" if track_label else ""
     if ts_path.exists() and iteration_dirs:
         ts = _js2.loads(ts_path.read_text())
+        # Only remove revisions for THIS track (keep other model tracks)
+        _prefix = f"ai{_track_tag}-"
         ts["revisions"] = [r for r in ts.get("revisions", [])
-                           if not r.get("commit_hash", "").startswith("ai-")]
-        for it_num, _, adate, it_mscore in reversed(iteration_dirs):
+                           if not r.get("commit_hash", "").startswith(_prefix)]
+        for it_entry in reversed(iteration_dirs):
+            it_num, _, adate, it_mscore = it_entry[0], it_entry[1], it_entry[2], it_entry[3]
+            it_all_m = it_entry[4] if len(it_entry) > 4 else {}
+            # Build metrics dict with all available metrics
+            _ts_metrics = {}
+            if it_mscore is not None:
+                _ts_metrics["m-score"] = it_mscore
+            if it_all_m:
+                for mk, mv in it_all_m.items():
+                    _ts_metrics[mk] = mv
             synthetic = {
                 "revision_number": 0,
-                "commit_hash": f"ai-loop{it_num}",
+                "commit_hash": f"ai{_track_tag}-{it_num}",
                 "commit_date": f"{adate.strftime('%Y-%m-%d')} 10:00:00 +0000",
-                "commit_author": "qwen3.6 (AI loop)",
-                "commit_message": f"AI Loop Refactor: Iteration {it_num}",
-                "metrics": {"m-score": it_mscore} if it_mscore is not None else {},
+                "commit_author": f"{model} (AI loop)",
+                "commit_message": f"AI Loop Refactor: Iteration {it_num} [{track_label or model}]",
+                "metrics": _ts_metrics,
             }
             ts.setdefault("revisions", []).insert(0, synthetic)
         ts["revision_count"] = len(ts.get("revisions", []))
@@ -1471,6 +3145,15 @@ def _run_refactor_loop(temporal_root: pathlib.Path, model: str = "qwen3-coder-30
     plot_out = temporal_root / "INPUT_INTERPRETATION" / "plots"
     _sp_end.call([sys.executable, PLOTTER, "--json", str(plot_ts), "--output", str(plot_out)])
 
+    # Generate anti-pattern evolution visualization
+    _evo_script = pathlib.Path(__file__).resolve().parent / "refactor_evolution_plot.py"
+    if _evo_script.exists() and iteration_dirs:
+        _sp_end.call([sys.executable, str(_evo_script),
+                      "--temporal-root", str(temporal_root)])
+        _evo_png = plot_out / "refactor_evolution.png"
+        if _evo_png.exists():
+            print(f"  Saved: {_evo_png}")
+
     print(f"\n{sep}\n  Loop mode complete — {len(iteration_dirs)} iteration(s).\n{sep}\n")
 
     # Generate manager report
@@ -1482,19 +3165,28 @@ def _run_refactor_loop(temporal_root: pathlib.Path, model: str = "qwen3-coder-30
 
 
 def _run_refactor_stage(temporal_root: pathlib.Path, conversation: list[str],
-                        model: str = "qwen3-coder-30b-refactor", loop_count: int = 0) -> int:
+                        model: str = "qwen3-coder-30b-refactor", loop_count: int = 0,
+                        refactor_models: list[str] | None = None,
+                        qa_model: str = "qwen3-coder-30b-refactor",
+                        use_feedback_loop: bool = False) -> int:
     """Stage 4: Iterative LLM-refactor — one folder + DV8 run per Q2 action.
 
-    If loop_count > 0: loop mode — re-run Q1+Q2 each iteration, apply only the top action.
-    Otherwise: sequential mode — apply all 3 Q2 actions in order with M-score guard.
+    Stage 3 (Q&A/analysis): always uses qa_model (local Ollama — fast, reliable).
+    Stage 4 (code application): uses model or refactor_models (Claude/Qwen/Codex).
 
-    For N actions the timeline becomes:
-      02_Jan2024 → 01_Jun2024 → 00N_action1 → 00(N-1)_action2 → 001_actionN
-    producing an N+2 point M-score time series.
+    If loop_count > 0: loop mode — full pipeline per iteration (Q1 → Q2 → apply → DV8 → M-score).
+    If refactor_models has >1 entry: multi-model comparison mode — run loop for each model from same baseline.
+    After automated loop: offers manual targeting for single follow-up iterations.
+    Otherwise: sequential mode — apply all 3 Q2 actions in order with M-score guard.
     """
+    # ── MULTI-MODEL COMPARISON ────────────────────────────────────────────────
+    if refactor_models and len(refactor_models) > 1 and loop_count > 0:
+        return _run_multi_model_loop(temporal_root, models=refactor_models,
+                                      max_iterations=loop_count, qa_model=qa_model)
     # ── LOOP MODE ──────────────────────────────────────────────────────────────
     if loop_count > 0:
-        return _run_refactor_loop(temporal_root, model=model, max_iterations=loop_count)
+        return _run_refactor_loop(temporal_root, model=model, max_iterations=loop_count,
+                                   qa_model=qa_model, use_feedback_loop=use_feedback_loop)
     # ── SEQUENTIAL MODE (default) ──────────────────────────────────────────────
     import shutil, re as _re
     sep = "=" * 70
@@ -1626,7 +3318,7 @@ def _run_refactor_stage(temporal_root: pathlib.Path, conversation: list[str],
         new_files = _stage4_apply_action(new_dir, action_num, action_text.strip(), refactor_model)
         all_new_files.extend(new_files)
 
-        rc = _stage4_run_dv8(new_dir)
+        rc = _stage4_run_dv8(new_dir, skip_arch_report=True)
         if rc != 0:
             print(f"[stage4] Stopping after failed DV8 run for action {action_num}.")
             return rc
@@ -2231,6 +3923,26 @@ def tool_temporal_analysis(plan: dict) -> int:
         if "java" in ur and "python" not in ur:
             lang_hint = "java"
 
+        # Dependency extractor: "with neodepends", "with understand", "with depends"
+        if re.search(r"\bwith\s+neodepends\b", ur) or re.search(r"\bneodepends\b", ur):
+            # NeoDepends is default for Python — ensure java_depends is False so Java also uses it
+            java_depends = False
+            force_depends = False
+        elif re.search(r"\bwith\s+understand\b", ur) or re.search(r"\buse\s+understand\b", ur):
+            # Understand requires UND binary — check env or let dv8_agent discover it
+            if not understand_und:
+                import shutil as _sh_u
+                _und = _sh_u.which("und")
+                if _und:
+                    understand_und = _und
+                else:
+                    print("[WARNING] 'understand' requested but no UND binary found. "
+                          "Set --understand-und or install SciTools Understand.")
+        elif re.search(r"\bwith\s+depends\b", ur) or re.search(r"\buse\s+depends\b", ur):
+            # Force legacy Depends for Java (not NeoDepends)
+            java_depends = True
+            force_depends = True
+
         # Keep local NeoDepends clone fresh when Python analysis is requested.
         # dv8_agent.py handles full discovery (local → GitHub clone → release download).
         if any(kw in ur for kw in ("python", "neodepends")):
@@ -2319,6 +4031,14 @@ def tool_temporal_analysis(plan: dict) -> int:
         if mv_cochange is not None:
             cmd += ["--mv-cochange", str(mv_cochange)]
         return cmd
+    # Determine which dependency extractor will be used
+    if understand_und:
+        _extractor_name = "Understand (SciTools)"
+    elif java_depends and (lang_hint == "java" or not lang_hint):
+        _extractor_name = "Depends (legacy Java)"
+    else:
+        _extractor_name = "NeoDepends (auto)"
+
     # If user specified a source_path, run once.
     json_file = None
     if source_path:
@@ -2327,6 +4047,7 @@ def tool_temporal_analysis(plan: dict) -> int:
         print(f"   Repository: {repo}")
         print(f"   Revisions: {count}")
         print(f"   Branch: {branch}")
+        print(f"   Extractor: {_extractor_name}")
         print(f"   Mode: {mode_name}\n")
         rc = subprocess.call(cmd)
     else:
@@ -2355,6 +4076,7 @@ def tool_temporal_analysis(plan: dict) -> int:
             print(f"   Repository: {repo}")
             print(f"   Revisions: {count}")
             print(f"   Branch: {branch}")
+            print(f"   Extractor: {_extractor_name}")
             print(f"   Mode: {mode_name}\n")
             lang_rc = subprocess.call(cmd)
             if lang_rc == 0:
@@ -2414,18 +4136,18 @@ def tool_temporal_analysis(plan: dict) -> int:
             bf_rc = subprocess.call(bf_cmd)
             if bf_rc == 0:
                 print("Interpretation bundle ready.")
-                # Risk pipeline: issue fetch → DV8 binary export → risk scores → plots
-                _git_root = None
-                if repo and "://" not in str(repo):
-                    _candidate = pathlib.Path(repo).expanduser().resolve()
-                    if (_candidate / ".git").exists():
-                        _git_root = _candidate
-                _run_risk_pipeline(
-                    temporal_folder,
-                    repo_name,
-                    git_root=_git_root,
-                    review_model=None,  # skip slow LLM commit review by default
-                )
+                # DISABLED: Risk pipeline — not empirically proven yet, only DV8 metrics used
+                # _git_root = None
+                # if repo and "://" not in str(repo):
+                #     _candidate = pathlib.Path(repo).expanduser().resolve()
+                #     if (_candidate / ".git").exists():
+                #         _git_root = _candidate
+                # _run_risk_pipeline(
+                #     temporal_folder,
+                #     repo_name,
+                #     git_root=_git_root,
+                #     review_model=None,
+                # )
             else:
                 print("Warning: Backfill failed; interpretation may not work.")
 
@@ -2523,6 +4245,7 @@ def tool_temporal_analysis(plan: dict) -> int:
                     "auto_refactor": plan.get("auto_refactor", False),
                     "refactor_model": plan.get("refactor_model") or "qwen3-coder-30b-refactor",
                     "refactor_loop_count": plan.get("refactor_loop_count", 0),
+                    "use_feedback_loop": plan.get("use_feedback_loop", False),
                 })
             else:
                 print("No further action.")
@@ -3040,7 +4763,9 @@ def main():
         if not tr.is_dir():
             print(f"[stage4-only] Path not found: {tr}")
             sys.exit(1)
-        sys.exit(_run_refactor_stage(tr, conversation=[], model=refactor_model_override or "qwen3-coder-30b-refactor"))
+        sys.exit(_run_refactor_stage(tr, conversation=[], model=refactor_model_override or "qwen3-coder-30b-refactor",
+                                     qa_model=model_override or "qwen3-coder-30b-refactor",
+                                     use_feedback_loop=use_feedback_loop))
 
     if len(filtered_args) < 1 and not temporal_root_override:
         print('Usage: python LLM_frontend_upgraded.py "your request"')
@@ -3076,21 +4801,110 @@ def main():
     if not auto_refactor and any(k in user_req.lower() for k in _AUTO_KEYWORDS):
         auto_refactor = True
 
+    # Detect bare "refactor" as auto_refactor trigger (without needing "automated")
+    import re as _re_claude
+    _ur_low = user_req.lower()
+    if not auto_refactor and _re_claude.search(r'\brefactor(?:ing)?\b', _ur_low):
+        auto_refactor = True
+
+    # Detect "claude refactoring" / "claude subscription" / "with claude sonnet subscription" → use claude CLI for Stage 4
+    _claude_refactor_match = _re_claude.search(
+        r'(?:with\s+)?claude[\s-]*(?:opus|sonnet|haiku)?\s*(?:refactor(?:ing)?|subscription|coder)',
+        _ur_low
+    )
+    if _claude_refactor_match and not refactor_model_override:
+        # Extract optional model variant: "claude-opus", "claude sonnet subscription", "claude-sonnet refactoring"
+        _claude_variant = _re_claude.search(
+            r'claude[\s-]*(opus|sonnet|haiku)',
+            _ur_low
+        )
+        variant = _claude_variant.group(1) if _claude_variant and _claude_variant.group(1) else ""
+        if not variant:
+            # No model specified — ask user which Claude model to use
+            print("\n[main] Claude Code refactoring detected but no model specified.")
+            print("  Available models:")
+            print("    1) sonnet  — fast, good for most refactoring (recommended)")
+            print("    2) opus    — most capable, slower, uses more tokens")
+            print("    3) haiku   — fastest, least capable")
+            try:
+                choice = input("  Which Claude model? [1/2/3 or name, default=sonnet]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                choice = ""
+            if choice in ("2", "opus"):
+                variant = "opus"
+            elif choice in ("3", "haiku"):
+                variant = "haiku"
+            else:
+                variant = "sonnet"
+            print(f"  → Using claude-{variant}")
+        refactor_model_override = f"claude-{variant}"
+        auto_refactor = True
+        print(f"[main] Claude Code refactoring mode: model={refactor_model_override}")
+
+    # Detect multi-model comparison: "claude and qwen", "compare claude and qwen", "claude vs qwen"
+    # Also: "with claude sonnet subscription and qwen coder and compare them"
+    refactor_models_list: list[str] = []
+    if refactor_model_override:
+        refactor_models_list.append(refactor_model_override)
+    # Check for additional models: "and qwen", "and codex", "vs qwen"
+    _multi_model_re = _re_claude.findall(
+        r'(?:and|vs|versus|\+)\s+(claude[\s-]*(?:opus|sonnet|haiku)?|qwen[\w-]*|codex)',
+        _ur_low
+    )
+    for _mm in _multi_model_re:
+        _mm_clean = _mm.strip().replace(" ", "-")
+        if _mm_clean.startswith("qwen"):
+            refactor_models_list.append("qwen3-coder-30b-refactor")
+        elif _mm_clean.startswith("codex"):
+            refactor_models_list.append("codex")
+        elif _mm_clean.startswith("claude"):
+            _cv = _re_claude.search(r"claude[\s-]*(opus|sonnet|haiku)", _mm_clean)
+            refactor_models_list.append(f"claude-{_cv.group(1)}" if _cv else "claude-sonnet")
+    # Also detect standalone "qwen refactoring/coder" if no claude was specified
+    if not refactor_model_override and _re_claude.search(r'qwen\s*(?:refactor(?:ing)?|coder)', _ur_low):
+        refactor_models_list.append("qwen3-coder-30b-refactor")
+        auto_refactor = True
+    # Deduplicate
+    _seen = set()
+    refactor_models_list = [m for m in refactor_models_list if not (m in _seen or _seen.add(m))]
+
+    # Detect "compare" intent: "compare them", "compare models", "compare claude and qwen"
+    _compare_mode = bool(_re_claude.search(r'\bcompare\b', _ur_low))
+    if _compare_mode and len(refactor_models_list) > 1:
+        print(f"[main] Multi-model COMPARISON mode: {', '.join(refactor_models_list)}")
+        auto_refactor = True
+    elif len(refactor_models_list) > 1:
+        print(f"[main] Multi-model comparison: {', '.join(refactor_models_list)}")
+        auto_refactor = True
+
     # Detect loop mode: "loop refactoring N", "loop N", "action loop N", "loop most important action N"
-    # Default: "automated refactoring" without explicit N → 3 loop iterations
+    # Default: "automated refactoring" without explicit N → 4 loop iterations for comparison, 3 for single model
     import re as _re_loop
     _loop_match = _re_loop.search(
         r'(?:loop\s+(?:refactoring|refactor|most\s+important\s+action\s*|action\s+)?|action\s+loop\s+)(\d+)',
         user_req.lower()
     )
+    if not _loop_match:
+        # Also match "N iterations" or "iterations N"
+        _loop_match = _re_loop.search(r'(\d+)\s+iteration', user_req.lower()) or \
+                      _re_loop.search(r'iteration[s]?\s+(\d+)', user_req.lower())
     refactor_loop_count = int(_loop_match.group(1)) if _loop_match else 0
     if refactor_loop_count > 0:
         auto_refactor = True
         print(f"[main] Loop refactoring mode: {refactor_loop_count} iterations (re-analyze + 1 action each loop)")
     elif auto_refactor and refactor_loop_count == 0:
-        # Default: automated refactoring always uses loop mode with 3 iterations
-        refactor_loop_count = 3
+        # Default: multi-model comparison → 4 iterations, single model → 5 iterations
+        if len(refactor_models_list) > 1:
+            refactor_loop_count = 4
+            print(f"[main] Multi-model comparison: defaulting to {refactor_loop_count} iterations per model")
+        else:
+            refactor_loop_count = 5
         print(f"[main] Auto-refactor mode: defaulting to loop mode ({refactor_loop_count} iterations)")
+
+    # Detect feedback loop mode: "feedback loop", "use feedback loop", "feedback loop refactoring"
+    use_feedback_loop = bool(_re_loop.search(r'feedback\s+loop', user_req.lower()))
+    if use_feedback_loop:
+        print(f"[main] Feedback loop ENABLED: reviewer agent will check each refactoring iteration")
 
     # Handle direct interpretation with --temporal-root
     if temporal_root_override:
@@ -3105,6 +4919,7 @@ def main():
             "refactor_model": refactor_model_override or "qwen3-coder-30b-refactor",
             "refactor_loop_count": refactor_loop_count,
             "force_reinterpret": force_reinterpret,
+            "use_feedback_loop": use_feedback_loop,
         })
         sys.exit(rc)
 
@@ -3204,6 +5019,7 @@ def main():
             "auto_refactor": auto_refactor,
             "refactor_model": refactor_model_override or "qwen3-coder-30b-refactor",
             "refactor_loop_count": refactor_loop_count,
+            "use_feedback_loop": use_feedback_loop,
         }
         print(f"Plan (fast-path): {json.dumps(_fast_plan, indent=2)}\n")
         rc = run_tool(_fast_plan, user_req)
@@ -3245,6 +5061,7 @@ def main():
             "auto_refactor": auto_refactor,
             "refactor_model": refactor_model_override or "qwen3-coder-30b-refactor",
             "refactor_loop_count": refactor_loop_count,
+            "use_feedback_loop": use_feedback_loop,
         }
         if _mv is not None:
             _fast_plan["mv_cochange"] = _mv
@@ -3267,10 +5084,15 @@ def main():
             plan["auto_refactor"] = True
         if refactor_loop_count and not plan.get("refactor_loop_count"):
             plan["refactor_loop_count"] = refactor_loop_count
+        if use_feedback_loop and not plan.get("use_feedback_loop"):
+            plan["use_feedback_loop"] = True
         if refactor_model_override and not plan.get("refactor_model"):
             plan["refactor_model"] = refactor_model_override
         elif not plan.get("refactor_model"):
             plan["refactor_model"] = "qwen3-coder-30b-refactor"
+        # Multi-model comparison
+        if len(refactor_models_list) > 1:
+            plan["refactor_models"] = refactor_models_list
 
         print(f"Plan: {json.dumps(plan, indent=2)}\n")
 
@@ -3324,6 +5146,8 @@ def main():
             p["auto_refactor"] = auto_refactor
             p["refactor_model"] = refactor_model_override or "qwen3-coder-30b-refactor"
             p["refactor_loop_count"] = refactor_loop_count
+            if use_feedback_loop:
+                p["use_feedback_loop"] = True
             rc = run_tool(p, user_req)
             sys.exit(rc)
 
