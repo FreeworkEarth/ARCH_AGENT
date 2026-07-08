@@ -3735,6 +3735,7 @@ def tool_temporal_analysis(plan: dict) -> int:
     branch = plan.get("branch", "main")
     min_months_apart = plan.get("min_months_apart", 0)
     min_commits_apart = plan.get("min_commits_apart", 0)
+    pr_mode = bool(plan.get("pr_mode", False))
     fine_grain = plan.get("fine_grain", False)
     since_date = plan.get("since_date")
     until_date = plan.get("until_date")
@@ -4030,6 +4031,8 @@ def tool_temporal_analysis(plan: dict) -> int:
             cmd += ["--fine-grain"]
         if mv_cochange is not None:
             cmd += ["--mv-cochange", str(mv_cochange)]
+        if pr_mode:
+            cmd += ["--pr-mode"]
         return cmd
     # Determine which dependency extractor will be used
     if understand_und:
@@ -4758,8 +4761,10 @@ def main():
             i += 1
 
     # Early detection of feedback loop flag (needed before stage4_only_path exit)
+    # user_req isn't set yet, so scan filtered_args + raw sys.argv for the keyword
     import re as _re_fb
-    use_feedback_loop = bool(_re_fb.search(r'feedback\s+loop', user_req.lower()))
+    _raw_args_str = " ".join(filtered_args + sys.argv[1:]).lower()
+    use_feedback_loop = bool(_re_fb.search(r'feedback\s+loop', _raw_args_str))
 
     # Standalone Stage 4 test: skip full pipeline, just refactor + re-analyse
     if stage4_only_path:
@@ -4905,6 +4910,11 @@ def main():
             refactor_loop_count = 5
         print(f"[main] Auto-refactor mode: defaulting to loop mode ({refactor_loop_count} iterations)")
 
+    # Detect PR mode: "pull requests", "PRs", "pr mode", "use PRs"
+    use_pr_mode = bool(_re_loop.search(r'(?:pull\s*requests?|(?<!\w)PRs?(?!\w)|pr\s*mode)', user_req))
+    if use_pr_mode:
+        print(f"[main] PR mode ENABLED: using merged Pull Requests as revision points")
+
     # Print feedback loop status (already detected earlier for stage4_only_path)
     if use_feedback_loop:
         print(f"[main] Feedback loop ENABLED: reviewer agent will check each refactoring iteration")
@@ -4923,6 +4933,7 @@ def main():
             "refactor_loop_count": refactor_loop_count,
             "force_reinterpret": force_reinterpret,
             "use_feedback_loop": use_feedback_loop,
+            "pr_mode": use_pr_mode,
         })
         sys.exit(rc)
 
@@ -5023,6 +5034,7 @@ def main():
             "refactor_model": refactor_model_override or "qwen3-coder-30b-refactor",
             "refactor_loop_count": refactor_loop_count,
             "use_feedback_loop": use_feedback_loop,
+            "pr_mode": use_pr_mode,
         }
         print(f"Plan (fast-path): {json.dumps(_fast_plan, indent=2)}\n")
         rc = run_tool(_fast_plan, user_req)
@@ -5065,6 +5077,7 @@ def main():
             "refactor_model": refactor_model_override or "qwen3-coder-30b-refactor",
             "refactor_loop_count": refactor_loop_count,
             "use_feedback_loop": use_feedback_loop,
+            "pr_mode": use_pr_mode,
         }
         if _mv is not None:
             _fast_plan["mv_cochange"] = _mv
@@ -5089,6 +5102,8 @@ def main():
             plan["refactor_loop_count"] = refactor_loop_count
         if use_feedback_loop and not plan.get("use_feedback_loop"):
             plan["use_feedback_loop"] = True
+        if use_pr_mode and not plan.get("pr_mode"):
+            plan["pr_mode"] = True
         if refactor_model_override and not plan.get("refactor_model"):
             plan["refactor_model"] = refactor_model_override
         elif not plan.get("refactor_model"):
@@ -5151,6 +5166,8 @@ def main():
             p["refactor_loop_count"] = refactor_loop_count
             if use_feedback_loop:
                 p["use_feedback_loop"] = True
+            if use_pr_mode:
+                p["pr_mode"] = True
             rc = run_tool(p, user_req)
             sys.exit(rc)
 

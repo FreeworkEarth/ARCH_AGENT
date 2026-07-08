@@ -1453,7 +1453,9 @@ def clone_or_copy(repo: str, workspace: Path, branch: Optional[str]) -> Path:
                 _gh_match = re.match(r'https?://github\.com/([^/]+/[^/]+?)(?:\.git)?/?$', repo)
                 if _gh_match:
                     _gh_slug = _gh_match.group(1)
-                    print(f"git ls-remote failed — trying gh CLI for private repo: {_gh_slug}")
+                    _gh_org = _gh_slug.split("/")[0]
+                    print(f"\ngit ls-remote failed — repo may be private: {_gh_slug}")
+                    print(f"Trying gh CLI with current account...")
                     _gh_cmd = [_gh_bin, "repo", "clone", _gh_slug, str(target)]
                     if branch:
                         _gh_cmd.extend(["--", "-b", branch])
@@ -1463,7 +1465,39 @@ def clone_or_copy(repo: str, workspace: Path, branch: Optional[str]) -> Path:
                             print(f"Successfully cloned via gh CLI (private repo)")
                             return target.resolve()
                         else:
-                            print(f"gh repo clone also failed: {_gh_res.stderr[:300]}")
+                            # Current gh account doesn't have access — offer to log in
+                            print(f"\nCurrent gh account cannot access {_gh_slug}.")
+                            print(f"You need to authenticate with a GitHub account that has access to '{_gh_org}'.")
+                            print(f"")
+                            _choice = input("Log in with a different GitHub account now? [Y/n]: ").strip().lower()
+                            if _choice in ("", "y", "yes"):
+                                print(f"\nStarting gh auth login — authenticate with the account that has access to {_gh_org}...")
+                                print(f"(This will open your browser for authentication)\n")
+                                _login_rc = subprocess.call(
+                                    [_gh_bin, "auth", "login", "--git-protocol", "https", "--web"],
+                                )
+                                if _login_rc == 0:
+                                    print(f"\nLogin successful! Retrying clone...")
+                                    # Clean up any partial clone from first attempt
+                                    if target.exists() and not (target / '.git').exists():
+                                        try:
+                                            shutil.rmtree(target)
+                                        except Exception:
+                                            pass
+                                    _gh_cmd2 = [_gh_bin, "repo", "clone", _gh_slug, str(target)]
+                                    if branch:
+                                        _gh_cmd2.extend(["--", "-b", branch])
+                                    _gh_res2 = subprocess.run(_gh_cmd2, capture_output=True, text=True, timeout=300)
+                                    if _gh_res2.returncode == 0:
+                                        print(f"Successfully cloned via gh CLI after re-login")
+                                        return target.resolve()
+                                    else:
+                                        print(f"Clone still failed after login: {_gh_res2.stderr[:300]}")
+                                        print(f"Check that the logged-in account has access to {_gh_slug}.")
+                                else:
+                                    print(f"gh auth login failed or was cancelled.")
+                            else:
+                                print(f"Skipping login. Clone will likely fail.")
                     except subprocess.TimeoutExpired:
                         print("gh repo clone timed out (300s)")
                     except Exception as e:
@@ -2480,6 +2514,74 @@ def get_commit_history(
     return commits[:count]
 
 
+def get_pr_history(
+    repo_path: Path,
+    count: int = 10,
+) -> List[Dict[str, str]]:
+    """Get merged Pull Requests as revision points using gh CLI.
+
+    Returns the same dict format as get_commit_history() so the rest of the
+    pipeline (checkout_commit_to_folder, run_temporal_analysis) works unchanged.
+
+    Each merged PR's merge commit SHA becomes a revision point.
+    """
+    gh_bin = shutil.which("gh")
+    if not gh_bin:
+        raise RuntimeError("gh CLI not found. Install: https://cli.github.com/")
+
+    # gh pr list returns merged PRs with their merge commit SHA
+    # Fields: number, title, mergedAt, mergeCommit (the SHA we need)
+    cmd = [
+        gh_bin, "pr", "list",
+        "--state", "merged",
+        "--limit", str(count),
+        "--json", "number,title,mergedAt,mergeCommit,author",
+        "--jq", ".",
+    ]
+    result = subprocess.run(cmd, cwd=repo_path, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"gh pr list failed: {result.stderr[:300]}")
+
+    import json as _json_pr
+    try:
+        prs = _json_pr.loads(result.stdout)
+    except _json_pr.JSONDecodeError:
+        raise RuntimeError(f"Could not parse gh pr list output: {result.stdout[:200]}")
+
+    if not prs:
+        raise RuntimeError("No merged PRs found in this repository.")
+
+    commits = []
+    for pr in prs:
+        merge_commit = pr.get("mergeCommit") or {}
+        sha = merge_commit.get("oid", "")
+        if not sha:
+            continue
+        merged_at = pr.get("mergedAt", "")
+        # Convert ISO 8601 (2026-07-01T14:30:00Z) to git-log style (2026-07-01 14:30:00 +0000)
+        date_str = merged_at.replace("T", " ").replace("Z", " +0000") if merged_at else ""
+        author = pr.get("author", {})
+        author_name = author.get("login", "unknown") if isinstance(author, dict) else "unknown"
+        pr_num = pr.get("number", "?")
+        title = pr.get("title", "")
+
+        commits.append({
+            'hash': sha,
+            'short_hash': sha[:8],
+            'date': date_str,
+            'author': author_name,
+            'message': f"PR #{pr_num}: {title}",
+            'files_changed': 0,  # not available from gh pr list, but not used for selection
+        })
+
+    # gh returns newest first — same as get_commit_history
+    print(f"  Found {len(commits)} merged PRs:")
+    for c in commits:
+        print(f"    {c['short_hash']} {c['date'][:10]} {c['message'][:80]}")
+
+    return commits
+
+
 def _is_empty_revision(metrics: dict) -> bool:
     """Return True if a revision produced no usable DV8 metrics (empty/trivial repo state)."""
     keys = ("m-score", "propagation-cost", "decoupling-level", "independence-level")
@@ -2985,6 +3087,7 @@ def run_temporal_analysis(
     use_worktree: bool = True,
     spacing_mode: str = "intelligent",
     mv_cochange: int | None = None,
+    pr_mode: bool = False,
 ) -> Path:
     """Analyze multiple Git revisions and save time-series data with flexible spacing strategies."""
 
@@ -3013,9 +3116,17 @@ def run_temporal_analysis(
     except Exception as e:
         print(f"  Note: Git checkout failed: {e}")
 
-    # Get commits
-    if intelligent:
+    # Get commits (or PRs)
+    if pr_mode:
+        print(f"Selecting last {revision_count} merged Pull Requests as revision points...")
+        commits = get_pr_history(repo_path, count=revision_count)
+    elif intelligent:
         print(f"Intelligently selecting {revision_count} meaningful commits (releases, fixes, major changes)...")
+        commits = get_commit_history(
+            repo_path, branch, revision_count, intelligent=intelligent,
+            min_months_apart=min_months_apart, min_commits_apart=min_commits_apart,
+            since_date=since_date, until_date=until_date, spacing_mode=spacing_mode,
+        )
     else:
         if min_months_apart > 0:
             print(f"Selecting last {revision_count} commits with ≥{min_months_apart} month spacing...")
@@ -3023,17 +3134,11 @@ def run_temporal_analysis(
             print(f"Selecting last {revision_count} commits with {min_commits_apart} commits spacing...")
         else:
             print(f"Selecting all-time: first, last, and evenly spaced in between ({revision_count} total)...")
-    commits = get_commit_history(
-        repo_path,
-        branch,
-        revision_count,
-        intelligent=intelligent,
-        min_months_apart=min_months_apart,
-        min_commits_apart=min_commits_apart,
-        since_date=since_date,
-        until_date=until_date,
-        spacing_mode=spacing_mode,
-    )
+        commits = get_commit_history(
+            repo_path, branch, revision_count, intelligent=intelligent,
+            min_months_apart=min_months_apart, min_commits_apart=min_commits_apart,
+            since_date=since_date, until_date=until_date, spacing_mode=spacing_mode,
+        )
     print(f"Found {len(commits)} commits to analyze\n")
 
     if len(commits) == 0:
@@ -3049,6 +3154,7 @@ def run_temporal_analysis(
 
     # Derive a simple tag from inputs to name the folder consistently regardless of CLI spacing_mode value
     mode_tag = (
+        "pr" if pr_mode else
         "commits" if min_commits_apart > 0 else
         ("recent" if min_months_apart > 0 else "alltime")
     )
@@ -3070,7 +3176,9 @@ def run_temporal_analysis(
     from datetime import datetime
     run_timestamp = datetime.now().strftime("%y%m%d_%H%M%S")
 
-    if mode_tag == "alltime":
+    if mode_tag == "pr":
+        folder_name = f"temporal_analysis_{revision_count}prs{range_suffix}_{run_timestamp}"
+    elif mode_tag == "alltime":
         folder_name = f"temporal_analysis_alltime{range_suffix}_{run_timestamp}"
     elif mode_tag == "recent":
         folder_name = f"temporal_analysis_{revision_count}revisions_{min_months_apart}month_diff{range_suffix}_{run_timestamp}"
@@ -3286,6 +3394,8 @@ def parse_args() -> argparse.Namespace:
                        help="Revision selection mode: smart (most file changes), uniform/alltime (evenly spaced), intelligent (default filtering).")
     parser.add_argument("--no-temporal-worktree", action="store_true",
                        help="Disable git worktrees in temporal mode (use git archive snapshots instead).")
+    parser.add_argument("--pr-mode", action="store_true",
+                       help="Use merged Pull Requests as revision points instead of commits. Requires gh CLI.")
     # Single-commit focus analysis options
     parser.add_argument("--commit", help="Analyze a specific commit hash with full pipeline (use with --fine-grain for arch-report).")
     parser.add_argument("--commit2", help="Analyze a second commit hash (analyze both, placed into a focus folder).")
@@ -3474,6 +3584,7 @@ def main() -> None:
                 use_worktree=not args.no_temporal_worktree,
                 spacing_mode=args.spacing_mode,
                 mv_cochange=args.mv_cochange if hasattr(args, "mv_cochange") else None,
+                pr_mode=args.pr_mode if hasattr(args, "pr_mode") else False,
             )
 
         print(f"\nTemporal analysis complete!")
