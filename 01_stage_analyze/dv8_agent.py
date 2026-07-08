@@ -1425,12 +1425,15 @@ def clone_or_copy(repo: str, workspace: Path, branch: Optional[str]) -> Path:
         remote_heads: set[str] = set()
         default_branch: Optional[str] = None
 
+        _ls_remote_ok = False
         try:
             # Get default branch from HEAD symref
             res_head = subprocess.run(
                 ["git", "ls-remote", "--symref", repo, "HEAD"],
                 capture_output=True, text=True, check=False
             )
+            if res_head.returncode == 0 and res_head.stdout.strip():
+                _ls_remote_ok = True
             for line in res_head.stdout.splitlines():
                 line = line.strip()
                 # Example: "ref: refs/heads/main\tHEAD"
@@ -1442,6 +1445,32 @@ def clone_or_copy(repo: str, workspace: Path, branch: Optional[str]) -> Path:
                         break
         except Exception:
             pass  # non-fatal, we will still try sensible defaults
+
+        # If git ls-remote failed, try gh CLI (handles private repos via gh auth)
+        if not _ls_remote_ok:
+            _gh_bin = shutil.which("gh")
+            if _gh_bin:
+                _gh_match = re.match(r'https?://github\.com/([^/]+/[^/]+?)(?:\.git)?/?$', repo)
+                if _gh_match:
+                    _gh_slug = _gh_match.group(1)
+                    print(f"git ls-remote failed — trying gh CLI for private repo: {_gh_slug}")
+                    _gh_cmd = [_gh_bin, "repo", "clone", _gh_slug, str(target)]
+                    if branch:
+                        _gh_cmd.extend(["--", "-b", branch])
+                    try:
+                        _gh_res = subprocess.run(_gh_cmd, capture_output=True, text=True, timeout=300)
+                        if _gh_res.returncode == 0:
+                            print(f"Successfully cloned via gh CLI (private repo)")
+                            return target.resolve()
+                        else:
+                            print(f"gh repo clone also failed: {_gh_res.stderr[:300]}")
+                    except subprocess.TimeoutExpired:
+                        print("gh repo clone timed out (300s)")
+                    except Exception as e:
+                        print(f"gh clone error: {e}")
+            else:
+                print("Private repo detected but 'gh' CLI not found.")
+                print("Install GitHub CLI: https://cli.github.com/ then run: gh auth login")
 
         try:
             # Enumerate all remote heads
@@ -2672,7 +2701,10 @@ def analyze_single_revision(
         merged_arch_issue_dsm_path = history_output / "struct_plus_history.dv8-dsm"
         merged_arch_issue_json_path = history_output / "struct_plus_history.matrix.json"
         has_history_dsm = False
-        if export_git_history_log(revision_path, history_log_path, logs=step_logs):
+        # If git-history.txt was pre-copied (e.g. from baseline for loop iterations),
+        # skip the git log export and use the existing file directly.
+        _history_pre_exists = history_log_path.is_file() and history_log_path.stat().st_size > 100
+        if _history_pre_exists or export_git_history_log(revision_path, history_log_path, logs=step_logs):
             generate_git_change_cost(
                 dv8_console,
                 history_log_path,
@@ -3632,6 +3664,26 @@ def main() -> None:
     dsm_path = output_data / "repo.dv8-dsm"
     convert_to_dsm(dv8_console, json_dep, mapping, dsm_path, env)
 
+    # Build history DSM from git-history.txt (if available) and merge with structural DSM.
+    # This enables modularity violation detection even in folders without .git (e.g. loop iterations
+    # where git-history.txt was pre-copied from the baseline).
+    history_output = output_data / "history-dsm"
+    history_log_path = history_output / "git-history.txt"
+    _arch_issue_dsm = dsm_path  # default: structural only
+    _history_pre_exists = history_log_path.is_file() and history_log_path.stat().st_size > 100
+    if _history_pre_exists or export_git_history_log(analysis_root, history_log_path):
+        ensure_dirs(history_output)
+        generate_git_change_cost(dv8_console, history_log_path, history_output / "change-cost", env)
+        _fix_change_cost_csv(history_output / "change-cost")
+        _h_dsm = history_output / "history_raw.dv8-dsm"
+        if convert_git_history_to_dsm(dv8_console, history_log_path, _h_dsm, env):
+            export_matrix_json(dv8_console, _h_dsm, history_output / "history_raw.matrix.json", env)
+            _merged = history_output / "struct_plus_history.dv8-dsm"
+            if merge_dsms(dv8_console, [dsm_path, _h_dsm], _merged, env):
+                export_matrix_json(dv8_console, _merged, history_output / "struct_plus_history.matrix.json", env)
+                _arch_issue_dsm = _merged
+                print(f"  History DSM merged for anti-pattern detection (MV enabled).")
+
     # write an arch-report properties file inside InputData
     params_path = input_data / "archreport.properties"
     output_dir = Path("OutputData/Architecture-analysis-result")  # relative path used by DV8
@@ -3645,12 +3697,14 @@ def main() -> None:
         print(json.dumps(all_metrics, indent=2))
 
     # run the full architecture analysis if not skipped
+    _arch_report_ok = False
     if not args.skip_arch_report:
         try:
             run_arch_report(dv8_console, params_path.relative_to(analysis_root), analysis_root, env)
+            _arch_report_ok = True
         except SystemExit as e:
             print(f"Arch report failed: {e}")
-            # If user only asked for a metric, try computing it directly from the DSM
+            # If user only asked for a single metric, try computing it directly from the DSM
             if args.ask and ask_key not in {"all", "metrics", "all metrics", "all-metrics"}:
                 try:
                     metric_file = run_metric_task(dv8_console, args.ask, dsm_path, output_data, env)
@@ -3660,11 +3714,17 @@ def main() -> None:
                         result = {"file": str(metric_file)}
                     print("\n=== Metric result (fallback) ===")
                     print(json.dumps(result, indent=2))
-                    return
                 except Exception as me:
                     print(f"Direct metric fallback also failed: {me}")
-            # No metric requested; just stop
-            return
+
+    # Always run direct DV8 tasks (arch-issue, DRH, hotspot) when arch-report failed or was skipped.
+    # This ensures anti-pattern data is available even without a successful arch-report.
+    if not _arch_report_ok:
+        print("[main] Running direct DV8 tasks (arch-issue, DRH, hotspot) as arch-report fallback...")
+        run_additional_dv8_tasks(dv8_console, dsm_path, output_data, env,
+                                arch_issue_dsm_path=_arch_issue_dsm,
+                                project_name=project_name,
+                                mv_cochange=args.mv_cochange if hasattr(args, "mv_cochange") else None)
 
     # If a metric was requested, locate it in the report outputs or compute directly
     if args.ask:

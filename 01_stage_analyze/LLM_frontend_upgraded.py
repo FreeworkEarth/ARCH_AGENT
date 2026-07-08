@@ -4757,6 +4757,10 @@ def main():
             filtered_args.append(args[i])
             i += 1
 
+    # Early detection of feedback loop flag (needed before stage4_only_path exit)
+    import re as _re_fb
+    use_feedback_loop = bool(_re_fb.search(r'feedback\s+loop', user_req.lower()))
+
     # Standalone Stage 4 test: skip full pipeline, just refactor + re-analyse
     if stage4_only_path:
         tr = pathlib.Path(stage4_only_path).expanduser().resolve()
@@ -4901,8 +4905,7 @@ def main():
             refactor_loop_count = 5
         print(f"[main] Auto-refactor mode: defaulting to loop mode ({refactor_loop_count} iterations)")
 
-    # Detect feedback loop mode: "feedback loop", "use feedback loop", "feedback loop refactoring"
-    use_feedback_loop = bool(_re_loop.search(r'feedback\s+loop', user_req.lower()))
+    # Print feedback loop status (already detected earlier for stage4_only_path)
     if use_feedback_loop:
         print(f"[main] Feedback loop ENABLED: reviewer agent will check each refactoring iteration")
 
