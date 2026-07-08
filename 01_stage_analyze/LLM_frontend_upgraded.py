@@ -769,9 +769,13 @@ def tool_interpret_temporal(plan: dict) -> int:
     refactor_models = plan.get("refactor_models", [])  # multi-model comparison
     use_feedback_loop = bool(plan.get("use_feedback_loop", False))
 
-    # Extract model from prompt if not set (e.g. "with deepseek-r1:32b" or "32b")
+    # Extract model from prompt if not set (e.g. "with deepseek-r1:32b" or "32b" or "claude opus")
     raw_model = plan.get("model") or ""
-    if not raw_model or raw_model == "deepseek-r1:14b":
+    # Detect Claude model from prompt (takes priority)
+    _claude_match = re.search(r'(?:with\s+)?claude[\s-]*(opus|sonnet|haiku)', ur, re.I)
+    if _claude_match:
+        raw_model = f"claude-{_claude_match.group(1).lower()}"
+    elif not raw_model or raw_model == "deepseek-r1:14b":
         # Check if prompt explicitly mentions a model size
         m_model = re.search(r'deepseek[-_]r1:(\d+b)|(?<!\d)(\d+)b(?!\d)', ur, re.I)
         if m_model:
@@ -3735,6 +3739,7 @@ def tool_temporal_analysis(plan: dict) -> int:
     branch = plan.get("branch", "main")
     min_months_apart = plan.get("min_months_apart", 0)
     min_commits_apart = plan.get("min_commits_apart", 0)
+    min_days_apart = plan.get("min_days_apart", 0)
     pr_mode = bool(plan.get("pr_mode", False))
     fine_grain = plan.get("fine_grain", False)
     since_date = plan.get("since_date")
@@ -3971,7 +3976,10 @@ def tool_temporal_analysis(plan: dict) -> int:
     smart_commits = plan.get("spacing_mode") == "smart"
 
     # Determine mode based on min_months_apart
-    if smart_commits:
+    if pr_mode:
+        _sp = f", {min_days_apart} days apart" if min_days_apart > 0 else ""
+        mode_name = f"PULL REQUESTS ({count} merged PRs{_sp})"
+    elif smart_commits:
         mode_name = "SMART (commits with most file changes)"
     elif min_commits_apart > 0:
         mode_name = f"RECENT-COMMITS ({min_commits_apart} commits spacing)"
@@ -4033,6 +4041,8 @@ def tool_temporal_analysis(plan: dict) -> int:
             cmd += ["--mv-cochange", str(mv_cochange)]
         if pr_mode:
             cmd += ["--pr-mode"]
+        if min_days_apart > 0:
+            cmd += ["--min-days-apart", str(min_days_apart)]
         return cmd
     # Determine which dependency extractor will be used
     if understand_und:
@@ -4277,7 +4287,10 @@ def tool_interpret_metrics(plan: dict) -> int:
             size = ""
 
         vendor = name
-        if "llama" in name:
+        if "claude" in name:
+            variant = "opus" if "opus" in name else ("sonnet" if "sonnet" in name else "haiku")
+            return f"claude-{variant}"
+        elif "llama" in name:
             vendor = "llama3.1" if "3.1" in name else "llama"
         elif "deepseek" in name:
             # Keep r1 if present
@@ -4344,8 +4357,11 @@ def tool_interpret_metrics(plan: dict) -> int:
     model = plan.get("model")
     if not model:
         ur = (plan.get('user_request') or '').lower() if isinstance(plan, dict) else ''
-        # Heuristic: prefer deepseek if mentioned, else qwen, else llama
-        if 'deepseek' in (ur or ''):
+        # Detect Claude from prompt
+        _cm = re.search(r'(?:with\s+)?claude[\s-]*(opus|sonnet|haiku)', ur or '', re.I)
+        if _cm:
+            model = f"claude-{_cm.group(1).lower()}"
+        elif 'deepseek' in (ur or ''):
             model = 'deepseek-r1:32b'
         elif 'qwen' in (ur or ''):
             model = 'qwen2:8b'
@@ -4915,6 +4931,17 @@ def main():
     if use_pr_mode:
         print(f"[main] PR mode ENABLED: using merged Pull Requests as revision points")
 
+    # Detect "N weeks apart" or "N days apart" for min_days_apart
+    _days_apart_val = 0
+    _week_match = re.search(r'(\d+)\s*weeks?\s*apart', user_req, re.I)
+    _day_match = re.search(r'(\d+)\s*days?\s*apart', user_req, re.I)
+    if _week_match:
+        _days_apart_val = int(_week_match.group(1)) * 7
+        print(f"[main] Spacing: {_week_match.group(1)} week(s) apart = {_days_apart_val} days minimum")
+    elif _day_match:
+        _days_apart_val = int(_day_match.group(1))
+        print(f"[main] Spacing: {_days_apart_val} days apart minimum")
+
     # Print feedback loop status (already detected earlier for stage4_only_path)
     if use_feedback_loop:
         print(f"[main] Feedback loop ENABLED: reviewer agent will check each refactoring iteration")
@@ -4934,6 +4961,7 @@ def main():
             "force_reinterpret": force_reinterpret,
             "use_feedback_loop": use_feedback_loop,
             "pr_mode": use_pr_mode,
+            "min_days_apart": _days_apart_val,
         })
         sys.exit(rc)
 
@@ -5035,6 +5063,7 @@ def main():
             "refactor_loop_count": refactor_loop_count,
             "use_feedback_loop": use_feedback_loop,
             "pr_mode": use_pr_mode,
+            "min_days_apart": _days_apart_val,
         }
         print(f"Plan (fast-path): {json.dumps(_fast_plan, indent=2)}\n")
         rc = run_tool(_fast_plan, user_req)
@@ -5078,9 +5107,58 @@ def main():
             "refactor_loop_count": refactor_loop_count,
             "use_feedback_loop": use_feedback_loop,
             "pr_mode": use_pr_mode,
+            "min_days_apart": _days_apart_val,
         }
         if _mv is not None:
             _fast_plan["mv_cochange"] = _mv
+        print(f"Plan (fast-path): {json.dumps(_fast_plan, indent=2)}\n")
+        rc = run_tool(_fast_plan, user_req)
+        sys.exit(rc)
+
+    # ── Fast-path: "analyze repo <name|URL> last N pull requests/revisions [N weeks/days apart] [with claude opus] [and refactor ...]"
+    # Catches PR mode, week/day spacing, repo URLs, and claude model — no Ollama needed.
+    _gen_m = re.match(
+        r'^(?:analyze(?:\s+and\s+interpret)?)\s+(?:repo\s+)?'
+        r'(https?://github\.com/[^\s]+|[\w\-]+)\s+'
+        r'(?:last\s+)?(\d+)\s+(?:pull\s*requests?|PRs?|revisions?|commits?)'
+        r'(.*)',
+        user_req.strip(), re.I,
+    )
+    if _gen_m:
+        _repo_val = _gen_m.group(1).strip()
+        _count_val = int(_gen_m.group(2))
+        _rest_val = _gen_m.group(3) or ""
+        # Detect model: claude-opus/sonnet/haiku or deepseek
+        _model_val = ""
+        _cm_val = re.search(r'claude[\s-]*(opus|sonnet|haiku)', _rest_val, re.I)
+        if _cm_val:
+            _model_val = f"claude-{_cm_val.group(1).lower()}"
+        else:
+            _mm_val = re.search(r'(deepseek[-_]r1:[\w]+|\d+b)', _rest_val, re.I)
+            if _mm_val:
+                _model_val = _mm_val.group(1).strip().lower()
+        # Detect months apart (fallback if not using weeks/days — already parsed above)
+        _months_val = 0
+        _mm_months = re.search(r'(\d+)\s+months?\s+apart', _rest_val, re.I)
+        if _mm_months:
+            _months_val = int(_mm_months.group(1))
+        # Detect "alltime" / "all time"
+        _alltime = bool(re.search(r'all[\s-]?time', _rest_val, re.I))
+        _fast_plan = {
+            "tool": "temporal_analysis",
+            "repo": _repo_val,
+            "count": _count_val,
+            "branch": "main",
+            "min_months_apart": _months_val,
+            "model": _model_val or model_override or "deepseek-r1:32b",
+            "user_request": user_req,
+            "auto_refactor": auto_refactor,
+            "refactor_model": refactor_model_override or "qwen3-coder-30b-refactor",
+            "refactor_loop_count": refactor_loop_count,
+            "use_feedback_loop": use_feedback_loop,
+            "pr_mode": use_pr_mode,
+            "min_days_apart": _days_apart_val,
+        }
         print(f"Plan (fast-path): {json.dumps(_fast_plan, indent=2)}\n")
         rc = run_tool(_fast_plan, user_req)
         sys.exit(rc)
@@ -5104,6 +5182,8 @@ def main():
             plan["use_feedback_loop"] = True
         if use_pr_mode and not plan.get("pr_mode"):
             plan["pr_mode"] = True
+        if _days_apart_val > 0 and not plan.get("min_days_apart"):
+            plan["min_days_apart"] = _days_apart_val
         if refactor_model_override and not plan.get("refactor_model"):
             plan["refactor_model"] = refactor_model_override
         elif not plan.get("refactor_model"):
@@ -5168,6 +5248,8 @@ def main():
                 p["use_feedback_loop"] = True
             if use_pr_mode:
                 p["pr_mode"] = True
+            if _days_apart_val > 0:
+                p["min_days_apart"] = _days_apart_val
             rc = run_tool(p, user_req)
             sys.exit(rc)
 

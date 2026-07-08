@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 import urllib.error
 import urllib.request
 from typing import Optional
@@ -30,6 +32,16 @@ from typing import Optional
 
 _OLLAMA_DEFAULT = "http://localhost:11434"
 _VLLM_DEFAULT = "http://localhost:8000"
+
+# Claude model mapping: short names → CLI model names
+_CLAUDE_MODELS = {
+    "claude-opus": "opus",
+    "claude-sonnet": "sonnet",
+    "claude-haiku": "haiku",
+    "opus": "opus",
+    "sonnet": "sonnet",
+    "haiku": "haiku",
+}
 
 
 def _strip_thinking(text: str) -> str:
@@ -57,10 +69,15 @@ class LLMBackend:
     ):
         self.model = model
         self.num_ctx = num_ctx
-        self.backend = (
-            backend
-            or os.environ.get("ARCH_AGENT_LLM_BACKEND", "ollama")
-        ).lower()
+
+        # Auto-detect claude backend from model name
+        if backend:
+            self.backend = backend.lower()
+        elif model.lower().replace("-", "").replace(" ", "") in ("claudeopus", "claudesonnet", "claudehaiku") or model.lower() in _CLAUDE_MODELS:
+            self.backend = "claude"
+        else:
+            self.backend = os.environ.get("ARCH_AGENT_LLM_BACKEND", "ollama").lower()
+
         self.api_key = api_key or os.environ.get("ARCH_AGENT_LLM_API_KEY", "")
 
         if base_url:
@@ -69,6 +86,8 @@ class LLMBackend:
             self.base_url = os.environ["ARCH_AGENT_LLM_BASE_URL"].rstrip("/")
         elif self.backend == "vllm":
             self.base_url = _VLLM_DEFAULT
+        elif self.backend == "claude":
+            self.base_url = ""  # not used for Claude CLI
         else:
             self.base_url = _OLLAMA_DEFAULT
 
@@ -78,17 +97,55 @@ class LLMBackend:
 
     def generate(self, prompt: str, system: Optional[str] = None, timeout_s: int = 900) -> str:
         """Generate a response. Returns plain text (thinking block stripped)."""
-        if self.backend == "ollama":
+        if self.backend == "claude":
+            raw = self._claude_cli(prompt, system, timeout_s)
+        elif self.backend == "ollama":
             raw = self._ollama_api(prompt, timeout_s)
         elif self.backend in ("vllm", "api"):
             raw = self._openai_compat(prompt, system, timeout_s)
         else:
-            raise ValueError(f"Unknown LLM backend: {self.backend!r}. Use ollama, vllm, or api.")
+            raise ValueError(f"Unknown LLM backend: {self.backend!r}. Use ollama, vllm, api, or claude.")
         return _strip_thinking(raw)
 
     # ------------------------------------------------------------------
     # Backend implementations
     # ------------------------------------------------------------------
+
+    def _claude_cli(self, prompt: str, system: Optional[str], timeout_s: int) -> str:
+        """
+        Call Claude via the Claude CLI (uses subscription, no API costs).
+        Runs: claude -p --model <model> with prompt on stdin.
+        """
+        claude_bin = shutil.which("claude")
+        if not claude_bin:
+            return "[LLM ERROR: Claude CLI not found. Install: https://docs.anthropic.com/en/docs/claude-cli]"
+
+        # Map model name to CLI model variant
+        cli_model = _CLAUDE_MODELS.get(self.model.lower(), "opus")
+
+        # Build full prompt with system message if provided
+        full_prompt = prompt
+        if system:
+            full_prompt = f"{system}\n\n{prompt}"
+
+        cmd = [claude_bin, "-p", "--model", cli_model]
+
+        try:
+            result = subprocess.run(
+                cmd,
+                input=full_prompt,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+            )
+            if result.returncode != 0:
+                err = (result.stderr or "").strip()[:300]
+                return f"[LLM ERROR: Claude CLI returned code {result.returncode}: {err}]"
+            return (result.stdout or "").strip()
+        except subprocess.TimeoutExpired:
+            return f"[LLM ERROR: Claude CLI timed out after {timeout_s}s]"
+        except Exception as e:
+            return f"[LLM ERROR: Claude CLI failed: {e}]"
 
     def _ollama_api(self, prompt: str, timeout_s: int) -> str:
         """

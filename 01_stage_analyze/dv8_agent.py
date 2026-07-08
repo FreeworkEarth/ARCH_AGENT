@@ -2147,6 +2147,20 @@ def run_additional_dv8_tasks(
     else:
         print("  [hotspot] all-file-change-cost.csv not found; skipping hotspot generation.")
 
+    # 6) Export ALL .dv8-clsx files to JSON for human-readable file lists
+    _exported_count = 0
+    for clsx_file in output_dir.rglob("*.dv8-clsx"):
+        json_out = clsx_file.with_suffix(".json")
+        if json_out.exists():
+            continue
+        cmd = [dv8_console, "core:export-cluster", str(clsx_file), "-outputFile", str(json_out)]
+        res = run(cmd, env=env, check=False)
+        if res.returncode == 0:
+            _exported_count += 1
+        _log(res, f"export-cluster:{clsx_file.name}", cmd)
+    if _exported_count:
+        print(f"  [export] Exported {_exported_count} .dv8-clsx files to JSON")
+
 
 def summarize_outputs(output_dir: Path) -> None:
     """Print a concise summary of key outputs for quick navigation."""
@@ -2517,6 +2531,8 @@ def get_commit_history(
 def get_pr_history(
     repo_path: Path,
     count: int = 10,
+    min_days_apart: int = 0,
+    since_date: str | None = None,
 ) -> List[Dict[str, str]]:
     """Get merged Pull Requests as revision points using gh CLI.
 
@@ -2524,17 +2540,24 @@ def get_pr_history(
     pipeline (checkout_commit_to_folder, run_temporal_analysis) works unchanged.
 
     Each merged PR's merge commit SHA becomes a revision point.
+    Args:
+        count: Number of PRs to select
+        min_days_apart: Minimum days between selected PRs (0=no spacing)
+        since_date: Only include PRs merged on/after this date (YYYY-MM-DD)
     """
     gh_bin = shutil.which("gh")
     if not gh_bin:
         raise RuntimeError("gh CLI not found. Install: https://cli.github.com/")
 
+    # Fetch more PRs than needed when spacing is required
+    # With active repos (300+ PRs), need to look back far enough to find spaced ones
+    fetch_limit = 500 if min_days_apart > 0 else count
+
     # gh pr list returns merged PRs with their merge commit SHA
-    # Fields: number, title, mergedAt, mergeCommit (the SHA we need)
     cmd = [
         gh_bin, "pr", "list",
         "--state", "merged",
-        "--limit", str(count),
+        "--limit", str(fetch_limit),
         "--json", "number,title,mergedAt,mergeCommit,author",
         "--jq", ".",
     ]
@@ -2551,7 +2574,15 @@ def get_pr_history(
     if not prs:
         raise RuntimeError("No merged PRs found in this repository.")
 
-    commits = []
+    # Parse since_date for filtering
+    _since_dt = None
+    if since_date:
+        try:
+            _since_dt = datetime.strptime(since_date.strip()[:10], "%Y-%m-%d")
+        except ValueError:
+            pass
+
+    all_commits = []
     for pr in prs:
         merge_commit = pr.get("mergeCommit") or {}
         sha = merge_commit.get("oid", "")
@@ -2565,17 +2596,55 @@ def get_pr_history(
         pr_num = pr.get("number", "?")
         title = pr.get("title", "")
 
-        commits.append({
+        # Filter by since_date
+        if _since_dt and date_str:
+            try:
+                pr_date = datetime.strptime(date_str.split()[0], "%Y-%m-%d")
+                if pr_date < _since_dt:
+                    continue
+            except ValueError:
+                pass
+
+        all_commits.append({
             'hash': sha,
             'short_hash': sha[:8],
             'date': date_str,
             'author': author_name,
             'message': f"PR #{pr_num}: {title}",
-            'files_changed': 0,  # not available from gh pr list, but not used for selection
+            'files_changed': 0,
         })
 
-    # gh returns newest first — same as get_commit_history
-    print(f"  Found {len(commits)} merged PRs:")
+    if not all_commits:
+        raise RuntimeError("No merged PRs found matching the date filter.")
+
+    # Sort by date (newest first) — gh may return by PR number, not chronologically
+    all_commits.sort(key=lambda c: c['date'], reverse=True)
+
+    # Apply time spacing if requested
+    if min_days_apart > 0 and len(all_commits) > count:
+        selected = [all_commits[0]]  # newest first
+        for c in all_commits[1:]:
+            if len(selected) >= count:
+                break
+            try:
+                last_date = datetime.strptime(selected[-1]['date'].split()[0], "%Y-%m-%d")
+                curr_date = datetime.strptime(c['date'].split()[0], "%Y-%m-%d")
+                if abs((last_date - curr_date).days) >= min_days_apart:
+                    selected.append(c)
+            except (ValueError, IndexError):
+                selected.append(c)
+        # If spacing too strict, fill remaining with what we have
+        if len(selected) < count:
+            for c in all_commits:
+                if c not in selected:
+                    selected.append(c)
+                if len(selected) >= count:
+                    break
+        commits = selected
+    else:
+        commits = all_commits[:count]
+
+    print(f"  Found {len(commits)} merged PRs" + (f" (≥{min_days_apart} days apart)" if min_days_apart else "") + ":")
     for c in commits:
         print(f"    {c['short_hash']} {c['date'][:10]} {c['message'][:80]}")
 
@@ -3088,6 +3157,7 @@ def run_temporal_analysis(
     spacing_mode: str = "intelligent",
     mv_cochange: int | None = None,
     pr_mode: bool = False,
+    min_days_apart: int = 0,
 ) -> Path:
     """Analyze multiple Git revisions and save time-series data with flexible spacing strategies."""
 
@@ -3118,8 +3188,10 @@ def run_temporal_analysis(
 
     # Get commits (or PRs)
     if pr_mode:
-        print(f"Selecting last {revision_count} merged Pull Requests as revision points...")
-        commits = get_pr_history(repo_path, count=revision_count)
+        _pr_days = min_days_apart if min_days_apart > 0 else (min_months_apart * 30 if min_months_apart > 0 else 0)
+        _spacing_msg = f" with ≥{_pr_days} days apart" if _pr_days else ""
+        print(f"Selecting last {revision_count} merged Pull Requests{_spacing_msg}...")
+        commits = get_pr_history(repo_path, count=revision_count, min_days_apart=_pr_days, since_date=since_date)
     elif intelligent:
         print(f"Intelligently selecting {revision_count} meaningful commits (releases, fixes, major changes)...")
         commits = get_commit_history(
@@ -3396,6 +3468,8 @@ def parse_args() -> argparse.Namespace:
                        help="Disable git worktrees in temporal mode (use git archive snapshots instead).")
     parser.add_argument("--pr-mode", action="store_true",
                        help="Use merged Pull Requests as revision points instead of commits. Requires gh CLI.")
+    parser.add_argument("--min-days-apart", type=int, default=0,
+                       help="Minimum days between revisions (for PR mode or fine-grained commit spacing). Overrides --min-months-apart when >0.")
     # Single-commit focus analysis options
     parser.add_argument("--commit", help="Analyze a specific commit hash with full pipeline (use with --fine-grain for arch-report).")
     parser.add_argument("--commit2", help="Analyze a second commit hash (analyze both, placed into a focus folder).")
@@ -3585,6 +3659,7 @@ def main() -> None:
                 spacing_mode=args.spacing_mode,
                 mv_cochange=args.mv_cochange if hasattr(args, "mv_cochange") else None,
                 pr_mode=args.pr_mode if hasattr(args, "pr_mode") else False,
+                min_days_apart=args.min_days_apart if hasattr(args, "min_days_apart") else 0,
             )
 
         print(f"\nTemporal analysis complete!")
