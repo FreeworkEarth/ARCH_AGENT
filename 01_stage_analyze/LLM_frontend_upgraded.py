@@ -942,77 +942,93 @@ def tool_interpret_temporal(plan: dict) -> int:
             # AUTO MODE: inject Q1 -> Q2 -> Stage 4 without any human input
             # ------------------------------------------------------------------
             if auto_refactor and not user_question:
-                import importlib.util
-                _spec = importlib.util.spec_from_file_location("itb", pathlib.Path(INTERPRET_TEMPORAL))
-                _mod = importlib.util.module_from_spec(_spec)
-                _spec.loader.exec_module(_mod)
-                _risk_ctx, _commit_ctx, _ = _load_rich_qa_context(tr)
-                _mscore_bd = _mod.load_mscore_worst_modules(tr)
-                sep = "=" * 70
+                # Check if existing Q&A with action blocks already exists — skip Q1/Q2/Q3
+                _existing_qa_has_actions = False
+                _interp_dir = tr / "OUTPUT_INTERPRETATION"
+                if _interp_dir.exists():
+                    import re as _re_qa_check
+                    for _qa_file in sorted(_interp_dir.glob("*/USER_ANSWERS*.md"),
+                                           key=lambda p: p.stat().st_mtime, reverse=True):
+                        _qa_text = _qa_file.read_text(encoding="utf-8", errors="replace")
+                        if _re_qa_check.search(r'###\s+Action\s+1', _qa_text):
+                            _existing_qa_has_actions = True
+                            print(f"\n[AUTO] Found existing Q&A with action blocks: {_qa_file.name}")
+                            print(f"[AUTO] Skipping Q1/Q2/Q3 — going straight to Stage 4 refactoring.")
+                            break
+
                 conversation = []
-                from datetime import datetime as _dt
+                if not _existing_qa_has_actions:
+                    import importlib.util
+                    _spec = importlib.util.spec_from_file_location("itb", pathlib.Path(INTERPRET_TEMPORAL))
+                    _mod = importlib.util.module_from_spec(_spec)
+                    _spec.loader.exec_module(_mod)
+                    _risk_ctx, _commit_ctx, _ = _load_rich_qa_context(tr)
+                    _mscore_bd = _mod.load_mscore_worst_modules(tr)
+                    sep = "=" * 70
+                    from datetime import datetime as _dt
 
-                def _auto_ask(question: str) -> str:
-                    print(f"\n[AUTO] Asking: {question!r}")
-                    prior = "\n\n".join(conversation)
-                    ctx = (prior + "\n\n" + report_text) if prior else report_text
-                    raw = _mod.answer_user_question(model, question, ctx,
-                                                    mscore_breakdown=_mscore_bd,
-                                                    timeout_s=900,
-                                                    risk_score_context=_risk_ctx,
-                                                    commit_context=_commit_ctx)
-                    answer = _mod.strip_thinking_and_fences(raw)
-                    print(f"\n{sep}\n  ANSWER\n  Q: {question}\n{sep}\n{answer}\n{sep}")
-                    conversation.append(f"Q: {question}\nA: {answer}")
-                    now = _dt.now()
-                    answer_path = run_folder / f"USER_ANSWER_{now.strftime('%Y%m%d')}.md"
-                    entry = f"\n---\n\n**Q ({now.strftime('%H:%M:%S')})**: {question}\n\n{answer}\n"
-                    if answer_path.exists():
-                        with open(answer_path, "a", encoding="utf-8") as f:
-                            f.write(entry)
-                    else:
-                        answer_path.write_text(
-                            f"# Q&A Session — {now.strftime('%Y%m%d')}\n\n**Model**: {model}\n\n---\n\n"
-                            f"**Q ({now.strftime('%H:%M:%S')})**: {question}\n\n{answer}\n",
-                            encoding="utf-8"
-                        )
-                    print(f"Saved: {answer_path}")
-                    return answer
+                    def _auto_ask(question: str) -> str:
+                        print(f"\n[AUTO] Asking: {question!r}")
+                        prior = "\n\n".join(conversation)
+                        ctx = (prior + "\n\n" + report_text) if prior else report_text
+                        raw = _mod.answer_user_question(model, question, ctx,
+                                                        mscore_breakdown=_mscore_bd,
+                                                        timeout_s=900,
+                                                        risk_score_context=_risk_ctx,
+                                                        commit_context=_commit_ctx)
+                        answer = _mod.strip_thinking_and_fences(raw)
+                        print(f"\n{sep}\n  ANSWER\n  Q: {question}\n{sep}\n{answer}\n{sep}")
+                        conversation.append(f"Q: {question}\nA: {answer}")
+                        now = _dt.now()
+                        answer_path = run_folder / f"USER_ANSWER_{now.strftime('%Y%m%d')}.md"
+                        entry = f"\n---\n\n**Q ({now.strftime('%H:%M:%S')})**: {question}\n\n{answer}\n"
+                        if answer_path.exists():
+                            with open(answer_path, "a", encoding="utf-8") as f:
+                                f.write(entry)
+                        else:
+                            answer_path.write_text(
+                                f"# Q&A Session — {now.strftime('%Y%m%d')}\n\n**Model**: {model}\n\n---\n\n"
+                                f"**Q ({now.strftime('%H:%M:%S')})**: {question}\n\n{answer}\n",
+                                encoding="utf-8"
+                            )
+                        print(f"Saved: {answer_path}")
+                        return answer
 
-                # Q1 — identify worst anti-patterns and files
-                _auto_ask("Which parts got worse over time — show anti-pattern groups, "
-                          "files with most dependency growth, and worst files overall.")
-                # Q2 — structural diagnosis: SCC cycle members, layer collapse causes, worst package cycles
-                _auto_ask(
-                    "Structural diagnosis — answer ALL sections:\n\n"
-                    "## SCC Cycle Inventory\n"
-                    "List ALL files in the largest Strongly Connected Component (SCC). "
-                    "For each file state FanIn, FanOut, and which other SCC members it imports/calls. "
-                    "Identify the TOP 3 hub files with the most intra-SCC edges.\n\n"
-                    "## Layer Collapse Analysis\n"
-                    "If DRH layers decreased: which files moved DOWN (e.g. L2→L0) and WHY? "
-                    "What dependency edges pulled them into a lower layer? "
-                    "What would need to change to restore the lost layer?\n\n"
-                    "## Package Cycle Breakdown\n"
-                    "List the top 5 worst package cycles with their member files and the specific edges forming each cycle.\n\n"
-                    "Use ONLY file names from the data above. Do NOT use vague terms like 'the God-module' — name actual paths."
-                )
-                # Q3 — surgical actions based on Q2 diagnosis; Stage 4 loop parses ### Action N
-                _auto_ask(
-                    "Based on the structural diagnosis above (SCC members, layer collapse, package cycles), "
-                    "give EXACTLY 5 concrete refactoring actions using ### Action 1 / ### Action 2 / ### Action 3 / "
-                    "### Action 4 / ### Action 5 headings, ranked by structural leverage (highest impact first).\n\n"
-                    "For EACH action:\n"
-                    "- Name the EXACT target files (full paths)\n"
-                    "- Identify the specific import/call edge to break and its weight\n"
-                    "- Describe the concrete code change: which import to remove, which function/class to move, "
-                    "which protocol/interface to extract\n"
-                    "- State expected DV8 metric improvement (e.g. 'SCC shrinks from 34→~30', 'propagation-cost drops')\n"
-                    "- State the risk and mitigation\n\n"
-                    "PRIORITY: (1) break the largest SCC cycle hub, (2) evict recently-joined SCC members, "
-                    "(3) break package cycles overlapping with SCC, (4) reduce fan-in on God-files, (5) restore layer depth.\n\n"
-                    "Do NOT include process actions ('code reviews', 'documentation'). Only structural code changes."
-                )
+                    # Q1 — identify worst anti-patterns and files
+                    _auto_ask("Which parts got worse over time — show anti-pattern groups, "
+                              "files with most dependency growth, and worst files overall.")
+                    # Q2 — structural diagnosis: SCC cycle members, layer collapse causes, worst package cycles
+                    _auto_ask(
+                        "Structural diagnosis — answer ALL sections:\n\n"
+                        "## SCC Cycle Inventory\n"
+                        "List ALL files in the largest Strongly Connected Component (SCC). "
+                        "For each file state FanIn, FanOut, and which other SCC members it imports/calls. "
+                        "Identify the TOP 3 hub files with the most intra-SCC edges.\n\n"
+                        "## Layer Collapse Analysis\n"
+                        "If DRH layers decreased: which files moved DOWN (e.g. L2→L0) and WHY? "
+                        "What dependency edges pulled them into a lower layer? "
+                        "What would need to change to restore the lost layer?\n\n"
+                        "## Package Cycle Breakdown\n"
+                        "List the top 5 worst package cycles with their member files and the specific edges forming each cycle.\n\n"
+                        "Use ONLY file names from the data above. Do NOT use vague terms like 'the God-module' — name actual paths."
+                    )
+                    # Q3 — surgical actions based on Q2 diagnosis; Stage 4 loop parses ### Action N
+                    _auto_ask(
+                        "Based on the structural diagnosis above (SCC members, layer collapse, package cycles), "
+                        "give EXACTLY 5 concrete refactoring actions using ### Action 1 / ### Action 2 / ### Action 3 / "
+                        "### Action 4 / ### Action 5 headings, ranked by structural leverage (highest impact first).\n\n"
+                        "For EACH action:\n"
+                        "- Name the EXACT target files (full paths)\n"
+                        "- Identify the specific import/call edge to break and its weight\n"
+                        "- Describe the concrete code change: which import to remove, which function/class to move, "
+                        "which protocol/interface to extract\n"
+                        "- State expected DV8 metric improvement (e.g. 'SCC shrinks from 34→~30', 'propagation-cost drops')\n"
+                        "- State the risk and mitigation\n\n"
+                        "PRIORITY: (1) break the largest SCC cycle hub, (2) evict recently-joined SCC members, "
+                        "(3) break package cycles overlapping with SCC, (4) reduce fan-in on God-files, (5) restore layer depth.\n\n"
+                        "Do NOT include process actions ('code reviews', 'documentation'). Only structural code changes."
+                    )
+
                 # Stage 4 — loop mode: applies Action 1 only, re-runs Q1+Q2 fresh each iteration
                 print(f"\n[AUTO] Triggering Stage 4 (loop refactor: Action 1 per iteration, re-analyze between each)...")
                 _run_refactor_stage(tr, conversation, model=refactor_model, loop_count=refactor_loop_count, refactor_models=refactor_models, qa_model=model, use_feedback_loop=use_feedback_loop)
@@ -5006,6 +5022,9 @@ def main():
                 variant = "sonnet"
             print(f"  → Using claude-{variant}")
         refactor_model_override = f"claude-{variant}"
+        # Also use Claude for Q&A (interpretation) — user said "claude opus", use it everywhere
+        if not model_override:
+            model_override = f"claude-{variant}"
         auto_refactor = True
         print(f"[main] Claude Code refactoring mode: model={refactor_model_override}")
 
