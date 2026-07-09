@@ -586,7 +586,10 @@ def build_managers_special(context: Dict[str, Any]) -> Tuple[str, List[str]]:
                 allowed_files.append(f)
         entry = _fmt_kv(m, ["module_key", "layer", "module_size", "cross_penalty", "clddf"])
         if files:
-            short_files = ", ".join(f.split("/")[-1] for f in files[:3] if isinstance(f, str))
+            short_files = ", ".join(
+                re.sub(r'/self \(File\)$', '', f) if isinstance(f, str) else str(f)
+                for f in files[:3]
+            )
             if short_files:
                 entry += f", files=[{short_files}]"
         cross_lines.append(entry)
@@ -651,7 +654,7 @@ def build_managers_special(context: Dict[str, Any]) -> Tuple[str, List[str]]:
         hm_files = hm.get("files_sample") or []
         hm_file_parts = []
         for fpath in hm_files[:3]:
-            fname = fpath.split("/")[-1] if isinstance(fpath, str) else str(fpath)
+            fname = re.sub(r'/self \(File\)$', '', fpath) if isinstance(fpath, str) else str(fpath)
             fi = next(
                 (r for r in dangerous_top if isinstance(r, dict) and (r.get("Filename") or "").endswith(fname)),
                 None,

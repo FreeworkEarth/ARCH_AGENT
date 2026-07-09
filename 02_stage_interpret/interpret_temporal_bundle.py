@@ -627,7 +627,7 @@ def load_antipattern_groups(temporal_root: Path, max_groups_per_type: int = 5):
                     total_bug_churn += s.get("bug_churn_total", 0)
                     total_ap_count += s.get("anti_pattern_count", 0)
                     total_churn_all += s.get("total_churn", 0)
-                    member_risk.append((m, rf.get("risk_score", 0.0)))
+                    member_risk.append((m, rf.get("combined_signals", rf.get("risk_score", 0.0))))
             member_risk.sort(key=lambda x: -x[1])
             groups.append({
                 "id": inst_dir.name,
@@ -1274,7 +1274,7 @@ def _load_fanin_fanout(rev_folder: Path) -> Dict[str, Dict[str, int]]:
         rows = (data.get("dangerous_files") or {}).get("rows") or []
         result: Dict[str, Dict[str, int]] = {}
         for r in rows:
-            fname = (r.get("Filename") or "").split("/")[-1]
+            fname = re.sub(r'/self \(File\)$', '', r.get("Filename") or "")
             if fname:
                 try:
                     result[fname] = {
@@ -1495,7 +1495,7 @@ def load_mscore_worst_modules(temporal_root: Path, top_n: int = 5, max_revisions
             files = m.get("files", [])
             file_str_parts = []
             for fpath in files[:3]:
-                fname = fpath.split("/")[-1]
+                fname = re.sub(r'/self \(File\)$', '', fpath) if isinstance(fpath, str) else str(fpath)
                 fi_fo = fanin_fanout.get(fname)
                 if fi_fo:
                     file_str_parts.append(
@@ -1957,7 +1957,7 @@ Hard rules:
 - Do NOT output reasoning or <think> blocks.
 - Use DEPENDENCY EVOLUTION as your primary evidence — cite the specific transition (e.g. "rev1←rev2") and the exact delta values.
 - For each flagged file explain: what changed (fan-in/fan-out delta), why it is dangerous (blast radius, fragility), and how it compares to prior revisions if multiple transitions show the same file worsening.
-- Cross-reference with MULTI-SIGNAL RISK SCORES and ANTI-PATTERN GROUPS — a file that both grew in dependencies AND belongs to a Clique/Modularity Violation is multiply confirmed as a priority.
+- Cross-reference with FILE HOTSPOT SIGNALS and ANTI-PATTERN GROUPS — a file that both grew in dependencies AND belongs to a Clique/Modularity Violation is multiply confirmed as a priority.
 - If SCCs grew in count or size, explain what that means: a larger cyclic cluster means more files are architecturally trapped together.
 - If METRIC PEAKS data is present: write a "## Metric Trajectory" section showing ALL transitions chronologically (oldest→newest). For each: state the revision window (dates), exact Δ M-score and Δ propagation-cost, DRH file count change, top 2 files with most fan-in growth (Δ values), total new dependency edges, which AP instances were active or grew, and a one-sentence architectural interpretation. For the WORST transition (largest propagation-cost jump): add a "#### Why this was the worst transition" sub-section using the WORST TRANSITION DRH REPORT data — explain which files joined the coupling network, what structural changes drove the spike (layer moves, SCC expansion, new edge types), what the commits show, and link to "Full DRH report: <path>". Omit only if METRIC PEAKS data is absent.
 - Rank your findings: worst evolution first. For each: (1) filename, (2) what signal worsened and by how much, (3) architectural implication, (4) one concrete fix.
