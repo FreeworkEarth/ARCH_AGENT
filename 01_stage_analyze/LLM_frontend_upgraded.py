@@ -515,13 +515,13 @@ def _run_risk_pipeline(
             files = data.get("files", [])
             if files:
                 print(f"\n{'='*60}")
-                print(f"  TOP-5 MOST DANGEROUS FILES — {repo_name}")
+                print(f"  TOP-5 FILES BY COMBINED SIGNALS — {repo_name}")
                 print(f"{'='*60}")
                 for f in files[:5]:
                     aps = ", ".join(f.get("anti_patterns_seen", [])) or "—"
                     sigs = f.get("signals", {})
                     print(
-                        f"  #{f['rank']:>2}  score={f['risk_score']:.4f}  {f['file']}\n"
+                        f"  #{f['rank']:>2}  combined={f.get('combined_signals', f.get('risk_score', 0)):.4f}  {f['file']}\n"
                         f"       anti-patterns: {aps}\n"
                         f"       fan-in={sigs.get('hotspot_fanin_score',0):.0f}  "
                         f"scc={sigs.get('scc_membership_count',0)}  "
@@ -554,19 +554,20 @@ def _load_rich_qa_context(temporal_root: pathlib.Path) -> tuple:
         try:
             risk_data = json.loads(risk_json.read_text(encoding="utf-8"))
             top_files = risk_data.get("files", [])[:25]
-            lines_rs = ["rank | file | risk_score | bug_churn | anti_patterns | scc_revisions | co_change | anti_pattern_types"]
+            lines_rs = ["rank | file | combined_signals | bug_churn | anti_patterns | scc_revisions | co_change | anti_pattern_types"]
             lines_rs.append("---" * 12)
             for f in top_files:
                 s = f.get("signals", {})
                 ap_counts = f.get("anti_pattern_type_counts", {})
                 aps = ", ".join(f"{k}:{v}" for k, v in list(ap_counts.items())[:4])
+                _cs = f.get('combined_signals', f.get('risk_score', 0))
                 lines_rs.append(
-                    f"#{f['rank']:2d} | {f['file'].split('/')[-1]:40s} | {f['risk_score']:.3f} | "
+                    f"#{f['rank']:2d} | {f['file'].split('/')[-1]:40s} | {_cs:.3f} | "
                     f"bug={s.get('bug_churn_total',0):5d} | ap={s.get('anti_pattern_count',0):3d} counts / load={s.get('anti_pattern_instance_load',0):3d} | "
                     f"scc={s.get('scc_membership_count',0):2d} revisions | co={s.get('co_change_without_dep',0):2d} | [{aps}]"
                 )
             risk_score_context = "\n".join(lines_rs)
-            print(f"  [query] Risk scores: top {len(top_files)} files loaded")
+            print(f"  [query] File signals: top {len(top_files)} files loaded")
         except Exception as exc:
             print(f"  [query] WARNING: Could not load risk scores: {exc}")
 
@@ -974,12 +975,37 @@ def tool_interpret_temporal(plan: dict) -> int:
                 # Q1 — identify worst anti-patterns and files
                 _auto_ask("Which parts got worse over time — show anti-pattern groups, "
                           "files with most dependency growth, and worst files overall.")
-                # Q2 — 3 prioritized actions (for manual reference); Stage 4 loop applies only Action 1 per iteration
-                _auto_ask("How would you refactor the worst anti-pattern? "
-                          "Give EXACTLY 3 concrete code-level refactoring actions using ### Action 1 / ### Action 2 / ### Action 3 headings. "
-                          "Each action must describe specific file changes (rename, split class, remove extends, extract interface, move method, etc). "
-                          "Do NOT include process actions like 'code reviews' or 'documentation'. Only structural code changes. "
-                          "Action 1 must be the single most impactful change right now.")
+                # Q2 — structural diagnosis: SCC cycle members, layer collapse causes, worst package cycles
+                _auto_ask(
+                    "Structural diagnosis — answer ALL sections:\n\n"
+                    "## SCC Cycle Inventory\n"
+                    "List ALL files in the largest Strongly Connected Component (SCC). "
+                    "For each file state FanIn, FanOut, and which other SCC members it imports/calls. "
+                    "Identify the TOP 3 hub files with the most intra-SCC edges.\n\n"
+                    "## Layer Collapse Analysis\n"
+                    "If DRH layers decreased: which files moved DOWN (e.g. L2→L0) and WHY? "
+                    "What dependency edges pulled them into a lower layer? "
+                    "What would need to change to restore the lost layer?\n\n"
+                    "## Package Cycle Breakdown\n"
+                    "List the top 5 worst package cycles with their member files and the specific edges forming each cycle.\n\n"
+                    "Use ONLY file names from the data above. Do NOT use vague terms like 'the God-module' — name actual paths."
+                )
+                # Q3 — surgical actions based on Q2 diagnosis; Stage 4 loop parses ### Action N
+                _auto_ask(
+                    "Based on the structural diagnosis above (SCC members, layer collapse, package cycles), "
+                    "give EXACTLY 5 concrete refactoring actions using ### Action 1 / ### Action 2 / ### Action 3 / "
+                    "### Action 4 / ### Action 5 headings, ranked by structural leverage (highest impact first).\n\n"
+                    "For EACH action:\n"
+                    "- Name the EXACT target files (full paths)\n"
+                    "- Identify the specific import/call edge to break and its weight\n"
+                    "- Describe the concrete code change: which import to remove, which function/class to move, "
+                    "which protocol/interface to extract\n"
+                    "- State expected DV8 metric improvement (e.g. 'SCC shrinks from 34→~30', 'propagation-cost drops')\n"
+                    "- State the risk and mitigation\n\n"
+                    "PRIORITY: (1) break the largest SCC cycle hub, (2) evict recently-joined SCC members, "
+                    "(3) break package cycles overlapping with SCC, (4) reduce fan-in on God-files, (5) restore layer depth.\n\n"
+                    "Do NOT include process actions ('code reviews', 'documentation'). Only structural code changes."
+                )
                 # Stage 4 — loop mode: applies Action 1 only, re-runs Q1+Q2 fresh each iteration
                 print(f"\n[AUTO] Triggering Stage 4 (loop refactor: Action 1 per iteration, re-analyze between each)...")
                 _run_refactor_stage(tr, conversation, model=refactor_model, loop_count=refactor_loop_count, refactor_models=refactor_models, qa_model=model, use_feedback_loop=use_feedback_loop)
@@ -1120,11 +1146,37 @@ def tool_interpret_temporal(plan: dict) -> int:
 
                 _auto_ask_fresh("Which parts got worse over time — show anti-pattern groups, "
                                 "files with most dependency growth, and worst files overall.")
-                _auto_ask_fresh("How would you refactor the worst anti-pattern? "
-                               "Give EXACTLY 3 concrete code-level refactoring actions using ### Action 1 / ### Action 2 / ### Action 3 headings. "
-                               "Each action must describe specific file changes (rename, split class, remove extends, extract interface, move method, etc). "
-                               "Do NOT include process actions like 'code reviews' or 'documentation'. Only structural code changes. "
-                               "Action 1 must be the single most impactful change right now.")
+                # Q2 — structural diagnosis
+                _auto_ask_fresh(
+                    "Structural diagnosis — answer ALL sections:\n\n"
+                    "## SCC Cycle Inventory\n"
+                    "List ALL files in the largest Strongly Connected Component (SCC). "
+                    "For each file state FanIn, FanOut, and which other SCC members it imports/calls. "
+                    "Identify the TOP 3 hub files with the most intra-SCC edges.\n\n"
+                    "## Layer Collapse Analysis\n"
+                    "If DRH layers decreased: which files moved DOWN (e.g. L2→L0) and WHY? "
+                    "What dependency edges pulled them into a lower layer? "
+                    "What would need to change to restore the lost layer?\n\n"
+                    "## Package Cycle Breakdown\n"
+                    "List the top 5 worst package cycles with their member files and the specific edges forming each cycle.\n\n"
+                    "Use ONLY file names from the data above. Do NOT use vague terms like 'the God-module' — name actual paths."
+                )
+                # Q3 — surgical actions based on Q2 diagnosis
+                _auto_ask_fresh(
+                    "Based on the structural diagnosis above (SCC members, layer collapse, package cycles), "
+                    "give EXACTLY 5 concrete refactoring actions using ### Action 1 / ### Action 2 / ### Action 3 / "
+                    "### Action 4 / ### Action 5 headings, ranked by structural leverage (highest impact first).\n\n"
+                    "For EACH action:\n"
+                    "- Name the EXACT target files (full paths)\n"
+                    "- Identify the specific import/call edge to break and its weight\n"
+                    "- Describe the concrete code change: which import to remove, which function/class to move, "
+                    "which protocol/interface to extract\n"
+                    "- State expected DV8 metric improvement (e.g. 'SCC shrinks from 34→~30', 'propagation-cost drops')\n"
+                    "- State the risk and mitigation\n\n"
+                    "PRIORITY: (1) break the largest SCC cycle hub, (2) evict recently-joined SCC members, "
+                    "(3) break package cycles overlapping with SCC, (4) reduce fan-in on God-files, (5) restore layer depth.\n\n"
+                    "Do NOT include process actions ('code reviews', 'documentation'). Only structural code changes."
+                )
                 print(f"\n[AUTO] Triggering Stage 4 (loop refactor: Action 1 per iteration, re-analyze between each)...")
                 _run_refactor_stage(tr, conversation, model=refactor_model, loop_count=refactor_loop_count, refactor_models=refactor_models, qa_model=model, use_feedback_loop=use_feedback_loop)
             else:
