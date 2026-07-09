@@ -357,6 +357,28 @@ def _load_drh_modules(rev_dir: Path) -> dict:
     return result
 
 
+def _dv8_node_path(node: str) -> str:
+    """Return the real file path from a DV8 node id.
+
+    DV8 node ids look like 'careship/core/db.py/self (File)' — taking the last
+    path segment yields the useless label 'self (File)'. Strip that suffix and
+    return the full file path instead, so LLM context always names real files.
+    """
+    if not node:
+        return "?"
+    for suffix in ("/self (File)", "/self(File)"):
+        if node.endswith(suffix):
+            return node[: -len(suffix)]
+    return node
+
+
+def _norm_repo_path(path: str) -> str:
+    """Normalise a git-side path ('src/careship/x.py') to DV8-side ('careship/x.py')."""
+    if path.startswith("src/"):
+        return path[4:]
+    return path
+
+
 def load_evidence_graph_evolution(temporal_root: Path, max_transitions: int = 3) -> str:
     """Load pairwise evidence graph diffs and summarise dependency evolution.
 
@@ -427,7 +449,7 @@ def load_evidence_graph_evolution(temporal_root: Path, max_transitions: int = 3)
         if fi_top:
             lines.append("  TOP FAN-IN GROWTH (files gaining most incoming dependencies → centralisation risk):")
             for item in fi_top:
-                node = item.get("node", "?").split("/")[-1]
+                node = _dv8_node_path(item.get("node", "?"))
                 delta = item.get("delta", 0)
                 lines.append(f"    {node}: +{delta}")
 
@@ -436,7 +458,7 @@ def load_evidence_graph_evolution(temporal_root: Path, max_transitions: int = 3)
         if fo_top:
             lines.append("  TOP FAN-OUT GROWTH (files coupling to more targets → fragility risk):")
             for item in fo_top:
-                node = item.get("node", "?").split("/")[-1]
+                node = _dv8_node_path(item.get("node", "?"))
                 delta = item.get("delta", 0)
                 lines.append(f"    {node}: +{delta}")
 
@@ -445,8 +467,8 @@ def load_evidence_graph_evolution(temporal_root: Path, max_transitions: int = 3)
         if added:
             lines.append("  SAMPLE NEW DEPENDENCIES ADDED:")
             for e in added:
-                src = e.get("src", "?").split("/")[-1]
-                dest = e.get("dest", "?").split("/")[-1]
+                src = _dv8_node_path(e.get("src", "?"))
+                dest = _dv8_node_path(e.get("dest", "?"))
                 kind = e.get("kind", "?")
                 lines.append(f"    {src} --[{kind}]--> {dest}")
 
@@ -535,10 +557,14 @@ def load_antipattern_groups(temporal_root: Path, max_groups_per_type: int = 5):
     single_rev_root = temporal_root / "INPUT_INTERPRETATION" / "SINGLE_REVISION_ANALYSIS_DATA"
     if not single_rev_root.exists():
         return "", []
-    rev_dirs = sorted(single_rev_root.iterdir())
+    rev_dirs = sorted(p for p in single_rev_root.iterdir() if p.is_dir())
     if not rev_dirs:
         return "", []
-    newest_rev = rev_dirs[0]  # 01_* is most recent
+    # Pick the most recent PR revision (01_*). Refactoring-loop snapshots
+    # (004_*_loop2, 005_*_loop1) sort lexicographically BEFORE 01_ and must be
+    # excluded — otherwise the whole Q&A analyses a loop artifact, not the repo.
+    pr_dirs = [p for p in rev_dirs if "_loop" not in p.name.lower()]
+    newest_rev = pr_dirs[0] if pr_dirs else rev_dirs[0]
     arch_issue_root = newest_rev / "OutputData" / "arch-issue"
     if not arch_issue_root.exists():
         return "", []
@@ -550,8 +576,10 @@ def load_antipattern_groups(temporal_root: Path, max_groups_per_type: int = 5):
         try:
             rd = json.loads(risk_json.read_text(encoding="utf-8"))
             for f in rd.get("files", []):
-                basename = f["file"].split("/")[-1]
-                risk_lookup[basename] = f
+                # Key by full normalised path ('src/careship/x.py' → 'careship/x.py')
+                # so it joins against DV8 instance member paths. Basename keys
+                # collide (20+ files are named service.py) and misattribute churn.
+                risk_lookup[_norm_repo_path(f["file"])] = f
         except Exception:
             pass
 
@@ -609,8 +637,9 @@ def load_antipattern_groups(temporal_root: Path, max_groups_per_type: int = 5):
                     continue
             try:
                 lines = files_csv.read_text(encoding="utf-8").splitlines()
-                # Skip header line "file_path"
-                members = [l.strip().split("/")[-1] for l in lines[1:] if l.strip()]
+                # Skip header line "file_path" — keep FULL paths (basenames are
+                # ambiguous: many files share names like service.py/models.py)
+                members = [l.strip() for l in lines[1:] if l.strip()]
             except Exception:
                 continue
             if not members:
@@ -627,8 +656,15 @@ def load_antipattern_groups(temporal_root: Path, max_groups_per_type: int = 5):
                     total_bug_churn += s.get("bug_churn_total", 0)
                     total_ap_count += s.get("anti_pattern_count", 0)
                     total_churn_all += s.get("total_churn", 0)
-                    member_risk.append((m, rf.get("combined_signals", rf.get("risk_score", 0.0))))
-            member_risk.sort(key=lambda x: -x[1])
+                    _cs = rf.get("combined_signals", rf.get("risk_score", 0.0))
+                    member_risk.append((m, s, _cs))
+                else:
+                    member_risk.append((m, None, 0.0))
+            # Sort by bug_churn DESC, tiebreak ap_memberships DESC — no composite score
+            member_risk.sort(key=lambda x: (
+                -(x[1] or {}).get("bug_churn_total", 0),
+                -(x[1] or {}).get("anti_pattern_instance_load", 0),
+            ))
             groups.append({
                 "id": inst_dir.name,
                 "size": len(members),
@@ -683,9 +719,18 @@ def load_antipattern_groups(temporal_root: Path, max_groups_per_type: int = 5):
                     others_union |= other["member_set"]
             unique_count = len(g["member_set"] - others_union)
 
-            member_str = ", ".join(
-                f"{name}(risk={score:.3f})" for name, score in g["top_members"]
-            )
+            def _member_desc(entry):
+                name, s, cs = entry
+                if s:
+                    return (
+                        f"{name} (bug_churn={s.get('bug_churn_total', 0)}, "
+                        f"ap_memberships={s.get('anti_pattern_instance_load', s.get('anti_pattern_count', 0))}, "
+                        f"co_change={s.get('co_change_without_dep', 0)}, "
+                        f"combined={cs:.3f})"
+                    )
+                return f"{name} (no signal data)"
+
+            member_str = ", ".join(_member_desc(e) for e in g["top_members"])
             if g["size"] > 8:
                 member_str += f" ... +{g['size'] - 8} more files"
             if total_system_files:
@@ -707,10 +752,17 @@ def load_antipattern_groups(temporal_root: Path, max_groups_per_type: int = 5):
                 csv_names = ", ".join(n for n, exists in [(clsx_csv.name, clsx_csv.exists()), (sdsm_csv.name, sdsm_csv.exists())] if exists)
                 instance_files_note = f"\n    Instance data: {inst_dir_mirrored} [{csv_names}]"
 
+            # total_churn is not tracked for every file; when the sum is smaller
+            # than bug_churn the nonbug figure would go negative — report n/a
+            # instead of a misleading negative number.
+            if g["total_churn_all"] >= g["total_bug_churn"] and g["total_churn_all"] > 0:
+                churn_str = f"bug_churn={g['total_bug_churn']} | nonbug_churn={g['total_nonbug_churn']} | total_churn={g['total_churn_all']}"
+            else:
+                churn_str = f"bug_churn={g['total_bug_churn']} | nonbug_churn=n/a | total_churn=n/a (total churn not tracked for all members)"
             lines_out.append(
-                f"  Instance {g['id']}: {g['size']} files total{pct_str} ({unique_count} unique to this instance) | bug_churn={g['total_bug_churn']} | nonbug_churn={g['total_nonbug_churn']} | total_churn={g['total_churn_all']} | combined_ap_count={g['total_ap_count']}"
+                f"  Instance {g['id']}: {g['size']} files total{pct_str} ({unique_count} unique to this instance) | {churn_str} | combined_ap_count={g['total_ap_count']}"
             )
-            lines_out.append(f"    Top members by risk: {member_str}")
+            lines_out.append(f"    Top members (full paths, raw observable signals — no composite score): {member_str}")
             for note in g["overlap_notes"]:
                 lines_out.append(f"    ⚠ OVERLAP: {note}")
             if instance_files_note:
@@ -1110,7 +1162,7 @@ def detect_metric_peaks(
             fi_top = (ev.get("fan_in_delta_top") or [])[:5]
             if fi_top:
                 fi_str = ", ".join(
-                    f"{item.get('node','?').split('/')[-1]} (+{item.get('delta',0)})"
+                    f"{_dv8_node_path(item.get('node','?'))} (+{item.get('delta',0)})"
                     for item in fi_top
                 )
                 lines.append(f"  - Top fan-in growth: {fi_str}")
@@ -1118,7 +1170,7 @@ def detect_metric_peaks(
             fo_top = (ev.get("fan_out_delta_top") or [])[:5]
             if fo_top:
                 fo_str = ", ".join(
-                    f"{item.get('node','?').split('/')[-1]} (+{item.get('delta',0)})"
+                    f"{_dv8_node_path(item.get('node','?'))} (+{item.get('delta',0)})"
                     for item in fo_top
                 )
                 lines.append(f"  - Top fan-out growth: {fo_str}")
@@ -1822,11 +1874,15 @@ Then write a "Worst files overall" section — top 5 files ranked by bug_churn (
 - **fan_in_delta**: cumulative fan-in growth across ALL transitions — use the `fan_in_delta` value from the FILE HOTSPOT SIGNALS table (e.g. "fan_in_delta=+182"). Do NOT use the absolute fan-in value from DEPENDENCY EVOLUTION for this field.
 - **Number of distinct anti-pattern types**: e.g. "4 types: clique, modularity-violation, package-cycle, unhealthy-inheritance"
 - **Specific instances**: names of the SPECIFIC anti-pattern instances it belongs to (e.g. "Clique Instance 1, Modularity Violation Instance 1 and 4")
-Do NOT mention "risk score" — use observable signals only.
+Do NOT call anything a "risk score" — use individual observable signals (bug_churn, ap_instances, fan_in, etc.) and explain them. The combined_signals value is a normalized sum for ranking, not an empirically validated score.
 
 End with a short conclusion: worst group (name, %, bug_churn), worst file (name, bug_churn, fan-in), and one concrete first refactoring step.
 
 If MOST ACTIVE FILES data is present in context: after "Worst files overall", add a short "### Most active in last revision" section — list the top 5 files by total lines changed in the most recent window, with their churn count. Note which of these also appear in anti-pattern groups or have high bug_churn (cross-reference with FILE HOTSPOT SIGNALS). This shows current development pressure, not historical pain.
+
+Finally, add a "## Combined Signal Ranking (top 20)" table at the very end. For each of the top 20 files from the FILE HOTSPOT SIGNALS data, show ALL individual signals on one line:
+`# <rank> | <file_path> | bug_churn=<N> | total_churn=<N> | ap_load=<N> | ap_count=<N> | fan_in=<N> | scc=<N> | co_change=<N> | → combined=<X.XXXX>`
+Use ONLY values from the FILE HOTSPOT SIGNALS table. This gives the reader a quick at-a-glance view of every observable signal per file. Add a one-line note above the table: "(combined_signals = equal-weight normalized sum of bug_churn + total_churn + anti_pattern + fan_in + scc + co_change)"
 
 QUESTION: {question}
 
@@ -1856,7 +1912,7 @@ METRIC SEMANTICS — you MUST interpret these for the reader, not just quote the
 
 Hard rules:
 - Do NOT output reasoning or <think> blocks.
-- Do NOT mention "risk_score" — it is not empirically validated. Use observable signals only.
+- Do NOT call anything a "risk score". The combined_signals value is a normalized sum for ranking, not an empirically validated score. Cite the individual observable signals (bug_churn, ap_instances, fan_in, scc, co_change) and explain what each means.
 - For each file: state its rank, bug_churn_total (lines changed in bug-fix commits), ap_instances (anti-pattern instance memberships), and fan_in (if available from evolution data).
 - For each file include these 4 parts:
   1. **Bug-fix churn**: cite bug_churn_total and total_churn — explain what they mean in plain terms (e.g. "416 lines changed in bug-fix commits = high maintenance burden")
@@ -1981,13 +2037,13 @@ Hard rules:
 - Do NOT output reasoning or <think> blocks.
 - Format: short header, bullet points for evidence, 1-sentence conclusion.
 - For date-range questions: find transitions whose dates fall within the range asked and cite their specific metric deltas.
-- For "technical debt" questions: combine the MULTI-SIGNAL RISK SCORES (which files have most bugs+churn+anti-patterns) with the M-SCORE WORST MODULES (structural coupling) to identify groups of files that are both structurally bad AND actively causing problems.
+- For "technical debt" questions: combine the FILE HOTSPOT SIGNALS (which files have most bugs+churn+anti-patterns) with the M-SCORE WORST MODULES (structural coupling) to identify groups of files that are both structurally bad AND actively causing problems.
 - For "most rapidly decreasing in quality" questions: find transitions with the largest negative M-score deltas (look at the transition summaries), identify which files changed in those windows (from COMMIT CONTEXT), and name the specific anti-patterns/SCCs that worsened.
 - When citing metric changes, ALWAYS include both absolute delta and percentage.
 
 QUESTION: {question}
 
-REPORT (M-score data first, then risk scores, then transition summaries with dates, then narrative):
+REPORT (M-score data first, then file hotspot signals, then transition summaries with dates, then narrative):
 {context}
 """
     return query_ollama(model, prompt, timeout_s=timeout_s, num_ctx=_auto_num_ctx(prompt, answer_budget=6000))
@@ -2099,23 +2155,27 @@ def main() -> int:
                         elif _line.strip() == "" or _line.startswith("  "):
                             if "TOP FAN-" not in _line and "TOP FAN-IN" not in _line:
                                 _in_fanin_block = False
-                lines_rs = ["rank | file | bug_churn | ap_instances | fan_in(cumul_delta) | anti_patterns | scc_revisions | co_change | anti_pattern_types"]
+                lines_rs = ["rank | file | bug_churn | total_churn | ap_load | ap_count | fan_in | fan_in_delta | scc | co_change | anti_pattern_types | combined_signals"]
+                lines_rs.append("(combined_signals = equal-weight normalized sum of bug_churn + total_churn + anti_pattern + fan_in + scc + co_change)")
                 lines_rs.append("---" * 12)
                 for f in top_files:
                     s = f.get("signals", {})
                     ap_counts = f.get("anti_pattern_type_counts", {})
                     aps = ", ".join(f"{k}:{v}" for k, v in list(ap_counts.items())[:4])
-                    fname_short = f['file'].split('/')[-1]
-                    _fi_delta = _fanin_cumul.get(fname_short)
-                    fi_str = f"fan_in_delta={_fi_delta:+.0f}" if _fi_delta is not None else "fan_in_delta=n/a"
+                    fname_full = _norm_repo_path(f['file'])
+                    _fi_delta = _fanin_cumul.get(fname_full) or _fanin_cumul.get(fname_full.split('/')[-1])
+                    fi_delta_str = f"fan_in_delta={_fi_delta:+.0f}" if _fi_delta is not None else "fan_in_delta=n/a"
+                    _cs = f.get('combined_signals', f.get('risk_score', 0))
                     lines_rs.append(
-                        f"#{f['rank']:2d} | {fname_short:40s} | "
-                        f"bug={s.get('bug_churn_total',0):5d} | ap_instances={s.get('anti_pattern_instance_load',0):3d} | {fi_str} | "
-                        f"ap={s.get('anti_pattern_count',0):3d} counts | "
-                        f"scc={s.get('scc_membership_count',0):2d} revisions | co={s.get('co_change_without_dep',0):2d} | [{aps}]"
+                        f"#{f['rank']:2d} | {fname_full:60s} | "
+                        f"bug={s.get('bug_churn_total',0):5d} | total_churn={s.get('total_churn',0):6d} | "
+                        f"ap_load={s.get('anti_pattern_instance_load',0):3d} | ap_count={s.get('anti_pattern_count',0):3d} | "
+                        f"fan_in={s.get('hotspot_fanin_score',0):.0f} | {fi_delta_str} | "
+                        f"scc={s.get('scc_membership_count',0):2d} | co={s.get('co_change_without_dep',0):2d} | [{aps}] | "
+                        f"combined={_cs:.3f}"
                     )
                 risk_score_context = "\n".join(lines_rs)
-                print(f"  [Q&A] Loaded risk scores for top {len(top_files)} files")
+                print(f"  [Q&A] Loaded file hotspot signals for top {len(top_files)} files")
             except Exception as exc:
                 print(f"  [Q&A] WARNING: Could not load risk scores: {exc}")
         commit_context, bug_commit_count, bug_commit_source = load_bug_commit_context(temporal_root)
@@ -2404,23 +2464,27 @@ def main() -> int:
                     elif _line.strip() == "" or _line.startswith("  "):
                         if "TOP FAN-" not in _line and "TOP FAN-IN" not in _line:
                             _in_fanin_block = False
-            lines_rs = ["rank | file | bug_churn | ap_instances | fan_in(cumul_delta) | anti_patterns | scc_revisions | co_change | anti_pattern_types"]
+            lines_rs = ["rank | file | bug_churn | total_churn | ap_load | ap_count | fan_in | fan_in_delta | scc | co_change | anti_pattern_types | combined_signals"]
+            lines_rs.append("(combined_signals = equal-weight normalized sum of bug_churn + total_churn + anti_pattern + fan_in + scc + co_change)")
             lines_rs.append("---" * 12)
             for f in top_files:
                 s = f.get("signals", {})
                 ap_counts = f.get("anti_pattern_type_counts", {})
                 aps = ", ".join(f"{k}:{v}" for k, v in list(ap_counts.items())[:4])
-                fname_short = f['file'].split('/')[-1]
-                _fi_delta = _fanin_cumul.get(fname_short)
-                fi_str = f"fan_in_delta={_fi_delta:+.0f}" if _fi_delta is not None else "fan_in_delta=n/a"
+                fname_full = _norm_repo_path(f['file'])
+                _fi_delta = _fanin_cumul.get(fname_full) or _fanin_cumul.get(fname_full.split('/')[-1])
+                fi_delta_str = f"fan_in_delta={_fi_delta:+.0f}" if _fi_delta is not None else "fan_in_delta=n/a"
+                _cs = f.get('combined_signals', f.get('risk_score', 0))
                 lines_rs.append(
-                    f"#{f['rank']:2d} | {fname_short:40s} | "
-                    f"bug={s.get('bug_churn_total',0):5d} | ap_instances={s.get('anti_pattern_instance_load',0):3d} | {fi_str} | "
-                    f"ap={s.get('anti_pattern_count',0):3d} counts | "
-                    f"scc={s.get('scc_membership_count',0):2d} revisions | co={s.get('co_change_without_dep',0):2d} | [{aps}]"
+                    f"#{f['rank']:2d} | {fname_full:60s} | "
+                    f"bug={s.get('bug_churn_total',0):5d} | total_churn={s.get('total_churn',0):6d} | "
+                    f"ap_load={s.get('anti_pattern_instance_load',0):3d} | ap_count={s.get('anti_pattern_count',0):3d} | "
+                    f"fan_in={s.get('hotspot_fanin_score',0):.0f} | {fi_delta_str} | "
+                    f"scc={s.get('scc_membership_count',0):2d} | co={s.get('co_change_without_dep',0):2d} | [{aps}] | "
+                    f"combined={_cs:.3f}"
                 )
             risk_score_context = "\n".join(lines_rs)
-            print(f"  [Q&A] Loaded risk scores for top {len(top_files)} files")
+            print(f"  [Q&A] Loaded file hotspot signals for top {len(top_files)} files")
         except Exception as exc:
             print(f"  [Q&A] WARNING: Could not load risk scores: {exc}")
 

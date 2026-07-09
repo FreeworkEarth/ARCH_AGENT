@@ -516,18 +516,21 @@ def _run_risk_pipeline(
             if files:
                 print(f"\n{'='*60}")
                 print(f"  TOP-5 FILES BY COMBINED SIGNALS — {repo_name}")
+                print(f"  (equal-weight normalized sum of bug_churn + anti_pattern + fan_in + scc + co_change)")
                 print(f"{'='*60}")
                 for f in files[:5]:
                     aps = ", ".join(f.get("anti_patterns_seen", [])) or "—"
                     sigs = f.get("signals", {})
                     print(
-                        f"  #{f['rank']:>2}  combined={f.get('combined_signals', f.get('risk_score', 0)):.4f}  {f['file']}\n"
-                        f"       anti-patterns: {aps}\n"
-                        f"       fan-in={sigs.get('hotspot_fanin_score',0):.0f}  "
+                        f"  #{f['rank']:>2}  {f['file']}\n"
+                        f"       bug_churn={sigs.get('bug_churn_total',0)}  "
+                        f"ap_load={sigs.get('anti_pattern_instance_load',0)}  "
+                        f"ap_count={sigs.get('anti_pattern_count',0)}  "
+                        f"fan_in={sigs.get('hotspot_fanin_score',0):.0f}  "
                         f"scc={sigs.get('scc_membership_count',0)}  "
-                        f"anti_pattern_count={sigs.get('anti_pattern_count',0)}  "
-                        f"anti_pattern_load={sigs.get('anti_pattern_instance_load',0)}  "
-                        f"bug_churn={sigs.get('bug_churn_total',0)}"
+                        f"co_change={sigs.get('co_change_without_dep',0)}\n"
+                        f"       → combined_signals={f.get('combined_signals', f.get('risk_score', 0)):.4f}\n"
+                        f"       anti-patterns: {aps}"
                     )
                 print(f"{'='*60}")
                 print(f"  Full results: {risk_json}")
@@ -554,7 +557,8 @@ def _load_rich_qa_context(temporal_root: pathlib.Path) -> tuple:
         try:
             risk_data = json.loads(risk_json.read_text(encoding="utf-8"))
             top_files = risk_data.get("files", [])[:25]
-            lines_rs = ["rank | file | combined_signals | bug_churn | anti_patterns | scc_revisions | co_change | anti_pattern_types"]
+            lines_rs = ["rank | file | bug_churn | total_churn | ap_load | ap_count | fan_in | scc | co_change | anti_pattern_types | combined_signals"]
+            lines_rs.append("(combined_signals = equal-weight normalized sum of bug_churn + total_churn + anti_pattern + fan_in + scc + co_change)")
             lines_rs.append("---" * 12)
             for f in top_files:
                 s = f.get("signals", {})
@@ -562,9 +566,12 @@ def _load_rich_qa_context(temporal_root: pathlib.Path) -> tuple:
                 aps = ", ".join(f"{k}:{v}" for k, v in list(ap_counts.items())[:4])
                 _cs = f.get('combined_signals', f.get('risk_score', 0))
                 lines_rs.append(
-                    f"#{f['rank']:2d} | {f['file'].split('/')[-1]:40s} | {_cs:.3f} | "
-                    f"bug={s.get('bug_churn_total',0):5d} | ap={s.get('anti_pattern_count',0):3d} counts / load={s.get('anti_pattern_instance_load',0):3d} | "
-                    f"scc={s.get('scc_membership_count',0):2d} revisions | co={s.get('co_change_without_dep',0):2d} | [{aps}]"
+                    f"#{f['rank']:2d} | {f['file'].split('/')[-1]:40s} | "
+                    f"bug={s.get('bug_churn_total',0):5d} | total_churn={s.get('total_churn',0):6d} | "
+                    f"ap_load={s.get('anti_pattern_instance_load',0):3d} | ap_count={s.get('anti_pattern_count',0):3d} | "
+                    f"fan_in={s.get('hotspot_fanin_score',0):.0f} | "
+                    f"scc={s.get('scc_membership_count',0):2d} | co={s.get('co_change_without_dep',0):2d} | [{aps}] | "
+                    f"combined={_cs:.3f}"
                 )
             risk_score_context = "\n".join(lines_rs)
             print(f"  [query] File signals: top {len(top_files)} files loaded")

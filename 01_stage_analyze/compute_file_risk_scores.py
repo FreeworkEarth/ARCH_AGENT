@@ -839,6 +839,61 @@ def compute_risk_scores(
 ) -> List[Dict[str, Any]]:
     """Compute composite risk scores and return sorted list of file dicts."""
 
+    # --- Key normalisation ---------------------------------------------------
+    # The input dicts use MIXED key formats: git-derived signals (churn,
+    # co-change) use 'src/careship/x.py' while DV8-derived signals (fan-in,
+    # SCC, anti-patterns) use 'careship/x.py' or 'careship/x.py/self (File)'.
+    # Without normalisation the per-file join silently fails (fan_in=0, scc=0
+    # for every churned file). Normalise everything to 'careship/x.py'.
+    def _norm_key(p: str) -> str:
+        for suffix in ("/self (File)", "/self(File)"):
+            if p.endswith(suffix):
+                p = p[: -len(suffix)]
+        if p.startswith("src/"):
+            p = p[4:]
+        return p
+
+    def _norm_numeric(d: Dict) -> Dict:
+        if not d:
+            return {}
+        out: Dict = {}
+        for k, v in d.items():
+            nk = _norm_key(k)
+            out[nk] = out.get(nk, 0) + v
+        return out
+
+    def _norm_sets(d: Dict) -> Dict:
+        if not d:
+            return {}
+        out: Dict = {}
+        for k, v in d.items():
+            nk = _norm_key(k)
+            out[nk] = out.get(nk, set()) | set(v)
+        return out
+
+    def _norm_counts(d: Dict) -> Dict:
+        if not d:
+            return {}
+        out: Dict = {}
+        for k, v in d.items():
+            nk = _norm_key(k)
+            merged = out.setdefault(nk, {})
+            for t, c in (v or {}).items():
+                merged[t] = merged.get(t, 0) + c
+        return out
+
+    anti_pattern_total = _norm_numeric(anti_pattern_total)
+    hotspot_fanin_sum = _norm_numeric(hotspot_fanin_sum)
+    rev_presence = _norm_numeric(rev_presence)
+    total_churn = _norm_numeric(total_churn)
+    bug_churn = _norm_numeric(bug_churn)
+    scc_count = _norm_numeric(scc_count)
+    cochange_partners = _norm_numeric(cochange_partners)
+    anti_patterns_seen = _norm_sets(anti_patterns_seen)
+    anti_pattern_revision_count = _norm_numeric(anti_pattern_revision_count)
+    anti_pattern_instance_load = _norm_numeric(anti_pattern_instance_load)
+    anti_pattern_type_counts = _norm_counts(anti_pattern_type_counts)
+
     # Universe of files: union of all signal dicts
     all_files: Set[str] = (
         set(anti_pattern_total)
@@ -850,6 +905,14 @@ def compute_risk_scores(
         | set(cochange_partners)
     )
     all_files = {f for f in all_files if f}  # drop empty strings
+    # Only rank real source files. Git churn brings in .md audit docs, .patch
+    # artifacts, configs etc. — those can top raw bug_churn but are not part of
+    # the system architecture and must not appear as "worst files".
+    # Test/build/doc directories are excluded via PROD_EXCLUDE_DIR_NAMES.
+    all_files = {
+        f for f in all_files
+        if _is_source_file(f) and not _has_excluded_segment_str(f)
+    }
 
     # Raw signal dicts (with 0 defaults)
     def raw(d: Dict, f: str, default=0):
@@ -1796,8 +1859,13 @@ def main() -> int:
     if results:
         print(f"Top-5 by combined signals (bug_churn + total_churn + anti_pattern + fan_in + scc + co_change):")
         for item in results[:5]:
+            s = item.get("signals", {})
             print(
-                f"  #{item['rank']:>3}  {item['combined_signals']:.4f}  {item['file']}"
+                f"  #{item['rank']:>3} | {item['file']}\n"
+                f"        bug_churn={s.get('bug_churn_total',0):5d}  total_churn={s.get('total_churn',0):6d}  "
+                f"ap_load={s.get('anti_pattern_instance_load',0):4d}  ap_count={s.get('anti_pattern_count',0):3d}  "
+                f"fan_in={s.get('hotspot_fanin_score',0):.0f}  scc={s.get('scc_membership_count',0):2d}  "
+                f"co_change={s.get('co_change_without_dep',0):2d}  → combined={item['combined_signals']:.4f}"
             )
     return 0
 
