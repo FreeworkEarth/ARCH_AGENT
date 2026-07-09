@@ -931,18 +931,22 @@ def compute_risk_scores(
         for f in all_files:
             norm.setdefault(f, {})[sig_name] = norm_vals.get(f, 0.0)
 
-    # Composite score
+    # Combined signal score — equal weight per signal (no opinionated weighting)
+    # Previous hand-tuned weights (kept for future empirical weight learning):
+    #   bug_churn=0.25, total_churn=0.05, anti_pattern=0.25,
+    #   hotspot_fanin=0.20, scc_membership=0.15, co_change=0.10
+    _equal_w = 1.0 / 6.0
     w = weights
     results: List[Dict[str, Any]] = []
     for f in all_files:
         n = norm[f]
         score = (
-            w.get("bug_churn", 0.25) * n["bug_churn_total"]
-            + w.get("total_churn", 0.05) * n["total_churn"]
-            + w.get("anti_pattern", 0.25) * n["anti_pattern_count"]
-            + w.get("hotspot_fanin", 0.20) * n["hotspot_fanin_score"]
-            + w.get("scc_membership", 0.15) * n["scc_membership_count"]
-            + w.get("co_change", 0.10) * n["co_change_without_dep"]
+            w.get("bug_churn", _equal_w) * n["bug_churn_total"]
+            + w.get("total_churn", _equal_w) * n["total_churn"]
+            + w.get("anti_pattern", _equal_w) * n["anti_pattern_count"]
+            + w.get("hotspot_fanin", _equal_w) * n["hotspot_fanin_score"]
+            + w.get("scc_membership", _equal_w) * n["scc_membership_count"]
+            + w.get("co_change", _equal_w) * n["co_change_without_dep"]
         )
         ap_seen = sorted(anti_patterns_seen.get(f, set())) if anti_patterns_seen else []
         ap_type_counts = dict(sorted(raw(anti_pattern_type_counts, f, {}).items()))
@@ -955,7 +959,7 @@ def compute_risk_scores(
         results.append(
             {
                 "file": f,
-                "risk_score": round(score, 6),
+                "combined_signals": round(score, 6),
                 "signals": raw_signals[f],
                 "signals_normalised": {k: round(v, 6) for k, v in n.items()},
                 "anti_patterns_seen": ap_seen,
@@ -965,7 +969,7 @@ def compute_risk_scores(
             }
         )
 
-    results.sort(key=lambda x: x["risk_score"], reverse=True)
+    results.sort(key=lambda x: x["combined_signals"], reverse=True)
     for rank, item in enumerate(results, start=1):
         item["rank"] = rank
     return results
@@ -986,14 +990,14 @@ def _write_csv(path: Path, records: List[Dict[str, Any]]) -> None:
     if not records:
         return
     signal_keys = list(records[0]["signals"].keys())
-    fieldnames = ["rank", "risk_score", "file"] + signal_keys + ["anti_patterns_seen", "anti_pattern_type_counts"]
+    fieldnames = ["rank", "combined_signals", "file"] + signal_keys + ["anti_patterns_seen", "anti_pattern_type_counts"]
     with open(path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for rec in records:
             row = {
                 "rank": rec["rank"],
-                "risk_score": rec["risk_score"],
+                "combined_signals": rec["combined_signals"],
                 "file": rec["file"],
                 "anti_patterns_seen": "|".join(rec.get("anti_patterns_seen", [])),
                 "anti_pattern_type_counts": json.dumps(rec.get("anti_pattern_type_counts", {}), sort_keys=True),
@@ -1790,10 +1794,10 @@ def main() -> int:
 
     print(f"\nDone. {len(results)} files scored.")
     if results:
-        print(f"Top-5 by risk score:")
+        print(f"Top-5 by combined signals (bug_churn + total_churn + anti_pattern + fan_in + scc + co_change):")
         for item in results[:5]:
             print(
-                f"  #{item['rank']:>3}  {item['risk_score']:.4f}  {item['file']}"
+                f"  #{item['rank']:>3}  {item['combined_signals']:.4f}  {item['file']}"
             )
     return 0
 
