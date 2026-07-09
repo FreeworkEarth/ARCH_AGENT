@@ -1706,7 +1706,13 @@ def _build_antipattern_context(temporal_root: pathlib.Path) -> str:
             strings = _re_ap.findall(rb'[\x20-\x7e]{3,}', body)
             files = []
             for s in strings:
-                decoded = s.decode("utf-8", errors="replace").strip().lstrip("%(*!")
+                decoded = s.decode("utf-8", errors="replace").strip()
+                # Strip binary length-prefix bytes that leak into printable range
+                _path_start = _re_ap.search(r'[a-zA-Z_]', decoded)
+                if _path_start:
+                    decoded = decoded[_path_start.start():]
+                else:
+                    continue
                 # Format 1: "path/self (File)" — structural APs
                 if "/self (File)" in decoded:
                     fpath = decoded.replace("/self (File)", "")
@@ -2025,7 +2031,13 @@ def _generate_antipattern_network_graph(rev_dir: pathlib.Path, output_path: path
                                 body = raw
                             strings = _re_ng.findall(rb'[\x20-\x7e]{5,}', body)
                             for s in strings:
-                                decoded = s.decode("utf-8", errors="replace").strip().lstrip("%(*!")
+                                decoded = s.decode("utf-8", errors="replace").strip()
+                                # Strip binary length-prefix bytes that leak into printable range
+                                _path_start = _re_ng.search(r'[a-zA-Z_]', decoded)
+                                if _path_start:
+                                    decoded = decoded[_path_start.start():]
+                                else:
+                                    continue
                                 fpath = None
                                 if "/self (File)" in decoded:
                                     fpath = decoded.replace("/self (File)", "")
@@ -2622,10 +2634,6 @@ def _run_refactor_loop(temporal_root: pathlib.Path, model: str = "qwen3-coder-30
     import shutil as _sh, datetime as _dt, json as _js, importlib.util as _ilu, re as _re_l
     sep = "=" * 70
     _model_label = track_label or model
-    # Q&A (Q1/Q2 analysis) must use a local Ollama model — Claude models don't route through Ollama
-    if qa_model.startswith("claude-"):
-        print(f"[loop] qa_model '{qa_model}' is a Claude model — falling back to local Ollama for Q&A.")
-        qa_model = "qwen3-coder-30b-refactor"
     print(f"\n{sep}\n  STAGE 4 (LOOP MODE): max {max_iterations} iterations")
     print(f"  Q&A model (Stage 3):      {qa_model}")
     print(f"  Refactor model (Stage 4): {model}")
@@ -2702,6 +2710,31 @@ def _run_refactor_loop(temporal_root: pathlib.Path, model: str = "qwen3-coder-30
                     # Single-model: delete all loop folders
                     _sh.rmtree(_old)
 
+    # Check for existing Q&A with action blocks (skip redundant Q1+Q2 on iteration 1)
+    _seed_action: str | None = None
+    interp_dir = temporal_root / "OUTPUT_INTERPRETATION"
+    if interp_dir.exists():
+        _answer_files = sorted(
+            interp_dir.glob("*/USER_ANSWERS*.md"),
+            key=lambda p: p.stat().st_mtime, reverse=True
+        )
+        for _af in _answer_files:
+            _af_text = _af.read_text(encoding="utf-8", errors="replace")
+            if "### Action 1" in _af_text:
+                _turns = _re_l.split(r'\n---\n', _af_text)
+                _action_turns = [t for t in _turns if _re_l.search(r'###\s+Action\s+1', t)]
+                if _action_turns:
+                    _seed_q2_answer = _action_turns[-1]
+                    _seed_actions = _re_l.findall(
+                        r"### Action (\d+)[^\n]*\n(.*?)(?=\n### Action \d+|\n## |\Z)",
+                        _seed_q2_answer, _re_l.DOTALL
+                    )
+                    if _seed_actions:
+                        _seed_action = _seed_actions[0][1].strip()
+                        print(f"[loop] Found existing Q&A with {len(_seed_actions)} action(s) in: {_af.name}")
+                        print(f"[loop] Iteration 1 will use existing Action 1 (skipping redundant Q1+Q2)")
+                        break
+
     for iteration in range(1, max_iterations + 1):
         print(f"\n{sep}\n  LOOP ITERATION {iteration}/{max_iterations}\n{sep}")
 
@@ -2710,136 +2743,162 @@ def _run_refactor_loop(temporal_root: pathlib.Path, model: str = "qwen3-coder-30
             if prev_mscore is not None:
                 print(f"[loop] Baseline M-score: {prev_mscore:.2f}%")
 
-        # Re-run backfill + re-generate report for current state
-        import subprocess as _sp_l
-        bf_cmd = [sys.executable, BACKFILL_TEMPORAL, str(temporal_root)]
-        _sp_l.call(bf_cmd)
-
-        # Load fresh report text
-        interp_dir = temporal_root / "OUTPUT_INTERPRETATION"
-        candidates = sorted(
-            [d for d in interp_dir.iterdir() if d.is_dir()] if interp_dir.exists() else [],
-            key=lambda d: d.stat().st_mtime, reverse=True
-        )
-        report_text = ""
-        if candidates:
-            run_folder = candidates[0]
-            for rp in ["INTERPRETATION_REPORT.md", "report.md", "interpretation.md"]:
-                rpath = run_folder / rp
-                if rpath.exists():
-                    report_text = rpath.read_text(encoding="utf-8", errors="replace")
-                    break
-
-        _risk_ctx, _commit_ctx, _ = _load_rich_qa_context(temporal_root)
-        _mscore_bd = _mod.load_mscore_worst_modules(temporal_root)
-        conversation: list[str] = []
-
-        def _loop_ask(question: str) -> str:
-            prior = "\n\n".join(conversation)
-            ctx = (prior + "\n\n" + report_text) if prior else report_text
-            raw = _mod.answer_user_question(qa_model, question, ctx,
-                                            mscore_breakdown=_mscore_bd,
-                                            timeout_s=900,
-                                            risk_score_context=_risk_ctx,
-                                            commit_context=_commit_ctx)
-            answer = _mod.strip_thinking_and_fences(raw)
-            print(f"\n[loop] Q ({qa_model}): {question}\n[loop] A (trimmed): {answer[:300]}...")
-            conversation.append(f"Q: {question}\nA: {answer}")
-            return answer
-
-        # Build DV8 anti-pattern context — specific instances with file lists for surgical targeting
-        _ap_ctx = _build_antipattern_context(temporal_root)
-        if _ap_ctx:
-            print(f"[loop] Loaded DV8 anti-pattern instances with file lists for targeted refactoring.")
+        # ITERATION 1 WITH EXISTING Q&A: skip Q1+Q2, use pre-loaded action
+        if iteration == 1 and _seed_action is not None:
+            print(f"[loop] Using existing Action 1 from USER_ANSWERS.md (skipping Q1+Q2)")
+            action_text = _seed_action
+            tried_file_sets.append(_extract_action_files(action_text))
+            tried_actions.append(action_text[:200])
+            _seed_action = None  # consumed — iterations 2+ will re-generate
         else:
-            print(f"[loop] WARNING: No anti-pattern data found. Q2 will use generic prompt.")
+            # Re-run backfill + re-generate report for current state
+            import subprocess as _sp_l
+            bf_cmd = [sys.executable, BACKFILL_TEMPORAL, str(temporal_root)]
+            _sp_l.call(bf_cmd)
 
-        print(f"[loop] Running Q1 (anti-pattern analysis)...")
-        _loop_ask("Which parts got worse over time — show anti-pattern groups, "
-                  "files with most dependency growth, and worst files overall.")
-
-        # ALL iterations target anti-patterns — the concrete file lists make this surgical
-        print(f"[loop] Running Q2 — strategy: ANTI-PATTERN (iteration {iteration})...")
-
-        # Build skip clause for previously tried actions
-        _skip_clause = ""
-        if tried_actions:
-            _tried_list = "\n".join(f"  - {a}" for a in tried_actions)
-            _skip_clause = (
-                f"\n\nIMPORTANT: The following actions were already tried in previous iterations "
-                f"and did NOT improve the architecture. Do NOT repeat them or target the same files/anti-patterns. "
-                f"Pick a DIFFERENT anti-pattern instance or a different structural change:\n{_tried_list}\n"
+            # Load fresh report text
+            interp_dir = temporal_root / "OUTPUT_INTERPRETATION"
+            candidates = sorted(
+                [d for d in interp_dir.iterdir() if d.is_dir()] if interp_dir.exists() else [],
+                key=lambda d: d.stat().st_mtime, reverse=True
             )
-        # Add review failure feedback so next iteration avoids the same mistakes
-        if review_failures:
-            _fail_list = "\n".join(f"  - {f}" for f in review_failures[-3:])
-            _skip_clause += (
-                f"\n\nCRITICAL — PREVIOUS ITERATIONS FAILED CODE REVIEW:\n{_fail_list}\n"
-                f"The refactoring MUST NOT introduce the same issues. Pay extra attention to:\n"
-                f"- All imports resolving correctly\n"
-                f"- No circular imports between files\n"
-                f"- Complete code moves (not stubs or placeholders)\n"
-                f"- All callers updated to import from new locations\n"
-            )
+            report_text = ""
+            if candidates:
+                run_folder = candidates[0]
+                for rp in ["INTERPRETATION_REPORT.md", "report.md", "interpretation.md"]:
+                    rpath = run_folder / rp
+                    if rpath.exists():
+                        report_text = rpath.read_text(encoding="utf-8", errors="replace")
+                        break
 
-        if _ap_ctx:
-            _loop_ask(
-                "Based on the DV8 anti-pattern analysis below, give EXACTLY 3 concrete code-level "
-                "refactoring actions using ### Action 1 / ### Action 2 / ### Action 3 headings. "
-                "Each action MUST target a SPECIFIC anti-pattern instance listed below and name the exact files involved. "
-                "Describe exact dependency-breaking changes: "
-                "which import to remove, which function/class to move, which file to split. "
-                "Do NOT include process actions ('code reviews', 'documentation'). Only structural code changes. "
-                "Do NOT create protocol/interface files unless the action specifically requires it — "
-                "prefer MOVING code to REMOVE import edges over ADDING abstraction layers. "
-                "Action 1 must target the anti-pattern instance with the MOST files (highest impact)."
-                f"\n\n{_ap_ctx}\n"
-                f"CRITICAL RULES FOR EFFECTIVE REFACTORING:\n"
-                f"- The goal is to REDUCE dependency edges, not add abstraction layers.\n"
-                f"- MOVE code from high-coupling files to low-coupling files.\n"
-                f"- When breaking a cycle A→B→C→A: identify the WEAKEST edge (fewest callers) and remove it "
-                f"by moving the imported symbols to where they're used.\n"
-                f"- NEVER create re-exports — if you move code, update ALL callers to import from the new location.\n"
-                f"- NEVER use TYPE_CHECKING blocks — DV8 counts them as real imports.\n"
-                f"- Prefer FEWER files with clear responsibilities over MANY small files.\n"
-                + _skip_clause
-            )
-        else:
-            # Fallback if no anti-pattern data available
-            _loop_ask(
-                "Give EXACTLY 3 concrete code-level refactoring actions using ### Action 1 / ### Action 2 / ### Action 3 headings. "
-                "Each action must target tight coupling or circular dependencies between specific files. "
-                "Describe exact changes: which import to remove, which function to move, which file to split. "
-                "Do NOT include process actions. Only structural code changes."
-                + _skip_clause
-            )
+            _risk_ctx, _commit_ctx, _ = _load_rich_qa_context(temporal_root)
+            _mscore_bd = _mod.load_mscore_worst_modules(temporal_root)
+            conversation: list[str] = []
 
-        # Parse actions from Q2 answer — prefer Action 1, but on stall fall back to Action 2/3
-        _q2_answer = conversation[-1]
-        _all_actions = _re_l.findall(
-            r"### Action (\d+)[^\n]*\n(.*?)(?=\n### Action \d+|\n## |\Z)",
-            _q2_answer, _re_l.DOTALL
-        )
-        if not _all_actions:
-            print(f"[loop] Could not parse any ### Action from Q2 answer. Stopping.")
-            break
-        # Pick the first action that hasn't been tried yet (by comparing target file sets)
-        action_text = None
-        for _act_num, _act_body in _all_actions:
-            _act_clean = _act_body.strip()
-            _act_files = _extract_action_files(_act_clean)
-            if _act_files and any(_act_files == t for t in tried_file_sets):
-                print(f"[loop] Skipping Action {_act_num} — targets same files as a previous action.")
-                continue
-            action_text = _act_clean
-            print(f"[loop] Selected Action {_act_num} for this iteration.")
-            break
-        if not action_text:
-            # All actions target same files as before — use Action 1 anyway as last resort
-            action_text = _all_actions[0][1].strip()
-            print(f"[loop] All actions target previously tried files — using Action 1 anyway.")
-        tried_file_sets.append(_extract_action_files(action_text))
-        tried_actions.append(action_text[:200])
+            def _loop_ask(question: str) -> str:
+                prior = "\n\n".join(conversation)
+                ctx = (prior + "\n\n" + report_text) if prior else report_text
+                raw = _mod.answer_user_question(qa_model, question, ctx,
+                                                mscore_breakdown=_mscore_bd,
+                                                timeout_s=900,
+                                                risk_score_context=_risk_ctx,
+                                                commit_context=_commit_ctx)
+                answer = _mod.strip_thinking_and_fences(raw)
+                print(f"\n[loop] Q ({qa_model}): {question}\n[loop] A (trimmed): {answer[:300]}...")
+                conversation.append(f"Q: {question}\nA: {answer}")
+                return answer
+
+            # Build DV8 anti-pattern context — specific instances with file lists for surgical targeting
+            _ap_ctx = _build_antipattern_context(temporal_root)
+            if _ap_ctx:
+                print(f"[loop] Loaded DV8 anti-pattern instances with file lists for targeted refactoring.")
+            else:
+                print(f"[loop] WARNING: No anti-pattern data found. Q2 will use generic prompt.")
+
+            print(f"[loop] Running Q1 (anti-pattern analysis)...")
+            _loop_ask("Which parts got worse over time — show anti-pattern groups, "
+                      "files with most dependency growth, and worst files overall.")
+
+            # ALL iterations target anti-patterns — the concrete file lists make this surgical
+            print(f"[loop] Running Q2 — strategy: ANTI-PATTERN (iteration {iteration})...")
+
+            # Build skip clause for previously tried actions
+            _skip_clause = ""
+            if tried_actions:
+                _tried_list = "\n".join(f"  - {a}" for a in tried_actions)
+                _skip_clause = (
+                    f"\n\nIMPORTANT: The following actions were already tried in previous iterations "
+                    f"and did NOT improve the architecture. Do NOT repeat them or target the same files/anti-patterns. "
+                    f"Pick a DIFFERENT anti-pattern instance or a different structural change:\n{_tried_list}\n"
+                )
+            # Add review failure feedback so next iteration avoids the same mistakes
+            if review_failures:
+                _fail_list = "\n".join(f"  - {f}" for f in review_failures[-3:])
+                _skip_clause += (
+                    f"\n\nCRITICAL — PREVIOUS ITERATIONS FAILED CODE REVIEW:\n{_fail_list}\n"
+                    f"The refactoring MUST NOT introduce the same issues. Pay extra attention to:\n"
+                    f"- All imports resolving correctly\n"
+                    f"- No circular imports between files\n"
+                    f"- Complete code moves (not stubs or placeholders)\n"
+                    f"- All callers updated to import from new locations\n"
+                )
+
+            if _ap_ctx:
+                _loop_ask(
+                    "Based on the DV8 anti-pattern analysis below, give EXACTLY 3 concrete code-level "
+                    "refactoring actions using ### Action 1 / ### Action 2 / ### Action 3 headings. "
+                    "Each action MUST target a SPECIFIC anti-pattern instance listed below and name the exact files involved. "
+                    "Describe exact dependency-breaking changes: "
+                    "which import to remove, which function/class to move, which file to split. "
+                    "Do NOT include process actions ('code reviews', 'documentation'). Only structural code changes. "
+                    "Do NOT create protocol/interface files unless the action specifically requires it — "
+                    "prefer MOVING code to REMOVE import edges over ADDING abstraction layers. "
+                    "Action 1 must target the anti-pattern instance with the MOST files (highest impact)."
+                    f"\n\n{_ap_ctx}\n"
+                    f"CRITICAL RULES FOR EFFECTIVE REFACTORING:\n"
+                    f"- The goal is to REDUCE dependency edges, not add abstraction layers.\n"
+                    f"- MOVE code from high-coupling files to low-coupling files.\n"
+                    f"- When breaking a cycle A→B→C→A: identify the WEAKEST edge (fewest callers) and remove it "
+                    f"by moving the imported symbols to where they're used.\n"
+                    f"- NEVER create re-exports — if you move code, update ALL callers to import from the new location.\n"
+                    f"- NEVER use TYPE_CHECKING blocks — DV8 counts them as real imports.\n"
+                    f"- Prefer FEWER files with clear responsibilities over MANY small files.\n"
+                    + _skip_clause
+                )
+            else:
+                # Fallback if no anti-pattern data available
+                _loop_ask(
+                    "Give EXACTLY 3 concrete code-level refactoring actions using ### Action 1 / ### Action 2 / ### Action 3 headings. "
+                    "Each action must target tight coupling or circular dependencies between specific files. "
+                    "Describe exact changes: which import to remove, which function to move, which file to split. "
+                    "Do NOT include process actions. Only structural code changes."
+                    + _skip_clause
+                )
+
+            # Parse actions from Q2 answer — prefer Action 1, but on stall fall back to Action 2/3
+            _q2_answer = conversation[-1]
+            _all_actions = _re_l.findall(
+                r"### Action (\d+)[^\n]*\n(.*?)(?=\n### Action \d+|\n## |\Z)",
+                _q2_answer, _re_l.DOTALL
+            )
+            if not _all_actions:
+                print(f"[loop] Could not parse any ### Action from Q2 answer. Stopping.")
+                break
+            # Pick the first action that hasn't been tried yet (by comparing target file sets)
+            action_text = None
+            for _act_num, _act_body in _all_actions:
+                _act_clean = _act_body.strip()
+                _act_files = _extract_action_files(_act_clean)
+                if _act_files and any(_act_files == t for t in tried_file_sets):
+                    print(f"[loop] Skipping Action {_act_num} — targets same files as a previous action.")
+                    continue
+                action_text = _act_clean
+                print(f"[loop] Selected Action {_act_num} for this iteration.")
+                break
+            if not action_text:
+                # All actions target same files as before — use Action 1 anyway as last resort
+                action_text = _all_actions[0][1].strip()
+                print(f"[loop] All actions target previously tried files — using Action 1 anyway.")
+            tried_file_sets.append(_extract_action_files(action_text))
+            tried_actions.append(action_text[:200])
+
+            # Save this iteration's Q&A
+            from datetime import datetime as _dt_save
+            _now_save = _dt_save.now()
+            _iter_qa_dir = sorted(
+                [d for d in interp_dir.iterdir() if d.is_dir()],
+                key=lambda d: d.stat().st_mtime, reverse=True
+            )[0] if interp_dir.exists() else interp_dir
+            _iter_answer_path = _iter_qa_dir / f"USER_ANSWERS_iter{iteration}.md"
+            _iter_content = (
+                f"# Q&A — Iteration {iteration}/{max_iterations}\n\n"
+                f"**Model (Q&A)**: {qa_model} | **Model (refactor)**: {model}\n"
+                f"**Generated**: {_now_save.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            )
+            for _conv_entry in conversation:
+                _iter_content += f"\n---\n\n{_conv_entry}\n"
+            _iter_answer_path.write_text(_iter_content, encoding="utf-8")
+            print(f"[loop] Saved iteration {iteration} Q&A: {_iter_answer_path.name}")
 
         # Build new folder for this iteration
         action_date = today - _dt.timedelta(weeks=max_iterations - iteration + 1)
@@ -3098,6 +3157,30 @@ def _run_refactor_loop(temporal_root: pathlib.Path, model: str = "qwen3-coder-30
             title=f"Iteration {iteration} — Dependency Network ({model})")
         if _iter_graph:
             print(f"[loop] Saved iteration {iteration} network graph: {_plot_dir / f'network_iteration_{iteration}.png'}")
+
+        # Write M-score progression summary row
+        if new_mscore is not None:
+            _summary_dir = sorted(
+                [d for d in interp_dir.iterdir() if d.is_dir()],
+                key=lambda d: d.stat().st_mtime, reverse=True
+            )[0] if interp_dir.exists() and any(interp_dir.iterdir()) else interp_dir
+            _summary_path = _summary_dir / "USER_ANSWERS_summary.md"
+            if not _summary_path.exists():
+                _summary_path.write_text(
+                    f"# Refactoring Loop Summary\n\n"
+                    f"**Refactor model**: {model} | **Q&A model**: {qa_model}\n"
+                    f"**Baseline M-score**: {baseline_mscore:.2f}%\n\n"
+                    f"| Iter | Action (summary) | M-score before | M-score after | Delta | Status |\n"
+                    f"|------|-----------------|----------------|---------------|-------|--------|\n",
+                    encoding="utf-8"
+                )
+            _act_summary = action_text[:80].replace("|", "/").replace("\n", " ")
+            _prev_ms = prev_mscore if prev_mscore is not None else baseline_mscore or 0.0
+            _delta_s = f"+{new_mscore - _prev_ms:.2f}%" if new_mscore >= _prev_ms else f"{new_mscore - _prev_ms:.2f}%"
+            _status_s = "stall" if (prev_mscore is not None and new_mscore <= prev_mscore + 0.1) else "applied"
+            with open(_summary_path, "a", encoding="utf-8") as _sf:
+                _sf.write(f"| {iteration} | {_act_summary} | {_prev_ms:.2f}% | {new_mscore:.2f}% | {_delta_s} | {_status_s} |\n")
+            print(f"[loop] Updated summary: {_summary_path.name}")
 
         iteration_dirs.append((str(iteration), new_dir, action_date, new_mscore, all_metrics))
         # Next iteration builds on this iteration's output
@@ -4848,6 +4931,7 @@ def main():
             print(f"[stage4-only] Path not found: {tr}")
             sys.exit(1)
         sys.exit(_run_refactor_stage(tr, conversation=[], model=refactor_model_override or "qwen3-coder-30b-refactor",
+                                     loop_count=refactor_loop_count,
                                      qa_model=model_override or "qwen3-coder-30b-refactor",
                                      use_feedback_loop=use_feedback_loop))
 
