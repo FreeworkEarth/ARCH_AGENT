@@ -1295,34 +1295,31 @@ def _stage4_apply_action_claude(folder: pathlib.Path, action_num: str, action_te
     print(f"[stage4]   Using Claude Code CLI (model: {claude_model}) for refactoring")
 
     prompt = (
-        f"You are applying a specific refactoring action to this codebase. "
+        f"You are applying a specific refactoring action to a codebase. "
         f"The source code is in: {folder}\n\n"
         f"REFACTORING ACTION {action_num}:\n{action_text}\n\n"
+        f"CRITICAL INSTRUCTIONS — YOU MUST ACTUALLY EDIT FILES:\n"
+        f"1. Use the Read tool to read each file mentioned in the action.\n"
+        f"2. Use the Edit tool to make the exact changes described. DO NOT just describe what you would change — "
+        f"you MUST call the Edit tool for every modification.\n"
+        f"3. If new files need to be created, use the Write tool to create them.\n"
+        f"4. After ALL edits are done, use Grep to verify your changes (e.g. check that old imports are gone, "
+        f"new imports exist, moved functions are in the target file).\n"
+        f"5. Output a brief summary of what you changed (1-2 lines per file).\n\n"
+        f"DO NOT just output a plan or description. You MUST use Edit/Write tools to modify the actual files. "
+        f"If you only describe changes without calling Edit/Write, the refactoring will fail review.\n\n"
         f"RULES:\n"
-        f"1. Apply ONLY the action above. Do not add other changes, comments, docstrings, or formatting.\n"
-        f"2. Read each file mentioned in the action, apply the change, and write it back.\n"
-        f"3. If new files need to be created (e.g. extracting an interface), create them.\n"
-        f"4. If a file needs to be split, create the new files and update the original.\n"
-        f"5. Do NOT modify test files, __pycache__, InputData, OutputData, or .git directories.\n"
-        f"6. After making all changes, output a brief summary of what you changed (1-2 lines per file).\n"
-        f"7. Do NOT run any tests, builds, or git commands.\n"
-        f"8. CRITICAL — NO CIRCULAR IMPORTS & NO RE-EXPORTS: When extracting code into new files, ensure ONE-WAY dependencies only. "
-        f"The new file imports from its dependencies, but the original file must NOT import back from the new file. "
-        f"NEVER add re-exports (e.g. 'from new_file import X' in the old file) — re-exports keep the same dependency edges and defeat the purpose. "
-        f"Instead, UPDATE ALL CALLERS to import directly from the new location. Use Grep to find every 'from old_file import X' and change them. "
-        f"Example: if you move TypeA from types.py to type_defs.py, grep for 'from.*types import.*TypeA' and update each file to 'from type_defs import TypeA'. "
-        f"Do NOT leave 'from type_defs import TypeA' in types.py — that creates the same coupling.\n"
-        f"9. MINIMIZE NEW FILES: Prefer restructuring imports between existing files over creating new ones. "
-        f"Each new file adds nodes to the dependency graph. Only create a new file if the action explicitly requires it "
-        f"AND you update all dependents to import from the new file directly (no re-exports from the old file).\n"
-        f"10. DO NOT use TYPE_CHECKING blocks to hide imports — DV8 analyzes the AST statically and still counts them.\n"
-        f"11. NO NEW PACKAGE CYCLES: Before moving code between packages/directories, check that the move "
-        f"does not create a circular dependency between packages. If package A depends on package B, "
-        f"do NOT add an import from B to A. Keep package dependencies ONE-WAY.\n"
-        f"12. CLEAN UP EMPTY FILES: When moving ALL code from file A to file B, DELETE file A entirely "
-        f"(remove the file) and remove its import from __init__.py and all other files that imported it. "
-        f"An empty file that still exists creates an isolated node in the dependency graph that artificially "
-        f"inflates metrics. Either keep meaningful content in the file or delete it completely.\n"
+        f"- Apply ONLY the action above. Do not add other changes, comments, docstrings, or formatting.\n"
+        f"- Do NOT modify test files, __pycache__, InputData, OutputData, or .git directories.\n"
+        f"- Do NOT run any tests, builds, or git commands.\n"
+        f"- NO CIRCULAR IMPORTS & NO RE-EXPORTS: When moving code, ensure ONE-WAY dependencies only. "
+        f"NEVER add re-exports (e.g. 'from new_file import X' in the old file). "
+        f"Instead, UPDATE ALL CALLERS to import directly from the new location. Use Grep to find every caller.\n"
+        f"- MINIMIZE NEW FILES: Prefer restructuring imports between existing files over creating new ones. "
+        f"Only create a new file if the action explicitly requires it.\n"
+        f"- DO NOT use TYPE_CHECKING blocks — DV8 analyzes the AST statically and still counts them.\n"
+        f"- NO NEW PACKAGE CYCLES: Before moving code, check that the move doesn't create circular package deps.\n"
+        f"- CLEAN UP EMPTY FILES: When moving ALL code out of a file, DELETE the file entirely.\n"
     )
 
     try:
@@ -1343,6 +1340,43 @@ def _stage4_apply_action_claude(folder: pathlib.Path, action_num: str, action_te
         output = result.stdout.strip()
         if output:
             print(f"[stage4]   Claude output:\n{output[:800]}")
+
+        # Verify at least one file was actually modified
+        import time as _time_verify
+        _recent_cutoff = _time_verify.time() - 120  # last 2 minutes
+        _modified_count = 0
+        _skip_dirs = {"__pycache__", "InputData", "OutputData", ".git"}
+        for _f in folder.rglob("*.py"):
+            if any(s in _f.parts for s in _skip_dirs):
+                continue
+            if _f.stat().st_mtime > _recent_cutoff:
+                _modified_count += 1
+
+        if _modified_count == 0:
+            print(f"[stage4]   WARNING: No files modified! Retrying with explicit instructions...")
+            retry_prompt = (
+                f"IMPORTANT: You MUST use the Edit tool to modify files. Do NOT just describe changes.\n\n"
+                f"The source code is in: {folder}\n\n"
+                f"Apply this refactoring:\n{action_text}\n\n"
+                f"Step 1: Read the file(s) mentioned above using the Read tool.\n"
+                f"Step 2: Use the Edit tool to make each change.\n"
+                f"Step 3: Verify with Grep that your edits were applied.\n"
+            )
+            retry_result = _sp_claude.run(
+                [claude_bin, "-p",
+                 "--model", claude_model,
+                 "--allowedTools", "Read,Edit,Write,Glob,Grep",
+                 "--add-dir", str(folder)],
+                input=retry_prompt,
+                capture_output=True, text=True, timeout=600, cwd=str(folder)
+            )
+            if retry_result.returncode == 0 and retry_result.stdout.strip():
+                print(f"[stage4]   Retry output:\n{retry_result.stdout.strip()[:500]}")
+            else:
+                print(f"[stage4]   Retry also produced no output.")
+        else:
+            print(f"[stage4]   Verified: {_modified_count} file(s) modified.")
+
         return []  # Claude edits files directly, no NEW_FILE parsing needed
 
     except _sp_claude.TimeoutExpired:
@@ -2717,13 +2751,12 @@ def _run_refactor_loop(temporal_root: pathlib.Path, model: str = "qwen3-coder-30
     for _old in list(data_repos.iterdir()):
         if _old.is_dir():
             _pfx = _old.name.split("_")[0]
-            if _pfx.isdigit() and len(_pfx) >= 3:
+            _is_loop = (_pfx.isdigit() and len(_pfx) >= 3) or _old.name.startswith("ai_loop")
+            if _is_loop:
                 if _track_suffix_check:
-                    # Multi-model: only delete folders for this specific track
                     if _track_suffix_check in _old.name:
                         _sh.rmtree(_old)
                 else:
-                    # Single-model: delete all loop folders
                     _sh.rmtree(_old)
 
     # Check for existing Q&A with action blocks (skip redundant Q1+Q2 on iteration 1)
@@ -2916,12 +2949,12 @@ def _run_refactor_loop(temporal_root: pathlib.Path, model: str = "qwen3-coder-30
             _iter_answer_path.write_text(_iter_content, encoding="utf-8")
             print(f"[loop] Saved iteration {iteration} Q&A: {_iter_answer_path.name}")
 
-        # Build new folder for this iteration
-        action_date = today - _dt.timedelta(weeks=max_iterations - iteration + 1)
-        date_str = action_date.strftime("%d%m%Y")
-        prefix = str(max_iterations - iteration + 1).zfill(3)
+        # Build new folder for this iteration — use real timestamp for unambiguous ordering
+        from datetime import datetime as _dt_now
+        action_date = today
+        _ts_now = _dt_now.now().strftime("%y%m%d_%H%M%S")
         _track_suffix = f"_{track_label}" if track_label else ""
-        new_name = prefix + "_" + "_".join(_base_name_parts) + f"_loop{iteration}{_track_suffix}_{date_str}_1000"
+        new_name = f"ai_loop{iteration}{_track_suffix}_{_ts_now}_" + "_".join(_base_name_parts)
         new_dir = data_repos / new_name
 
         if new_dir.exists():
